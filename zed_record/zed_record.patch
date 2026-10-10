@@ -1,0 +1,110 @@
+--- zed_record.cpp.bak-20261010	2026-10-10 12:13:21.751294414 +0800
++++ zed_record.cpp	2026-10-10 12:14:43.327131015 +0800
+@@ -365,9 +365,15 @@
+ // ============================================================
+ // 全手动曝光（ZED X）。单位：EXPOSURE_TIME=μs，ANALOG_GAIN=mdB。
+ static constexpr int kCameraFps = 15;
+-static constexpr int kManualExposureUs = 10000;     // 10ms
+-static constexpr int kManualAnalogGainMdB = 1000;  // 约 1000–16000，偏暗再调大
++// 曝光和模拟增益的默认值；运行时可用 --exposure-us / --analog-gain-mdb 覆盖（见 main）
++static constexpr int kDefaultExposureUs = 10000;     // 10ms
++static constexpr int kDefaultAnalogGainMdB = 1000;  // 约 1000–16000，偏暗再调大
+ static constexpr int kManualDigitalGain = 1;       // 约 1–256
++static int g_exposure_us = kDefaultExposureUs;
++static int g_analog_gain_mdb = kDefaultAnalogGainMdB;
++// 第 30 帧时读回的实际值（设置刚下发时立刻读回的值不可靠）
++static std::atomic<int> g_exposure_readback{-1};
++static std::atomic<int> g_gain_readback{-1};
+ 
+ static bool apply_manual_exposure(sl::Camera& zed) {
+   if (zed.setCameraSettings(sl::VIDEO_SETTINGS::AEC_AGC, 0) !=
+@@ -376,12 +382,12 @@
+     return false;
+   }
+   if (zed.setCameraSettings(sl::VIDEO_SETTINGS::EXPOSURE_TIME,
+-                            kManualExposureUs) != sl::ERROR_CODE::SUCCESS) {
++                            g_exposure_us) != sl::ERROR_CODE::SUCCESS) {
+     log_line("设置 EXPOSURE_TIME 失败");
+     return false;
+   }
+   if (zed.setCameraSettings(sl::VIDEO_SETTINGS::ANALOG_GAIN,
+-                            kManualAnalogGainMdB) != sl::ERROR_CODE::SUCCESS) {
++                            g_analog_gain_mdb) != sl::ERROR_CODE::SUCCESS) {
+     log_line("设置 ANALOG_GAIN 失败");
+     return false;
+   }
+@@ -513,6 +519,16 @@
+       }
+ 
+       ++frame_count;
++      if (frame_count == 30) {
++        int exposure_us = -1;
++        int analog_gain = -1;
++        zed->getCameraSettings(sl::VIDEO_SETTINGS::EXPOSURE_TIME, exposure_us);
++        zed->getCameraSettings(sl::VIDEO_SETTINGS::ANALOG_GAIN, analog_gain);
++        g_exposure_readback.store(exposure_us);
++        g_gain_readback.store(analog_gain);
++        log_line("第 30 帧读回: EXPOSURE_TIME=" + std::to_string(exposure_us) +
++                 " us, ANALOG_GAIN=" + std::to_string(analog_gain) + " mdB");
++      }
+       if (last_ts != 0) {
+         const double diff = static_cast<double>(current_ts - last_ts);
+         if (frame_count <= 5 || (frame_count % 15) == 0) {
+@@ -733,8 +749,10 @@
+          "no_fpga_trigger; no_calib_lock_first_frame\n";
+   ofs << "camera_fps=" << kCameraFps << '\n';
+   ofs << "resolution=HD1080\n";
+-  ofs << "exposure_us=" << kManualExposureUs << '\n';
+-  ofs << "analog_gain_mdb=" << kManualAnalogGainMdB << '\n';
++  ofs << "exposure_us=" << g_exposure_us << '\n';
++  ofs << "analog_gain_mdb=" << g_analog_gain_mdb << '\n';
++  ofs << "exposure_us_readback_frame30=" << g_exposure_readback.load() << '\n';
++  ofs << "analog_gain_mdb_readback_frame30=" << g_gain_readback.load() << '\n';
+   ofs << "digital_gain=" << kManualDigitalGain << '\n';
+   ofs << "image_rows=" << image_rows << '\n';
+   ofs << "note=filename_is_zed_timestamp_ms; "
+@@ -742,7 +760,34 @@
+   return true;
+ }
+ 
+-int main(int /*argc*/, char** /*argv*/) {
++static bool parse_int_arg(const char* text, int lo, int hi, int* out) {
++  char* end = nullptr;
++  errno = 0;
++  const long v = std::strtol(text, &end, 10);
++  if (errno != 0 || end == text || *end != '\0' || v < lo || v > hi) {
++    return false;
++  }
++  *out = static_cast<int>(v);
++  return true;
++}
++
++int main(int argc, char** argv) {
++  for (int i = 1; i < argc; ++i) {
++    const std::string arg = argv[i];
++    if (arg == "--exposure-us" && i + 1 < argc &&
++        parse_int_arg(argv[i + 1], 100, 60000, &g_exposure_us)) {
++      ++i;
++    } else if (arg == "--analog-gain-mdb" && i + 1 < argc &&
++               parse_int_arg(argv[i + 1], 1000, 16000, &g_analog_gain_mdb)) {
++      ++i;
++    } else {
++      std::cerr << "用法: " << argv[0]
++                << " [--exposure-us 100..60000] [--analog-gain-mdb 1000..16000]\n"
++                << "默认: --exposure-us " << kDefaultExposureUs
++                << " --analog-gain-mdb " << kDefaultAnalogGainMdB << std::endl;
++      return 2;
++    }
++  }
+   try_avoid_last_cpu("主线程");
+   std::signal(SIGINT, on_signal);
+   std::signal(SIGTERM, on_signal);
+@@ -773,6 +818,8 @@
+   log_line("  ZED IMU: " + zed_imu_csv_path.string());
+   log_line("  图像时间线: " + timeline_path.string());
+   log_line("时间戳直接用 SDK：zed_timestamp_ms / zed_imu_timestamp_ns。");
++  log_line("曝光设定: " + std::to_string(g_exposure_us) + " us, 模拟增益: " +
++           std::to_string(g_analog_gain_mdb) + " mdB");
+ 
+   auto zed = init_zedx();
+   if (!zed) {
