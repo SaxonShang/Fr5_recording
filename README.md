@@ -8,6 +8,7 @@
 用 FAIRINO FR5 机械臂带着 ZED X 做已知运动，同时录制双目图像、ZED 机身 IMU 和机械臂状态，离线算出相机位姿真值，供 [SIO_SLAM](https://github.com/lihongliang0203/SIO_SLAM) 评估。
 
 - **第一批 6 条录制**：相机始终水平朝前，每条只沿一个方向做纯平移：前进、后退、右移、左移、上升、下降。默认速度 0.05 m/s，行程 300 mm。
+- **第二批 4 条录制（准备中）**：绕左目光心的单轴纯旋转：向左 / 向右偏航，向上 / 向下俯仰，20°（以中心姿态为中心 ±10°），5 °/s。偏航在平移录制的起点上做；俯仰的中心朝向右转 35°，画面和平移录制不同。横滚（绕光轴）要转 J6，这套末端装置下没验证过，暂不做。
 - **正式录制前先验证两件事**：(1) 时间同步；(2) 真值，用固定的标定板检验。标定板只在验证录制中出现，正式录制时撤掉。
 - **相机真值**：`base_T_camera(t) = base_T_flange(t) · flange_T_left_camera`。手眼外参来自标定仓库 s003 的结果（`scripts/handeye_s003_result.json`），前提是相机安装之后没有动过。
 
@@ -139,8 +140,11 @@
 
 - **轨迹**：所有目标点先换算成相机位姿，再除以手眼外参得到法兰目标。MoveL 以非阻塞方式下发，到位由状态包判断。录制前用控制器逆解沿路径每 10 mm / 2° 检查一次：有解、关节在允许范围内、不跳到另一组逆解、相机不低于下限。
 - **速度**：这台控制器拒绝 MoveL 的物理速度模式（mm/s），所以用百分比速度。百分比和实际速度的换算由 `speed-test` 实测：平移和摆动各在两个速度下测，并检查是否成正比。
-- **运动模糊**：`blur = fx · v · T / Z`，其中 fx ≈ 735 px。默认 0.05 m/s、曝光 10 ms 时，1 m 处为 0.37 px。
-- **保护**：运动中实时测法兰线速度，超过预期 1.5 倍 + 5 mm/s 就停；超过 2 s 没有新状态就停；没到位又 5 s 不动就停。停止时用新的 XML-RPC 连接发 StopMotion。Ctrl+C、SSH 断开或被终止时，先停机械臂，再正常停相机、保存数据。
+- **旋转**：MoveL 让法兰走直线、姿态匀速插值；绕光心转时光心会在半路鼓出去（按手眼外参算，转 30° 时偏航 3.9 mm、俯仰 4.2 mm）。所以旋转段用 MoveC：经过转了一半的姿态，法兰绕旋转轴走圆，光心不动。逆解检查沿这条圆弧采样，同时求出中间点的关节角。同步摆动仍用 MoveL（20° 的一段中途偏离约 1.8 mm，只用来对时间），转轴取相机自身的竖直轴，俯仰起点上也不带绕光轴的分量。
+- **旋转用哪些关节**：起点处 J5 约 −45°。偏航基本只转 J5（每 1° 约 1.2–1.3°），偏航 ±10° 加摆动 ±10° 时 J5 为 −69.4～−22.8°，正好在平移录制走过的范围里；转 30° 就要超出。直接在起点俯仰时，J4 轴和相机 x 轴差 45°，要靠 J6 抵消横滚分量：俯仰 1°，J6 约转 1°，和横滚一样要转 J6。所以俯仰录制先绕竖直轴向右转 35°（`PITCH_HEADING_DEG`），让 J5 到 −89° 左右，这时俯仰只用 J2–J4：20° 时 J4 −128～−96°、J5 −103～−76°、J6 在 ±1° 以内。这些数是 10-12 用控制器逆解算出来的，机械臂没有动。
+- **运动模糊**：平移 `blur = fx · v · T / Z`，其中 fx ≈ 735 px，默认 0.05 m/s、曝光 10 ms 时 1 m 处为 0.37 px；旋转 `blur = fx · ω · T`，和景深无关，5 °/s 时为 0.64 px。
+- **保护**：运动中实时测法兰线速度和角速度，超过预期 1.5 倍 + 5 mm/s（角速度 + 2 °/s）就停；MoveC 时光心偏离旋转中心超过 2 mm 就停；超过 2 s 没有新状态就停；没到位又 5 s 不动就停。停止时用新的 XML-RPC 连接发 StopMotion。Ctrl+C、SSH 断开或被终止时，先停机械臂，再正常停相机、保存数据。
+- **关节范围**：腕部 J4–J6 限制在这套末端装置已经安全走过的范围内（再往外 Box 可能碰到腕部，见标定仓库 README 6.4 / 6.7）。10-10、10-12 的录制实测 J4 −151～−99°、J5 −69.5～−22.1°、J6 一直是 0，各留约 3° 余量；俯仰录制需要的 J4 上限和 J5 下限，按标定走过的范围（J4 −154～−77°、J5 −119～−56°）放宽到 −90° 和 −106°。J6 只放 ±5°，需要转 J6 的计划在 `plan` 时就会被拒绝。
 
 **结果**
 
@@ -155,18 +159,19 @@
 
 | 文件 | 说明 |
 |---|---|
-| `scripts/run_session.py` | 总控脚本，**所有可改参数都在文件开头**（其他模块不放可调参数）。子命令：`set-start`、`plan`、`goto-start`、`speed-test`、`sync-test`、`record <方向>`；选项 `--scale`、`--yes`、`--tag` |
-| `scripts/fr5_motion.py` | 运动规划与执行：相机保持水平的平移和同步摆动、逆解检查、速度换算、运动中的保护和实测速度 |
+| `scripts/run_session.py` | 总控脚本，**所有可改参数都在文件开头**（其他模块不放可调参数）。子命令：`set-start`、`plan`、`goto-start`、`speed-test`、`sync-test`、`movec-test`、`record <方向>`；选项 `--scale`、`--yes`、`--tag` |
+| `scripts/fr5_motion.py` | 运动规划与执行：相机保持水平的平移、绕光心的单轴旋转（MoveC）和同步摆动，沿实际路径的逆解检查，速度换算，运动中的保护和实测速度、光心偏离 |
 | `scripts/fr5_record.py` | 机械臂状态录制：独占 20004，每包记 Box 时间，停止时一次写盘；`open_rpc()` 让 SDK 运动指令共用这个连接 |
 | `scripts/zed_capture.py` | zed_record 的子进程管理（启动、等待开始采集、正常停止、保存输出），以及检查相机是否被其他程序占用 |
 | `scripts/fr5_groundtruth.py` | 离线真值：时钟拟合 → 陀螺仪互相关求 Δt → 曝光中心修正 → 插值出相机真值（只依赖 numpy） |
 | `scripts/gt_board_check.py` | 标定板真值验证，在笔记本上运行；只读调用标定仓库的 Aprilgrid 检测和标定板尺寸，内参默认用 `camera_s003_refit.yaml` |
 | `scripts/camera_s003_refit.yaml` | ZED 校正后左目 HD1080 内参，用 s003 图像重标（fx 736.23，cx 987.72，cy 555.14）。比出厂值准，也可给 SIO_SLAM 用 |
-| `scripts/test_fr5_groundtruth.py`、`test_fr5_motion.py`、`test_gt_board_check.py` | 离线测试（合成数据，不连机械臂），共 31 项；标定板测试只在笔记本上运行，Box 上自动跳过；参数检查需要 FAIRINO SDK，笔记本上自动跳过 |
+| `scripts/test_fr5_groundtruth.py`、`test_fr5_motion.py`、`test_gt_board_check.py` | 离线测试（合成数据，不连机械臂），共 44 项；标定板测试只在笔记本上运行，Box 上自动跳过；参数检查需要 FAIRINO SDK，笔记本上自动跳过 |
 | `scripts/movel_probe.py` | 诊断：发零行程的 MoveL / MoveJ（目标 = 当前位姿），看控制器拒绝哪种参数；`--set physical` 测试物理速度模式 |
 | `scripts/handeye_s003_result.json` | 标定仓库 `results/s003/result.json` 的副本（手眼外参） |
 | `scripts/start_pose.json` | `set-start` 保存的水平起点：相机光心约 (597, −476, 562) mm，关节 [119.51, 14.41, −74.33, −119.99, −44.77, −0.02]° |
 | `scripts/speed_calibration.json` | `speed-test` 的结果（速度换算系数和各段实测） |
+| `movec_test.json`（Box 上生成） | `movec-test` 的结果：MoveC / MoveL 各段的返回情况、每 1% 的角速度、光心最大偏离 |
 | `zed_record/zed_record.cpp`、`zed_record.patch` | Box 上 `~/ROBOT/zed_imu/zed_record.cpp` 的当前版本，以及相对原版的改动：增加 `--exposure-us`、`--analog-gain-mdb`，并在第 30 帧读回实际曝光和增益，写进 `time_meta.txt` |
 | `sync_from_box.ps1` | 从 Box 拉取 `scripts/` 和 `zed_record/` |
 | `data/` | 从 Box 拷到笔记本的录制数据（不进 git） |
@@ -179,6 +184,8 @@
 |---|---|---|---|
 | `SPEED_MPS` | 0.05 | 0.02–0.10 | 平移速度 m/s |
 | `STROKE_M` | 0.30 | 0.05–0.30 | 行程，以起点为中心两边各一半 |
+| `ROT_DEG` / `ROT_DEG_S` | 20 / 5 | 5–30 / 1–10 | 旋转录制的总转角（以中心姿态为中心两边各一半）和角速度；转角再大，偏航时 J5 会超出走过的范围（3.4）；角速度还要满足旋转模糊 ≤ `MAX_BLUR_PX` |
+| `PITCH_HEADING_DEG` | −35 | −45–0 | 俯仰录制的中心朝向：起点绕竖直轴转的角度，负为向右；让俯仰不用转 J6（3.4） |
 | `EXPOSURE_US` | 10000 | 1000–15000 | 曝光，传给 zed_record |
 | `ANALOG_GAIN_MDB` | 1000 | 1000–16000 | 模拟增益，传给 zed_record；缩短曝光后画面偏暗时调大 |
 | `MAX_BLUR_PX` / `NEAREST_DEPTH_M` | 1.0 / 1.0 | 0.3–2.0 / 0.3–20 | 允许的运动模糊（1080p 像素），以及画面里最近物体的距离 |
@@ -188,11 +195,11 @@
 | `REPOSITION_MPS` | 0.05 | 0.01–0.10 | 录制前移到起点的速度 |
 | `WEBAPP_SPEED_PCT` | 10 | 1–100 | WebApp 里的速度百分比，照抄过来（SDK 读不到）；两边必须一致，改了要重跑 speed-test |
 | `ACCEL_PCT` | 100 | 1–100 | MoveL 加速度百分比（oacc）；改了要重跑 speed-test |
-| `SPEED_TEST_PCT` / `SPEED_TEST_MM` | 5 / 100 | 1–10 / 50–150 | speed-test 去程的速度百分比和竖直行程 |
+| `SPEED_TEST_PCT` / `SPEED_TEST_MM` | 5 / 100 | 1–10 / 50–150 | speed-test 去程的速度百分比和竖直行程；movec-test 也用这个速度百分比 |
 | `MAX_SPEED_ERROR` | 0.10 | 0.02–0.3 | 平移实测速度和预计速度相差超过它就警告 |
 | `MAX_SPEED_RIPPLE` | 0.05 | 0.01–0.2 | 平移巡航段速度波动超过它就警告 |
 | `MIN_CAMERA_Z_M` | 0.35 | 0–1.5 | 相机光心最低高度（基坐标系 z） |
-| `JOINT_MIN_DEG` / `JOINT_MAX_DEG` | 见文件 | | 允许的关节范围：覆盖起点附近 ±150 mm 平移和 ±15° 摆动，并离奇异位形至少 15° |
+| `JOINT_MIN_DEG` / `JOINT_MAX_DEG` | 见文件 | | 允许的关节范围：腕部 J4–J6 限制在已安全走过的范围（3.4），J1–J3 覆盖起点附近 ±150 mm 平移，离奇异位形至少 15° |
 | `MAX_JOINT_STEP_DEG` | 5 | 1–15 | 路径上每 10 mm / 2° 允许的最大关节变化，超过说明逆解可能跳支 |
 | `MIN_FREE_GB` | 5 | 1–100 | 开始录制前 Box 至少剩余的磁盘空间 |
 
@@ -219,16 +226,19 @@
 ```bash
 cd ~/ROBOT/fr5_record
 python3 run_session.py set-start               # 读当前位姿，算出相机水平的起点并保存（不动）
-python3 run_session.py plan                    # 空跑：检查 6 条录制和 sync-test 的全部目标点（不动）
+python3 run_session.py plan                    # 空跑：检查全部录制和 sync-test 的路径（不动）；也可只列几条，如 plan yaw_left pitch_up
 python3 run_session.py goto-start --scale 0.25 # 低速移到起点
 python3 run_session.py speed-test              # 速度标定（不开相机）；改了 WebApp 速度百分比或 ACCEL_PCT 要重跑
 python3 run_session.py sync-test               # 时间同步验证（只做同步摆动）
+python3 run_session.py movec-test              # MoveC 探测（不开相机）：MoveC 和 MoveL 各绕光心竖直轴转 ±10°，对照光心偏离和速度
 python3 run_session.py record forward          # 正式录制，另有 backward / right / left / up / down
+python3 run_session.py record yaw_left         # 旋转录制，另有 yaw_right / pitch_up / pitch_down
 ```
 
-- **每条录制的结构**：静止 5 s → 同步摆动 → 静止 3 s → 单向平移 300 mm → 静止 3 s → 同步摆动 → 静止 5 s，共约 32 s、0.4 GB。结束后自动计算真值，并打印 Δt 和前后段差。
+- **每条录制的结构**：静止 5 s → 同步摆动 → 静止 3 s → 单向平移 300 mm（或绕光心旋转 20°）→ 静止 3 s → 同步摆动 → 静止 5 s，共约 32 s、0.4 GB。结束后自动计算真值，并打印 Δt 和前后段差；旋转录制还打印实测角速度、转角和光心最大偏离。
 - **每段运动结束后**打印实测的法兰线速度、角速度和用时，可以和计划对照。
 - `--scale 0.25`：按比例降速，用于首次低速演练。这时同步摆动只有 5 °/s，算不出 Δt，数据不用。
+- **俯仰录制第一次**：移到起点时会先向右转 35°，J5 到 −89° 左右，平移录制没走过这个区域，标定时走过。先用 `--scale 0.25` 演练，旁边有人盯着 Box 和腕部之间的间隙以及线缆；同时看一下新朝向的画面里纹理够不够、有没有人走动。
 - `--tag board`：给录制目录名加后缀（如 `…_right_board/`），用来区分验证录制和正式录制。
 - 按 Ctrl+C 或 SSH 断开：先停机械臂，再正常停相机，保存已录的数据。断开后的输出写进录制目录里的 `run_session.log`。
 
@@ -273,7 +283,8 @@ python3 run_session.py record forward          # 正式录制，另有 backward 
    ├─ time_meta.txt          相机设置，含第 30 帧读回的实际曝光和增益
    ├─ fr5_state.csv          机械臂状态（约 100 Hz）：Box 时间、控制器时间、关节、法兰位姿、错误码等
    ├─ fr5_meta.json          丢包、断线、时钟跳变、接收缓冲区大小等
-   ├─ motion_log.json        每段指令：时间、速度百分比、预计速度、实测速度；平移段速度和波动；所用速度标定
+   ├─ motion_log.json        每段指令：时间、速度百分比、预计速度、实测速度；平移段速度和波动；所用速度标定；
+   │                         旋转录制还有 MoveC 的中间点、转轴、光心偏离，以及旋转段的角速度汇总（rotate_speed）
    ├─ groundtruth_tum.txt    每张图一行：timestamp tx ty tz qx qy qz qw（Unix 秒、米），左目在 FR5 基坐标系下（已加修正）
    ├─ groundtruth_tum_uncorrected.txt  同上，不加时间修正和行程放大（对照用）
    ├─ groundtruth_arm_rate_tum.txt   机械臂每个状态包一行，格式同上（已加修正）

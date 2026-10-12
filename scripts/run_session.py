@@ -4,11 +4,14 @@
 
 在 Box 自己的终端里运行（人在机械臂旁边，手边有急停）：
     python3 run_session.py set-start        读当前位姿，算出相机水平的起点并保存（不动机械臂）
-    python3 run_session.py plan             空跑：检查 6 条录制和 sync-test 的全部目标点（不动机械臂）
+    python3 run_session.py plan             空跑：检查全部录制（6 条平移、4 条旋转）和 sync-test 的路径（不动机械臂）
     python3 run_session.py goto-start       低速移到水平起点（会先确认）
     python3 run_session.py speed-test       速度标定：实测速度百分比对应的 mm/s 和 °/s（会先确认，不开相机）
     python3 run_session.py sync-test        时间同步验证：只做同步摆动的录制（会先确认）
-    python3 run_session.py record forward   正式录制一条：forward/backward/right/left/up/down（会先确认）
+    python3 run_session.py movec-test       MoveC 探测：在起点用 MoveC 和 MoveL 各绕光心竖直轴转 ±10°，对照光心偏离（会先确认，不开相机）
+    python3 run_session.py record forward   正式录制一条（会先确认）
+                                            平移：forward/backward/right/left/up/down
+                                            旋转（绕光心）：yaw_left/yaw_right/pitch_up/pitch_down
 选项：--scale 0.25  首次运行按比例降速；--yes  跳过确认（只在你已经看过计划时用）；
       --tag board  加在录制目录名后面（区分验证录制和正式录制）
 
@@ -19,6 +22,11 @@ sync-test 和 record 需要先有 speed-test 的结果；改了 WebApp 速度百
 # ================================ 可修改参数 ================================
 SPEED_MPS = 0.05             # 平移速度 m/s
 STROKE_M = 0.30              # 每条录制的行程 m（以 set-start 保存的起点为中心，两边各一半）
+ROT_DEG = 20.0               # 旋转录制的总转角 °（以中心姿态为中心，两边各一半；绕光心，MoveC）
+                             # 20° 时偏航 ±10° 加摆动 ±10°，J5 正好在平移录制走过的范围里；30° 要超出
+ROT_DEG_S = 5.0              # 旋转角速度 °/s（模糊和景深无关：曝光 10 ms 时 5 °/s 约 0.64 px）
+PITCH_HEADING_DEG = -35.0    # 俯仰录制的中心朝向：起点绕竖直轴转这么多（负 = 向右）。起点处 J5 约 −45°，
+                             # 直接俯仰要靠 J6 抵消横滚分量（俯仰 1° J6 转约 1°）；右转 35° 后 J5 约 −89°，俯仰只用 J2–J4
 EXPOSURE_US = 10000          # 曝光 μs（传给 zed_record）
 ANALOG_GAIN_MDB = 1000       # 模拟增益 mdB（传给 zed_record）；缩短曝光后画面偏暗时调大
 MAX_BLUR_PX = 1.0            # 允许的最大运动模糊（1080p 像素）
@@ -37,10 +45,12 @@ SPEED_TEST_PCT = 5           # speed-test 去程的速度百分比；没标定�
 SPEED_TEST_MM = 100          # speed-test 在起点竖直上下的行程 mm
 MAX_SPEED_ERROR = 0.10       # 平移实测速度和预计速度相差超过 10% 就警告（speed-test 里也用来检查是否成正比）
 MIN_CAMERA_Z_M = 0.35        # 相机光心最低高度（基坐标系 z，m）；按现场桌面和障碍物修改
-# 允许的关节范围（°）。默认覆盖当前起点附近 ±150 mm 平移和 ±15° 摆动并留有余量，
-# 同时离腕部（J5=0）和肘部（J3=0）奇异位形至少 15°，J6 限制在 ±30° 以免扯线。按现场确认修改。
-JOINT_MIN_DEG = [80.0, -30.0, -130.0, -175.0, -90.0, -30.0]
-JOINT_MAX_DEG = [160.0, 60.0, -15.0, -70.0, -15.0, 30.0]
+# 允许的关节范围（°）。腕部 J4–J6 限制在这套末端装置已经安全走过的范围内（再往外 Box 可能碰到腕部，
+# 见标定仓库 README 6.4 / 6.7）：10-10、10-12 录制实测 J4 −151～−99、J5 −69.5～−22.1、J6 一直是 0，各留约 3° 余量；
+# 俯仰录制（右转 35° 后）要 J4 −128～−96、J5 −103～−76，按标定走过的范围（J4 −154～−77、J5 −119～−56）放宽到 −90、−106。
+# J6 只放 ±5°，需要转 J6 的计划（如横滚）在空跑时就会被拒绝。J1–J3 覆盖起点附近 ±150 mm 平移，离肘部奇异（J3=0）至少 15°。
+JOINT_MIN_DEG = [80.0, -30.0, -130.0, -154.0, -106.0, -5.0]
+JOINT_MAX_DEG = [160.0, 60.0, -15.0, -90.0, -19.0, 5.0]
 MAX_JOINT_STEP_DEG = 5.0     # 路径上每 10 mm / 2° 允许的最大关节变化（超过说明逆解可能跳支）
 MAX_SPEED_RIPPLE = 0.05      # 平移巡航段速度波动（标准差/均值）超过它就警告“速度不平稳”
 MIN_FREE_GB = 5.0            # 开始录制前 Box 至少剩余的磁盘空间 GB
@@ -50,11 +60,15 @@ ZED_RECORD = "~/ROBOT/zed_imu/build/zed_record"
 HANDEYE = "~/ROBOT/fr5_record/handeye_s003_result.json"
 START_POSE = "~/ROBOT/fr5_record/start_pose.json"
 SPEED_CAL = "~/ROBOT/fr5_record/speed_calibration.json"
+MOVEC_TEST = "~/ROBOT/fr5_record/movec_test.json"
 
 # 允许范围 [下限, 上限]，超出就拒绝运行
 RANGES = {
     "SPEED_MPS": (0.02, 0.10),       # 下限暂定，待平稳性测试确认；上限还受 MAX_BLUR_PX 约束
     "STROKE_M": (0.05, 0.30),        # ±150 mm 已做离线可达性检查
+    "ROT_DEG": (5.0, 30.0),          # 能不能转满还要看 plan 的关节检查
+    "ROT_DEG_S": (1.0, 10.0),        # 上限还受 MAX_BLUR_PX 约束
+    "PITCH_HEADING_DEG": (-45.0, 0.0),   # 只能向右转：向左 J5 会接近 0°（腕部奇异）
     "EXPOSURE_US": (1000, 15000),
     "ANALOG_GAIN_MDB": (1000, 16000),
     "MAX_BLUR_PX": (0.3, 2.0),
@@ -121,7 +135,18 @@ def p(path: str) -> Path:
 
 def motion_config() -> fm.MotionConfig:
     return fm.MotionConfig(SPEED_MPS, STROKE_M, HOLD_START_S, HOLD_MID_S, HOLD_END_S,
-                           WIGGLE_DEG, WIGGLE_DEG_S, int(WIGGLE_CYCLES), REPOSITION_MPS, SYNC_TEST_HOLD_S)
+                           WIGGLE_DEG, WIGGLE_DEG_S, int(WIGGLE_CYCLES), REPOSITION_MPS, SYNC_TEST_HOLD_S,
+                           ROT_DEG, ROT_DEG_S, PITCH_HEADING_DEG)
+
+
+RECORD_NAMES = [*fm.DIRECTIONS, *fm.ROTATIONS]
+
+
+def heading_note(name: str) -> str:
+    """俯仰录制先转到另一个朝向（见 PITCH_HEADING_DEG），计划里写明。"""
+    if name in fm.ROTATIONS and fm.ROTATIONS[name][0] == "x" and PITCH_HEADING_DEG:
+        return f"中心朝向：起点绕竖直轴向右转 {-PITCH_HEADING_DEG:g}°（画面和平移录制不同）"
+    return ""
 
 
 CAL_KEYS = ("WEBAPP_SPEED_PCT", "ACCEL_PCT", "WIGGLE_DEG")  # 这些改了，speed-test 的结果就不能用了
@@ -160,6 +185,8 @@ def report_move(seg: fm.Segment) -> None:
         parts.append(f"角速度 {m['angular_deg_s']['mean']:.2f} °/s")
     if m.get("duration_s") is not None:
         parts.append(f"用时 {m['duration_s']:.1f} s")
+    if seg.log.get("pivot_dev_max_mm") is not None:
+        parts.append(f"光心最大偏离 {seg.log['pivot_dev_max_mm']:.2f} mm")
     gap = m.get("max_gap_s") or 0.0
     print(f"    {seg.name}：速度 {seg.percent:.2f}%，实测 " + ("，".join(parts) or "行程太短，没测速度")
           + (f"（期间状态中断 {gap:.1f} s，用时不准）" if gap > 0.1 else ""), flush=True)
@@ -175,6 +202,11 @@ def parameter_problems() -> list[str]:
         v_max = MAX_BLUR_PX * NEAREST_DEPTH_M / (fm.FX_1080 * EXPOSURE_US * 1e-6)
         out.append(f"速度 {SPEED_MPS} m/s、曝光 {EXPOSURE_US} μs 时 {NEAREST_DEPTH_M} m 处模糊 {blur:.2f} px，"
                    f"超过 MAX_BLUR_PX={MAX_BLUR_PX}；这个曝光下速度最高 {v_max:.3f} m/s")
+    blur_rot = fm.rotation_blur_px(ROT_DEG_S, EXPOSURE_US)
+    if blur_rot > MAX_BLUR_PX:
+        w_max = MAX_BLUR_PX / blur_rot * ROT_DEG_S
+        out.append(f"旋转 {ROT_DEG_S} °/s、曝光 {EXPOSURE_US} μs 时模糊 {blur_rot:.2f} px，"
+                   f"超过 MAX_BLUR_PX={MAX_BLUR_PX}；这个曝光下角速度最高 {w_max:.1f} °/s")
     return out
 
 
@@ -222,7 +254,7 @@ def describe(segments: list[fm.Segment], pending: dict | None = None, totals: bo
             lines.append(f"  {s.name:<16} 静止 {s.duration_s:.1f} s")
             continue
         x, y, z = s.flange[:3]
-        head = f"  {s.name:<16} 移动 {s.distance_mm:5.1f} mm / {s.angle_deg:4.1f}°，"
+        head = f"  {s.name:<16} {'圆弧' if s.motion == 'C' else '移动'} {s.distance_mm:5.1f} mm / {s.angle_deg:4.1f}°，"
         tail = f"，法兰目标 ({x:.1f}, {y:.1f}, {z:.1f}) mm" + ("（不录制）" if not s.recorded else "")
         if pending and s.name in pending:
             lines.append(head + pending[s.name] + tail)
@@ -287,13 +319,14 @@ def cmd_plan(args, problems: list[str]) -> int:
     f_t_c, _ = gt.load_handeye(p(HANDEYE))
     start = load_start()
     cfg = motion_config()
-    names = args.names or [*fm.DIRECTIONS, "sync-test"]
-    unknown = [n for n in names if n not in fm.DIRECTIONS and n != "sync-test"]
+    names = args.names or [*RECORD_NAMES, "sync-test"]
+    unknown = [n for n in names if n not in RECORD_NAMES and n != "sync-test"]
     if unknown:
         print(f"不认识的录制名：{unknown}")
         return 2
     print(f"模糊估算：{NEAREST_DEPTH_M} m 处 左右/上下平移 {fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px，"
-          f"前后平移画面边缘约 {1.3 * fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px（1080p）")
+          f"前后平移画面边缘约 {1.3 * fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px；"
+          f"旋转 {fm.rotation_blur_px(ROT_DEG_S, EXPOSURE_US):.2f} px（1080p）")
     model, note = load_speed_model()
     print(note if model else f"注意：{note}；下面没有速度百分比，时长按设计速度估算")
     with tempfile.TemporaryDirectory() as tmp:
@@ -306,6 +339,8 @@ def cmd_plan(args, problems: list[str]) -> int:
                         else fm.plan_recording(name, start["camera"], f_t_c, cfg))
                 found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
                 print(f"\n=== {name}：{'通过' if not found else '有问题'}")
+                if heading_note(name):
+                    print(f"  {heading_note(name)}")
                 print(describe(segs))
                 for m in found:
                     print(f"  问题：{m}")
@@ -326,6 +361,33 @@ def translate_summary(seg: fm.Segment, scale: float) -> dict | None:
             "mean_mm_s": m["mean"], "min_mm_s": m["min"], "max_mm_s": m["max"], "ripple": m["ripple"],
             "smooth": m["ripple"] is not None and m["ripple"] <= MAX_SPEED_RIPPLE,
             "error": error, "speed_ok": abs(error) <= MAX_SPEED_ERROR}
+
+
+def rotate_summary(seg: fm.Segment, scale: float) -> dict | None:
+    """旋转段的实测角速度、转角、光心偏离，和预计、设计值对照。"""
+    measured = seg.log.get("measured") or {}
+    m = measured.get("angular_deg_s")
+    if not m or not seg.expect_deg_s:
+        return None
+    error = m["mean"] / seg.expect_deg_s - 1.0
+    return {"design_deg_s": ROT_DEG_S * scale, "expected_deg_s": seg.expect_deg_s, "percent": seg.percent,
+            "mean_deg_s": m["mean"], "min_deg_s": m["min"], "max_deg_s": m["max"], "ripple": m["ripple"],
+            "smooth": m["ripple"] is not None and m["ripple"] <= MAX_SPEED_RIPPLE,
+            "error": error, "speed_ok": abs(error) <= MAX_SPEED_ERROR,
+            "angle_deg": measured.get("angle_deg"), "planned_angle_deg": seg.angle_deg,
+            "pivot_dev_max_mm": seg.log.get("pivot_dev_max_mm")}
+
+
+def segment_log(s: fm.Segment) -> dict:
+    """写进 motion_log.json 的一段。"""
+    return {"name": s.name, "kind": s.kind, "recorded": s.recorded, "planned_duration_s": s.duration_s,
+            "motion": s.motion, "flange": s.flange, "joints": s.joints,
+            "via_flange": s.via_flange, "via_joints": s.via_joints,
+            "arc_axis": s.arc_axis.tolist() if s.arc_axis is not None else None, "arc_deg": s.arc_deg,
+            "pivot_m": s.pivot.tolist() if s.pivot is not None else None,
+            "design_speed_mm_s": s.speed_mm_s, "design_rate_deg_s": s.rate_deg_s,
+            "distance_mm": s.distance_mm, "angle_deg": s.angle_deg,
+            "percent": s.percent, "expect_mm_s": s.expect_mm_s, "expect_deg_s": s.expect_deg_s, **s.log}
 
 
 def cmd_motion(args, kind: str, direction: str | None) -> int:
@@ -379,7 +441,8 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         if found:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
         header = (f"{name}：速度比例 {args.scale}" + (f"，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
-                  + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%")
+                  + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%"
+                  + (f"\n{heading_note(name)}" if heading_note(name) else ""))
         confirm_plan(header + "\n" + describe(segs, totals=zed is not None), args.yes)
         ran = True
         runner.run(segs[0])                      # 移到起点（相机还没开始录）
@@ -419,16 +482,15 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         "start_pose": {k: start[k] for k in ("base_T_camera", "flange", "joints", "created")},
         "handeye_sha256": handeye["sha256"],
         "zed_record": zed.info if zed else None,
-        "segments": [{"name": s.name, "kind": s.kind, "recorded": s.recorded, "planned_duration_s": s.duration_s,
-                      "flange": s.flange, "joints": s.joints, "design_speed_mm_s": s.speed_mm_s,
-                      "design_rate_deg_s": s.rate_deg_s, "distance_mm": s.distance_mm, "angle_deg": s.angle_deg,
-                      "percent": s.percent, "expect_mm_s": s.expect_mm_s, "expect_deg_s": s.expect_deg_s,
-                      **s.log} for s in segs],
+        "segments": [segment_log(s) for s in segs],
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     }
     translate = next((s for s in segs if s.name == "translate"), None)
     if translate is not None and error is None:
         log["translate_speed"] = translate_summary(translate, args.scale)
+    rotate = next((s for s in segs if s.name == "rotate"), None)
+    if rotate is not None and error is None:
+        log["rotate_speed"] = rotate_summary(rotate, args.scale)
     (data_dir / "motion_log.json").write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n数据目录：{session_dir}")
     speed = log.get("translate_speed")
@@ -437,6 +499,13 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
               f"波动 {speed['ripple']:.1%}"
               + ("" if speed["smooth"] else f"，超过 MAX_SPEED_RIPPLE={MAX_SPEED_RIPPLE:.0%}，速度不平稳")
               + ("" if speed["speed_ok"] else f"；和预计差 {speed['error']:+.0%}，超过 MAX_SPEED_ERROR，重跑 speed-test"))
+    rot = log.get("rotate_speed")
+    if rot:
+        print(f"旋转实际角速度 {rot['mean_deg_s']:.2f} °/s（预计 {rot['expected_deg_s']:.2f}，设计 {rot['design_deg_s']:.2f}），"
+              f"波动 {rot['ripple']:.1%}，转角 {rot['angle_deg']:.2f}°（计划 {rot['planned_angle_deg']:.2f}°），"
+              f"光心最大偏离 {rot['pivot_dev_max_mm']:.2f} mm"
+              + ("" if rot["smooth"] else f"；波动超过 MAX_SPEED_RIPPLE={MAX_SPEED_RIPPLE:.0%}，速度不平稳")
+              + ("" if rot["speed_ok"] else f"；和预计差 {rot['error']:+.0%}，超过 MAX_SPEED_ERROR"))
     if error is None and (data_dir / "zed_imu.csv").exists():
         try:
             report = gt.process(data_dir, p(HANDEYE), data_dir)
@@ -549,16 +618,83 @@ def cmd_speed_test(args) -> int:
     return 0
 
 
+def cmd_movec_test(args) -> int:
+    """MoveC 探测：起点上用 MoveC 和 MoveL 各绕光心竖直轴转 +θ、-2θ、+θ（θ = WIGGLE_DEG，同步摆动已走过的范围），
+    速度都是 SPEED_TEST_PCT。看 MoveC 是否被接受、光心是否不动、速度百分比和 MoveL 是否一样。不开相机，结果存 MOVEC_TEST。"""
+    model, note = load_speed_model()
+    if model is None:
+        print(note)
+        return 1
+    f_t_c, _ = gt.load_handeye(p(HANDEYE))
+    start = load_start()
+    segs = fm.plan_movec_test(start["camera"], f_t_c, motion_config(), SPEED_TEST_PCT)
+    error, ran = None, False
+    with tempfile.TemporaryDirectory() as tmp:
+        rec = StateRecorder(tmp, ROBOT_IP)
+        rec.start()
+        try:
+            rpc = rec.open_rpc()
+            runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
+            runner.precheck()
+            found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
+            if found:
+                raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
+            confirm_plan(f"movec-test：圆弧（MoveC）和直线（MoveL）各转 +{WIGGLE_DEG:g}°、-{2 * WIGGLE_DEG:g}°、+{WIGGLE_DEG:g}°，"
+                         f"速度都是 {SPEED_TEST_PCT}%（预计按摆动标定估算，超过 1.5 倍就中止；"
+                         f"圆弧时光心偏离超过 {fm.MAX_PIVOT_DEV_MM} mm 也中止）\n{note}\n只录机械臂状态，不开相机\n"
+                         + describe(segs, totals=False), args.yes)
+            ran = True
+            for seg in segs:
+                print(f"[{seg.name}]", flush=True)
+                runner.run(seg)
+                report_move(seg)
+        except BaseException as exc:  # noqa: BLE001 - 包括 Ctrl+C：先停机械臂
+            error = f"{type(exc).__name__}: {exc}"
+            if ran:
+                fm.emergency_stop(ROBOT_IP)
+            print(f"\n中止：{error}")
+        finally:
+            rec.stop(write=False)
+    if not ran:
+        return 1
+
+    def stats(prefix):
+        done = [s for s in segs if s.name.startswith(prefix) and s.log.get("measured")]
+        rates = [k for k in (_per_pct(s, "angular_deg_s") for s in done) if k]
+        devs = [s.log["pivot_dev_max_mm"] for s in done if s.log.get("pivot_dev_max_mm") is not None]
+        return (float(np.median(rates)) if rates else None), (max(devs) if devs else None), len(done)
+
+    (rate_c, dev_c, n_c), (rate_l, dev_l, n_l) = stats("arc"), stats("line")
+    result = {"created": dt.datetime.now().isoformat(timespec="seconds"), "error": error,
+              "settings": {k: globals()[k] for k in (*CAL_KEYS, "SPEED_TEST_PCT")}, "speed_scale": args.scale,
+              "movec": {"segments_done": n_c, "deg_s_per_pct": rate_c, "pivot_dev_max_mm": dev_c},
+              "movel": {"segments_done": n_l, "deg_s_per_pct": rate_l, "pivot_dev_max_mm": dev_l},
+              "segments": [segment_log(s) for s in segs]}
+    p(MOVEC_TEST).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n已保存 {p(MOVEC_TEST)}")
+
+    def fmt(v, spec):
+        return "—" if v is None else format(v, spec)
+
+    print(f"  MoveC：完成 {n_c}/3 段，1% = {fmt(rate_c, '.3f')} °/s，光心最大偏离 {fmt(dev_c, '.2f')} mm")
+    print(f"  MoveL：完成 {n_l}/3 段，1% = {fmt(rate_l, '.3f')} °/s，光心最大偏离 {fmt(dev_l, '.2f')} mm"
+          f"（摆动标定 1% = {model.wiggle_deg_s_per_pct:.3f} °/s）")
+    if rate_c and rate_l and abs(rate_c / rate_l - 1.0) > MAX_SPEED_ERROR:
+        print(f"  注意：MoveC 和 MoveL 同样百分比下角速度差 {rate_c / rate_l - 1.0:+.0%}，旋转录制的速度要另行换算")
+    return 0 if error is None else 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("set-start")
     plan = sub.add_parser("plan")
-    plan.add_argument("names", nargs="*", help="要检查的录制，默认全部：forward backward right left up down sync-test")
+    plan.add_argument("names", nargs="*", help="要检查的录制，默认全部：6 条平移、4 条旋转和 sync-test")
     for name in ("goto-start", "speed-test", "sync-test"):
         sub.add_parser(name)
+    sub.add_parser("movec-test")
     record = sub.add_parser("record")
-    record.add_argument("direction", choices=list(fm.DIRECTIONS))
+    record.add_argument("direction", choices=RECORD_NAMES)
     for sp in sub.choices.values():
         sp.add_argument("--scale", type=float, default=1.0, help="速度比例 (0, 1]，首次运行建议 0.25")
         sp.add_argument("--yes", action="store_true", help="跳过确认")
@@ -580,6 +716,8 @@ def main(argv=None) -> int:
         return 1
     if args.command == "speed-test":
         return cmd_speed_test(args)
+    if args.command == "movec-test":
+        return cmd_movec_test(args)
     return cmd_motion(args, args.command, getattr(args, "direction", None))
 
 

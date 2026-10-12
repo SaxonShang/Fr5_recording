@@ -264,6 +264,14 @@ class SyntheticSessionTest(unittest.TestCase):
             report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
             self.assertEqual(report["travel_scale"]["factor"], 1.0)
 
+            # 旋转录制（主段叫 rotate，没有 translate）：不缩放
+            segs = [{"name": "goto_start", "flange": [*(P0 * 1000), 0, 0, 0]},
+                    {"name": "rotate", "flange": [*(P0 * 1000), 0, 0, 30]}]
+            (d / "motion_log.json").write_text(json.dumps({"kind": "record", "direction": "yaw_left", "segments": segs}))
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            self.assertEqual(report["travel_scale"]["factor"], 1.0)
+            self.assertEqual(report["travel_scale"]["source"], "none")
+
     def test_duplicate_timestamp_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
