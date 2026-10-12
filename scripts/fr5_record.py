@@ -39,6 +39,7 @@ from fairino import Robot
 
 DEFAULT_IP = "192.168.58.2"
 STATE_PORT = 20004
+RCVBUF_BYTES = 1 << 20  # 1 MB（Box 的 net.core.rmem_max），内核实际给 2 MB，约 8 s 的状态包
 XMLRPC_PORT = 20003
 FRAME_SIZE = ctypes.sizeof(Robot.RobotStatePkg)  # SDK V2.2.1 / 控制器 V3.9.1：1236 字节，含帧头和校验和
 HEADER = b"\x5a\x5a"
@@ -179,6 +180,8 @@ class StateRecorder:
         self._rpcs = []
         self._meta = {}
         self._t0 = None
+        self.rcvbuf_bytes = None
+        self.latest_monotonic = None  # 最新一包到达的 time.monotonic()（秒），判断状态是否新鲜用
 
     def __enter__(self):
         self.start()
@@ -259,8 +262,18 @@ class StateRecorder:
 
     # ---------------------------------------------------------------- 接收线程
     def _connect(self) -> None:
-        sock = socket.create_connection((self.ip, STATE_PORT), timeout=2.0)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # 接收缓冲区开大（连接前设置）：本进程忙于计算、接收线程一时读不过来时，由内核先收着。
+            # 默认 128 KB 只够约 0.5 s 的状态包，缓冲满了控制器就会断开 20004（2026-10-10 实测复现）。
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
+            sock.settimeout(2.0)
+            sock.connect((self.ip, STATE_PORT))
+        except OSError:
+            sock.close()
+            raise
         sock.settimeout(1.0)  # 定期醒来检查停止标志
+        self.rcvbuf_bytes = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         self._sock = sock
 
     def _close_socket(self) -> None:
@@ -332,6 +345,7 @@ class StateRecorder:
             self._rows += row
             self.count += 1
             self._latest = pkg
+            self.latest_monotonic = t_mo / 1e9
             self._cond.notify_all()
 
     def _event(self, message: str) -> None:
@@ -362,6 +376,7 @@ class StateRecorder:
             "sdk_robot_py": Robot.__file__,
             "sdk_robot_py_sha256": hashlib.sha256(Path(Robot.__file__).read_bytes()).hexdigest(),
             "frame_bytes": FRAME_SIZE,
+            "rcvbuf_bytes": self.rcvbuf_bytes,
             "start": start,
             "stop": stop,
             "ntp_start": self._meta["ntp_start"],

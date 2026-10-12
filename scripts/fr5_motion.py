@@ -39,6 +39,7 @@ OVERSPEED_MARGIN_MM_S = 5.0
 STALL_S = 5.0                # 没到位、又连续这么久没有移动，就中止
 STALL_MM, STALL_DEG = 0.05, 0.02
 STATE_LOST_S = 2.0           # 运动中超过这么久没有新的状态包（20004 断开），就中止
+FRESH_S = 0.1                # 发运动指令前，最新状态包必须是这么久之内到达的（正常每 10 ms 一包）
 ONSET_MM, ONSET_DEG = 0.1, 0.05   # 实测用时：从离开起点这么远开始算
 DAY_MS = 86_400_000
 
@@ -310,14 +311,25 @@ def recent_speed(samples, j: int) -> tuple[int, float | None]:
     return j, float(np.linalg.norm(np.subtract(samples[-1][1][:3], samples[j][1][:3]))) / age(j)
 
 
+def angles_to(rots: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """每个旋转矩阵 rots[i]（N×3×3）相对 ref 的转角（°），向量化。"""
+    d = np.einsum("ji,njk->nik", ref, rots)                      # refᵀ · rots[i]
+    cos = (np.trace(d, axis1=1, axis2=2) - 1.0) / 2.0
+    sin = np.linalg.norm(np.stack([d[:, 2, 1] - d[:, 1, 2], d[:, 0, 2] - d[:, 2, 0],
+                                   d[:, 1, 0] - d[:, 0, 1]], axis=1), axis=1) / 2.0
+    return np.degrees(np.arctan2(sin, cos))
+
+
 def motion_stats(samples) -> dict:
-    """一段运动的实测。samples = [(控制器时间 ms, 法兰位姿 6 个数), ...]，含运动前后的静止样本。"""
+    """一段运动的实测。samples = [(控制器时间 ms, 法兰位姿 6 个数), ...]，含运动前后的静止样本。
+    全部向量化：2000 个样本也只要几毫秒。逐个样本算会占住 Python 约 1 s，接收线程读不过来，控制器就断开 20004。"""
     ms = np.array([s[0] for s in samples], dtype=np.int64)
     t = ((ms - ms[0]) % DAY_MS) / 1000.0
-    poses = [fr5_to_matrix(s[1]) for s in samples]
-    xyz = np.array([pose[:3, 3] for pose in poses]) * 1000.0
+    arr = np.array([s[1] for s in samples], dtype=float)
+    xyz = arr[:, :3]
+    rots = gt.euler_to_matrix(arr[:, 3], arr[:, 4], arr[:, 5])
     path = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(xyz, axis=0), axis=1))]
-    angle = np.array([rotation_deg(poses[0], pose) for pose in poses])
+    angle = angles_to(rots, rots[0])
     out = {"samples": len(samples), "path_mm": float(path[-1]), "angle_deg": float(angle[-1]),
            "max_gap_s": float(np.diff(t).max()) if len(t) > 1 else None,   # 状态包最大间隔（断线时变大）
            "linear_mm_s": cruise_rate(t, path) if path[-1] > 2.0 else None,
@@ -329,7 +341,7 @@ def motion_stats(samples) -> dict:
         from_start, to_end = np.linalg.norm(xyz - xyz[0], axis=1), np.linalg.norm(xyz - xyz[-1], axis=1)
     elif out["angular_deg_s"]:
         main, onset = out["angular_deg_s"], ONSET_DEG
-        from_start, to_end = angle, np.array([rotation_deg(pose, poses[-1]) for pose in poses])
+        from_start, to_end = angle, angles_to(rots, rots[-1])
     else:
         return out
     on = np.nonzero(from_start > onset)[0]
@@ -377,27 +389,30 @@ def ctrl_ms(pkg) -> int:
 
 
 class MotionRunner:
-    def __init__(self, recorder, rpc, ip: str, accel_percent: float):
-        self.rec, self.rpc, self.ip, self.accel_percent = recorder, rpc, ip, accel_percent
+    """逐段执行：hold 只监视状态；move 发 MoveL 后由状态判断到位，运动中做各项保护并记录实测。
+    recorder 需提供 wait_state() 和 latest_monotonic（StateRecorder）。"""
+
+    def __init__(self, recorder, rpc, accel_percent: float):
+        self.rec, self.rpc, self.accel_percent = recorder, rpc, accel_percent
         self._count = -1
-        self._fresh_time = time.monotonic()      # 最近一次收到新状态包的时刻
 
     def latest(self, timeout: float = 0.5):
         """最新的状态包；超时没有新包时返回上一个（state_age() 会变大）。"""
-        count, pkg = self.rec.wait_state(self._count, timeout)
-        if count != self._count:
-            self._count, self._fresh_time = count, time.monotonic()
+        self._count, pkg = self.rec.wait_state(self._count, timeout)
         return pkg
 
     def state_age(self) -> float:
-        return time.monotonic() - self._fresh_time
+        """最新状态包到达至今多久（s），按录制器记下的到达时刻算：
+        断线前已到达、但本对象还没取过的包，计数是新的，内容却可能已经过时。"""
+        arrived = self.rec.latest_monotonic
+        return math.inf if arrived is None else time.monotonic() - arrived
 
     def fresh(self, what: str):
-        """等一个新的状态包；STATE_LOST_S 内等不到就中止（还没发运动指令）。"""
-        last, end = self._count, time.monotonic() + STATE_LOST_S
+        """等一个 FRESH_S 内到达的状态包；STATE_LOST_S 内等不到就中止（还没发运动指令）。"""
+        end = time.monotonic() + STATE_LOST_S
         while time.monotonic() < end:
             pkg = self.latest(0.2)
-            if self._count != last:
+            if self.state_age() < FRESH_S:
                 return pkg
         raise MotionAborted(f"{what}: {STATE_LOST_S:.0f} s 没收到新的机械臂状态（20004 断开？），没有发运动指令")
 

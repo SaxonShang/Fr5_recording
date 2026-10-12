@@ -1,0 +1,132 @@
+{
+  "created": "2026-10-10T16:03:05",
+  "settings": {
+    "WEBAPP_SPEED_PCT": 10,
+    "ACCEL_PCT": 100,
+    "WIGGLE_DEG": 10.0
+  },
+  "default_trans_vel_mm_s": 1000.0,
+  "speed_scale": 1.0,
+  "model": {
+    "mm_s_per_pct": 1.0005782613967868,
+    "wiggle_deg_s_per_pct": 0.34728765076986334,
+    "ramp_s": 0.2100513872648715
+  },
+  "checks": {
+    "translate_ratio_minus_1": -0.0020706673926886854,
+    "wiggle_ratio_minus_1": -0.03278462760229073,
+    "webapp_factor": 0.10005782613967869
+  },
+  "tests": [
+    {
+      "name": "goto_start",
+      "percent": 5.0,
+      "distance_mm": 0.004928950695076284,
+      "angle_deg": 0.0008113689523732869,
+      "measured": {
+        "samples": 2,
+        "path_mm": 0.002445027526727819,
+        "angle_deg": 0.000434225896818582,
+        "max_gap_s": 0.012,
+        "linear_mm_s": null,
+        "angular_deg_s": null,
+        "duration_s": null,
+        "ramp_s": null
+      }
+    },
+    {
+      "name": "test_up",
+      "percent": 5,
+      "distance_mm": 99.99999999999997,
+      "angle_deg": 0.0,
+      "measured": {
+        "samples": 2006,
+        "path_mm": 100.65259127770494,
+        "angle_deg": 0.008856394430080615,
+        "max_gap_s": 0.012000000000000455,
+        "linear_mm_s": {
+          "mean": 5.013272126106138,
+          "min": 4.07059232828388,
+          "max": 6.112727606555524,
+          "ripple": 0.07565794401972654
+        },
+        "angular_deg_s": null,
+        "duration_s": 19.983,
+        "ramp_s": 0.07348219848237036
+      }
+    },
+    {
+      "name": "test_down",
+      "percent": 49.86763010492664,
+      "distance_mm": 99.99999999999997,
+      "angle_deg": 0.0,
+      "measured": {
+        "samples": 178,
+        "path_mm": 99.98179934684687,
+        "angle_deg": 0.002689522229669118,
+        "max_gap_s": 0.605,
+        "linear_mm_s": {
+          "mean": 49.896466630365566,
+          "min": 45.95290309554841,
+          "max": 54.045487167654755,
+          "ripple": 0.04097375660556693
+        },
+        "angular_deg_s": null,
+        "duration_s": 1.7400000000000002,
+        "ramp_s": 0.0
+      }
+    },
+    {
+      "name": "test_yaw",
+      "percent": 5,
+      "distance_mm": 20.133634910833553,
+      "angle_deg": 10.000000000000018,
+      "measured": {
+        "samples": 561,
+        "path_mm": 21.06402118010517,
+        "angle_deg": 9.988653303935198,
+        "max_gap_s": 0.012000000000000455,
+        "linear_mm_s": {
+          "mean": 3.6792332278465776,
+          "min": 2.7769004165058675,
+          "max": 5.214416681379461,
+          "ripple": 0.134704248685382
+        },
+        "angular_deg_s": {
+          "mean": 1.795296377005173,
+          "min": 1.662440791803963,
+          "max": 1.9193812255061005,
+          "ripple": 0.02334846577260348
+        },
+        "duration_s": 5.525,
+        "ramp_s": 0.12158315061335045
+      }
+    },
+    {
+      "name": "test_yaw_back",
+      "percent": 55.701109455150345,
+      "distance_mm": 20.133634910833553,
+      "angle_deg": 10.000000000000014,
+      "measured": {
+        "samples": 81,
+        "path_mm": 20.38390470763461,
+        "angle_deg": 9.983648063475036,
+        "max_gap_s": 0.01200000000000001,
+        "linear_mm_s": {
+          "mean": 37.90556356506596,
+          "min": 28.980845623206406,
+          "max": 42.62213935144839,
+          "ripple": 0.08857385365240956
+        },
+        "angular_deg_s": {
+          "mean": 19.344307447954186,
+          "min": 16.310877339212855,
+          "max": 20.46002605488333,
+          "ripple": 0.051567302995894924
+        },
+        "duration_s": 0.732,
+        "ramp_s": 0.2100513872648715
+      }
+    }
+  ]
+}

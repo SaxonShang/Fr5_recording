@@ -1,124 +1,243 @@
 # FR5 + ZED X 数据录制（SIO_SLAM 机械臂真值）
 
-> 最后同步：2026-10-10。**正本在 Box 的 `~/ROBOT/fr5_record/`**，本文件夹是笔记本上的备份。
-> Box 上的脚本改动后，在本文件夹运行 `.\sync_from_box.ps1` 拉回最新版本。
+> 脚本的正本在 Box 的 `~/ROBOT/fr5_record/`，本仓库是笔记本上的备份，用 `.\sync_from_box.ps1` 从 Box 拉取。
+> 实验过程、发现和问题处理见 [实验记录.md](实验记录.md)。
 
 ## 1. 目标
 
-用 FR5 机械臂带着 ZED X 做已知运动，同时录制双目图像、ZED 机身 IMU 和机械臂状态，离线算出相机位姿真值，供 SIO_SLAM 评估。
+用 FAIRINO FR5 机械臂带着 ZED X 做已知运动，同时录制双目图像、ZED 机身 IMU 和机械臂状态，离线算出相机位姿真值，供 [SIO_SLAM](https://github.com/lihongliang0203/SIO_SLAM) 评估。
 
-第一批只录 6 条：相机始终**水平朝前**，每条只沿一个方向做纯平移：前进、后退、右移、左移、上升、下降（默认 0.05 m/s，行程 300 mm）。
-
-相机真值：`base_T_camera(t) = base_T_flange(t) · flange_T_left_camera`。其中手眼外参来自标定仓库 s003 的结果（`scripts/handeye_s003_result.json`），前提是相机安装之后没有动过。
+- **第一批 6 条录制**：相机始终水平朝前，每条只沿一个方向做纯平移：前进、后退、右移、左移、上升、下降。默认速度 0.05 m/s，行程 300 mm。
+- **正式录制前先验证两件事**：(1) 时间同步；(2) 真值，用固定的标定板检验。标定板只在验证录制中出现，正式录制时撤掉。
+- **相机真值**：`base_T_camera(t) = base_T_flange(t) · flange_T_left_camera`。手眼外参来自标定仓库 s003 的结果（`scripts/handeye_s003_result.json`），前提是相机安装之后没有动过。
 
 ## 2. 硬件、网络与软件版本
 
 | 项目 | 值 |
 |---|---|
 | 机械臂 | FAIRINO FR5，型号 `FR5-V1-002(V6.0)`；WebApp `v3.9.1`；控制器软件 `V3.9.5-QX` |
-| 相机 | ZED X（S/N 49953548），ZED SDK 5.1.2，HD1080 / 15 fps，校正后左目，`FLIP_MODE.OFF`，关闭自标定 |
-| 计算单元 | ZED Box Mini（Jetson，L4T R36.4.4，Ubuntu 22.04，Python 3.10） |
-| Box WiFi | `10.255.250.132`（DHCP，可能会变），笔记本通过它 SSH：`ssh user@10.255.250.132` |
+| 相机 | ZED X（S/N 49953548），ZED SDK 5.1.2，HD1080 / 15 fps，全局快门；录校正后的左右目 JPEG，关闭自标定 |
+| 计算单元 | ZED Box Mini（Jetson，L4T R36.4.4，Ubuntu 22.04，Python 3.10），自带显示器和鼠标 |
 | Box 有线 | `192.168.58.11/24`（NetworkManager "Wired connection 1"，固定 IP，无网关），网线直连 FR5 控制器 `192.168.58.2` |
-| 控制器端口 | 20003 XML-RPC 指令；20004 实时状态推送（**同一时间只服务一个连接**）；80 / 9999 WebApp |
-| FAIRINO Python SDK | V2.2.1（对应机器人 V3.9.1），官方仓库 `FAIR-INNOVATION/fairino-python-sdk` 提交 `060c68bb85f05d0097cc5efa360ddc61d6bb72e0` 的 `linux/fairino/Robot.py`，装在 Box `~/.local/lib/python3.10/site-packages/fairino/`，SHA256 `b0dbb2e4…103e`。只依赖标准库 |
-| WebApp 浏览器 | Box 上用 Falkon：`falkon http://192.168.58.2/ &` |
+| Box WiFi | `10.255.250.132`（DHCP，可能会变），笔记本通过它 SSH：`ssh user@10.255.250.132` |
+| 控制器端口 | 20003 XML-RPC 指令；20004 实时状态推送（同一时间只服务一个连接）；80 / 9999 WebApp |
+| FAIRINO Python SDK | V2.2.1（对应机器人 V3.9.1）：官方仓库 `FAIR-INNOVATION/fairino-python-sdk` 提交 `060c68bb85f05d0097cc5efa360ddc61d6bb72e0` 的 `linux/fairino/Robot.py`，装在 Box 的 `~/.local/lib/python3.10/site-packages/fairino/`，SHA256 `b0dbb2e4…103e`，只依赖标准库。V2.2.5 用 20005 端口的 CNDE 协议，这台控制器不支持 |
+| WebApp | Box 上用 Falkon 打开：`falkon http://192.168.58.2/ &`。自动模式的速度百分比设为 10% |
+| 笔记本 | 标定板验证用标定仓库 `D:\天府绛溪实验室\calibration` 的 `.venv`（OpenCV 4.14，带 aruco）。Box 上的 Python 导入不了 OpenCV |
 
-SDK V2.2.5（对应 V3.9.5）试过，不能用：它改用 20005 端口的 CNDE 协议，这台控制器拒绝连接 20005。
+## 3. 算法
 
-## 3. 文件说明
+### 3.1 相机真值
+
+机械臂状态以约 100 Hz 推送法兰位姿（20004 端口）。每张图像在其曝光中心时刻插值法兰位姿（位置线性插值，姿态用 SLERP），再乘手眼外参得到左目相机在 FR5 基坐标系下的位姿。超出机械臂数据范围、或两侧状态包间隔超过 30 ms（丢包）的帧不输出真值；带机械臂错误码的帧会在 `groundtruth_images.csv` 中标记出来。
+
+### 3.2 时间同步
+
+涉及三个时钟：ZED 的图像和 IMU 时间戳本来就是 Box 系统时间；机械臂状态包带的是控制器时间，没有同步，比 Box 快约 125 s，漂移约 200 ppm；另外还有各环节未知的固定延迟。所有数据统一换算到 Box 系统时间。
+
+1. **状态包接收**：录制程序独占 20004 连接，每包到达时记下 Box 的系统时间和单调时钟，停止时一次写盘。接收缓冲区设为 2 MB（约 8 s 的数据），即使同一进程里的计算一时占住 Python，控制器也不会因为发不出去而断开连接。
+2. **控制器时钟换算**：每 2 s 取“到达时间 − 控制器时间”的最小值（延迟最小、最接近真实的那些包），对这些下包络点做直线拟合，得到偏差和漂移。每条录制单独拟合。
+3. **剩余时间差 Δt**：把 ZED 陀螺仪的角速度大小（用静止段估出零偏后扣除）和由法兰姿态差分得到的角速度大小做互相关。为此每条录制的开头和结尾都有同步摆动：绕过相机光心的竖直轴 ±10°，20 °/s，来回 2 次，相机保持水平。前 40% 和后 40% 的数据还会分别估一次 Δt，两者相差超过 2 ms 就报警。
+4. **曝光中心**：ZED 的图像时间戳不在曝光中间。对每一帧，取它前后半帧内 `image_sync_trigger=1` 的 IMU 样本（曝光期间采到的样本），用最早和最晚样本的中点减去图像时间戳，再用中位数绝对偏差剔除离群帧，得到曝光中心相对时间戳的偏差（实测约 −3.5 ms），真值在曝光中心取。输出文件里仍写图像原来的时间戳。IMU 每 5 ms 一个样本，这个估计最多有约 ±0.8 ms 的量化偏差。
+
+**结果**
+
+- 合成数据：恢复出 200.4 ppm 的漂移；真值位置误差 RMS 0.012 mm，转角误差 RMS 0.0066°。
+- 全速 sync-test 4 次（每次约 30 s）：
+
+  | 录制 | Δt (ms) | 互相关峰值 | 前后段差 (ms) | 单次拟合漂移 (ppm) | 曝光中心 (ms) |
+  |---|---|---|---|---|---|
+  | 161111 | +2.11 | 0.9988 | 0.08 | 160.0 | −3.59 |
+  | 161424 | +1.99 | 0.9992 | 0.64 | 200.7 | −3.52 |
+  | 161510 | +2.81 | 0.9989 | 1.20 | 209.1 | −3.39 |
+  | 161611 | +3.22 | 0.9992 | 0.47 | 204.9 | −3.50 |
+
+- 每次录制内部，前后段差 ≤ 1.2 ms。跨录制看，“时钟偏差 + Δt”（控制器时间到相机时间的总换算）在 5 分钟内落在同一条 198.7 ppm 的漂移直线上，残差 ≤ 0.24 ms。所以各次 Δt 的差别只是时钟拟合和 Δt 之间的分配不同。
+- 1 ms 的时间误差，在 50 mm/s 平移时相当于 0.05 mm，在 20 °/s 转动时相当于 0.02°。
+- 上述检验只能说明同步是自洽的，查不出一个固定的整体偏移。标定板验证（3.3）发现真值整体比图像晚约 4.3 ms。
+
+### 3.3 真值验证（标定板）
+
+标定板（Kalibr Aprilgrid，6×6 个 tag，每个 55 mm）固定放在相机前方约 1 m 处。每张左目图检测标定板，用 PnP 求出 `camera_T_board`（先 IPPE 再 LM 细化；用 s003 的内参；至少 8 个 tag，重投影 RMS ≤ 1 px）。再乘上真值得到 `base_T_board`。真值准确的话，`base_T_board` 应该始终不变。
+
+- **重复性**：同一位置的不同静止段之间，标定板位姿应该相同。
+- **空间误差**：平移前后两个位置的静止段之间的差，分解到起点相机系（x 右、y 下、z 前）。
+- **时间扫描**：把真值时间整体平移 δ，找使摆动帧最一致的 δ。只用在静止位置附近做同步摆动的帧，每帧和同一位置的静止段比较，这样平移带来的空间误差不会混进来。这个检验和陀螺仪互相关完全独立，δ 应接近 0。
+- **误差分解**：right / up / forward 三个方向互相正交。把三条的“标定板差 = E · 相机移动量”写成 3×3 矩阵 E，用 7 个参数做最小二乘：横向尺度、深度方向额外尺度、三个转角、主点偏差 (cx, cy)。
+  - 尺度误差（标定板尺寸或机械臂行程）沿运动方向；
+  - 焦距误差只放大深度；
+  - 主点偏差只在深度变化时（forward）产生横向差；
+  - 手眼转角误差 θ 产生垂直于运动方向的差 −θ × m；
+  - 手眼平移误差在差分中抵消。
+- 合成数据测试：人为让真值晚 4 ms，从图像中找回 +4.0 ms；三个静止位置之间的差 0.03 mm。
+
+**结果**（标定板距离 1.0–1.3 m，三条录制每帧都检测到标定板，重投影中位 0.13 px）
+
+| 检查 | right | up | forward |
+|---|---|---|---|
+| 重复性（同一位置的静止段之间） | 0.02–0.03 mm | 0.02–0.06 mm | 0.02–0.15 mm |
+| 平移 300 mm 后标定板差（起点相机系，mm） | (−2.05, −1.97, +0.14) | (−0.56, +2.04, +1.46) | (+2.88, +2.82, +0.38) |
+| 平移后标定板姿态差 | 0.09° | 0.14° | 0.06° |
+| 时间扫描 δ | +3.97 ms | +4.41 ms | +4.44 ms |
+| 摆动帧离散（δ = 0 → 最佳 δ） | 1.20 → 0.32 mm | 1.31 → 0.31 mm | 1.33 → 0.37 mm |
+
+- **时间**：**真值比图像晚 4.27 ms**（三条平均，标准差 0.26 ms；12 个位置分别在 +3.7 到 +4.9 ms 之间）。
+  - 这是陀螺仪和图像之间的固定偏移，不是时钟拟合的问题。依据：“Δt + δ”在三条之间相差 1.0 ms，而 δ 只差 0.5 ms。
+  - 偏移来源有两种可能：ZED 陀螺仪输出滞后（内部滤波）；或者由 `image_sync_trigger` 估出的曝光中心（−3.5 ms）有偏差。曝光固定为 10 ms 时两者效果相同，改变曝光后要重新验证。
+  - `fr5_groundtruth.py` 目前**还没有**加入这个修正。
+- **空间**：误差按每 300 mm 平移计，分解结果如下。拟合残差 0.7 mm，来自 right 和 up 对绕光轴转角的估计不一致。
+
+  | 分量 | 大小 | 可能来源 |
+  |---|---|---|
+  | 横向尺度（right、up 一致） | −0.68%，即 −2.05 mm | 标定板比 412.5 mm 小，或机械臂实际行程比报告的长 |
+  | 深度方向额外尺度 | +0.81%，即 +2.4 mm | 焦距偏小约 0.8%（fx ≈ 740 px，内参用的是 734 px），或机械臂前后方向的尺度误差 |
+  | 主点偏差 | cx +7.4 px，cy +3.3 px | 出厂内参的主点偏差，或机械臂前进时路径偏斜 |
+  | 转角 | 0.37°（绕 x 0.28°，绕 y 0.03°，绕 z 0.24°） | 手眼转角误差（s003 的随机误差为 0.12°，1σ），或机械臂路径偏斜 |
+
+  - 标定板验证测到的是“相机测量 + 真值”的总误差。每一项的两种来源里，前一种（标定板尺寸、内参）只影响这项验证，不影响真值；后一种（机械臂）才是真值误差。
+  - 手眼转角误差在纯平移时只给真值姿态带来一个固定偏差，不影响真值位置。
+
+### 3.4 运动与速度
+
+- **轨迹**：所有目标点先换算成相机位姿，再除以手眼外参得到法兰目标。MoveL 以非阻塞方式下发，到位由状态包判断。录制前用控制器逆解沿路径每 10 mm / 2° 检查一次：有解、关节在允许范围内、不跳到另一组逆解、相机不低于下限。
+- **速度**：这台控制器拒绝 MoveL 的物理速度模式（mm/s），所以用百分比速度。百分比和实际速度的换算由 `speed-test` 实测：平移和摆动各在两个速度下测，并检查是否成正比。
+- **运动模糊**：`blur = fx · v · T / Z`，其中 fx = 734.46 px。默认 0.05 m/s、曝光 10 ms 时，1 m 处为 0.37 px。
+- **保护**：运动中实时测法兰线速度，超过预期 1.5 倍 + 5 mm/s 就停；超过 2 s 没有新状态就停；没到位又 5 s 不动就停。停止时用新的 XML-RPC 连接发 StopMotion。Ctrl+C、SSH 断开或被终止时，先停机械臂，再正常停相机、保存数据。
+
+**结果**
+
+- 1% = 平移 1.001 mm/s、摆动 0.347 °/s，WebApp 的 10% 也作用在 SDK 指令上。平移 50 mm/s 需要 49.97%，摆动 20 °/s 需要 57.59%；最高能到 100 mm/s、36 °/s。
+- 两个速度之间的换算系数：平移相差 −0.3%，摆动相差 −3.6%。
+- 实测平移 49.9–50.0 mm/s，巡航段速度波动 2.5–3.4%；同步摆动 19.7–20.8 °/s。
+- 按 Ctrl+C 后，机械臂在 0.133 s 内停下。
+
+## 4. 脚本与参数
+
+### 4.1 文件
 
 | 文件 | 说明 |
 |---|---|
-| `scripts/run_session.py` | **总控脚本，所有可改参数都在文件开头**。子命令：`set-start`、`plan`、`goto-start`、`speed-test`、`sync-test`、`record 方向` |
-| `scripts/fr5_motion.py` | 运动规划与执行：相机保持水平的平移和同步摆动，用控制器逆解做检查；`MoveL` 用**百分比速度**非阻塞下发，由状态判断到位，随时可以 `StopMotion`；运动中实时测法兰线速度，超过预期 1.5 倍 + 5 mm/s 就中止 |
-| `scripts/fr5_record.py` | 机械臂状态录制：独占 20004 端口，每包打 Box 时间戳，停止时一次写盘；`open_rpc()` 给 SDK 运动脚本共用同一个连接 |
-| `scripts/fr5_groundtruth.py` | 离线真值：控制器时钟拟合 → 陀螺仪互相关估 Δt → 曝光中心修正 → 插值出相机真值（只依赖 numpy） |
-| `scripts/test_fr5_groundtruth.py`、`scripts/test_fr5_motion.py` | 离线测试（合成数据，不连机械臂）：`python3 -B -m unittest test_fr5_groundtruth test_fr5_motion` |
-| `scripts/movel_probe.py` | 诊断：发零行程 MoveL/MoveJ（目标 = 当前位姿），看哪种被控制器拒绝；`--set physical` 试物理速度模式的取值 |
-| `scripts/plain_sdk_test.py` | 诊断：完全照官方例子，用 `Robot.RPC` 发一条零行程 `MoveJ` |
+| `scripts/run_session.py` | 总控脚本，**所有可改参数都在文件开头**（其他模块不放可调参数）。子命令：`set-start`、`plan`、`goto-start`、`speed-test`、`sync-test`、`record <方向>`；选项 `--scale`、`--yes`、`--tag` |
+| `scripts/fr5_motion.py` | 运动规划与执行：相机保持水平的平移和同步摆动、逆解检查、速度换算、运动中的保护和实测速度 |
+| `scripts/fr5_record.py` | 机械臂状态录制：独占 20004，每包记 Box 时间，停止时一次写盘；`open_rpc()` 让 SDK 运动指令共用这个连接 |
+| `scripts/zed_capture.py` | zed_record 的子进程管理（启动、等待开始采集、正常停止、保存输出），以及检查相机是否被其他程序占用 |
+| `scripts/fr5_groundtruth.py` | 离线真值：时钟拟合 → 陀螺仪互相关求 Δt → 曝光中心修正 → 插值出相机真值（只依赖 numpy） |
+| `scripts/gt_board_check.py` | 标定板真值验证，在笔记本上运行；只读调用标定仓库的 Aprilgrid 检测、s003 内参和标定板尺寸 |
+| `scripts/test_fr5_groundtruth.py`、`test_fr5_motion.py`、`test_gt_board_check.py` | 离线测试（合成数据，不连机械臂），共 27 项；标定板测试只在笔记本上运行，Box 上自动跳过 |
+| `scripts/movel_probe.py` | 诊断：发零行程的 MoveL / MoveJ（目标 = 当前位姿），看控制器拒绝哪种参数；`--set physical` 测试物理速度模式 |
 | `scripts/handeye_s003_result.json` | 标定仓库 `results/s003/result.json` 的副本（手眼外参） |
-| `scripts/speed_calibration.json` | `speed-test` 的结果：速度百分比 1% 对应多少 mm/s（平移）和 °/s（同步摆动）。还没跑过 speed-test 时没有这个文件 |
-| `scripts/start_pose.json` | `set-start` 保存的水平起点（当前：相机光心约 (597, −476, 562) mm，关节 [119.51, 14.41, −74.33, −119.99, −44.77, −0.02]） |
-| `zed_record/zed_record.cpp` | Box 上 `~/ROBOT/zed_imu/zed_record.cpp` 的当前版本 |
-| `zed_record/zed_record.patch` | 相对 10-08 版本的改动：加了 `--exposure-us`、`--analog-gain-mdb` 参数，第 30 帧读回实际曝光并写进 `time_meta.txt` |
-| `sync_from_box.ps1` | 从 Box 拉取以上文件到本文件夹 |
+| `scripts/start_pose.json` | `set-start` 保存的水平起点：相机光心约 (597, −476, 562) mm，关节 [119.51, 14.41, −74.33, −119.99, −44.77, −0.02]° |
+| `scripts/speed_calibration.json` | `speed-test` 的结果（速度换算系数和各段实测） |
+| `zed_record/zed_record.cpp`、`zed_record.patch` | Box 上 `~/ROBOT/zed_imu/zed_record.cpp` 的当前版本，以及相对原版的改动：增加 `--exposure-us`、`--analog-gain-mdb`，并在第 30 帧读回实际曝光和增益，写进 `time_meta.txt` |
+| `sync_from_box.ps1` | 从 Box 拉取 `scripts/` 和 `zed_record/` |
+| `data/` | 从 Box 拷到笔记本的录制数据（不进 git） |
 
-## 4. 在 Box 上安装
+### 4.2 可调参数（`run_session.py` 开头）
 
-1. **SDK**：把上面那个提交的 `linux/fairino/Robot.py` 放到 `~/.local/lib/python3.10/site-packages/fairino/`，再建一个空的 `__init__.py`，用 `sha256sum` 核对。
-2. **zed_record**：源码在 `~/ROBOT/zed_imu/`，改动见 `zed_record/zed_record.patch`。改之前的版本备份为 `zed_record.cpp.bak-20261010` 和 `build/zed_record.bak-20261010`。重新编译：
-   ```bash
-   cd ~/ROBOT/zed_imu/build && make -j4 zed_record
-   ```
-3. **脚本**：`scripts/` 里的文件放到 Box 的 `~/ROBOT/fr5_record/`。
-
-## 5. 使用流程
-
-运动和录制最好在 **Box 自己的终端**里运行，人站在机械臂旁边，手边有急停。每次运动前脚本都会列出计划，等你输入 `yes` 才会动。
-
-```bash
-cd ~/ROBOT/fr5_record
-python3 run_session.py set-start               # 读当前位姿，算出水平起点并保存（不动）
-python3 run_session.py plan                    # 空跑检查 6 条录制和 sync-test 的全部目标点（不动）
-python3 run_session.py goto-start --scale 0.25 # 低速移到水平起点
-python3 run_session.py speed-test              # 速度标定（不开相机）；改了 WebApp 速度百分比要重跑
-python3 run_session.py plan                    # 再空跑一次，这次会显示每段的速度百分比
-python3 run_session.py sync-test               # 时间同步验证（只做同步摆动），重复 3 次
-python3 run_session.py record forward          # 正式录制，依次 backward / right / left / up / down
-```
-
-每条录制的结构：静止 5 s → 同步摆动（绕相机竖直轴 ±10°，20°/s，来回 2 次）→ 静止 3 s → 单向平移 → 静止 3 s → 同步摆动 → 静止 5 s。每条约 31 s，约 0.4 GB。
-
-- **速度百分比**：控制器拒绝物理速度模式（见 §9），所以 `MoveL` 用百分比速度。百分比和实际速度的关系受 WebApp 速度百分比影响，SDK 又读不到它，因此先用 `speed-test` 实测，结果存在 `speed_calibration.json`。`sync-test` 和 `record` 必须有这个文件，并且其中的 `WEBAPP_SPEED_PCT`、`ACCEL_PCT`、`WIGGLE_DEG` 和脚本开头一致。`goto-start` 和 `speed-test` 在没标定时按保守假设换算（1% = 默认速度 1000 mm/s 的 1%），实际只会更慢。
-- **speed-test 做什么**：先移到起点；竖直上移 `SPEED_TEST_MM` 用固定的 `SPEED_TEST_PCT`，按实测换算后以录制速度下移；再绕相机光心竖直轴转 `WIGGLE_DEG`（固定百分比），按实测换算后以摆动角速度转回。去程和回程算出的“速度 / 百分比”相差超过 `MAX_SPEED_ERROR` 会警告（不成正比）。
-- **每段运动后**终端会打印实测的法兰线速度、角速度和用时，可以和计划里的“预计”对照。
-- **首次运行**：用 `--scale 0.25` 低速演练，但这时同步摆动只有 5°/s，算不出 Δt，这条数据不用。
-- **按 Ctrl+C**：先发 `StopMotion`，再正常停止相机，保存已录的数据。
-- **SSH 断开**：处理方式和 Ctrl+C 相同，之后的输出写进录制目录里的 `run_session.log`。
-
-## 6. 可调参数（`run_session.py` 开头）
-
-超出范围脚本会拒绝运行。另外，速度和曝光的组合必须满足"最近物体处的模糊 ≤ `MAX_BLUR_PX`"。
+超出范围脚本会拒绝运行。速度和曝光的组合还必须满足“最近物体处的模糊 ≤ `MAX_BLUR_PX`”。
 
 | 参数 | 默认 | 范围 | 说明 |
 |---|---|---|---|
-| `SPEED_MPS` | 0.05 | 0.02–0.10 | 平移速度 m/s；下限待平稳性实测确认 |
+| `SPEED_MPS` | 0.05 | 0.02–0.10 | 平移速度 m/s |
 | `STROKE_M` | 0.30 | 0.05–0.30 | 行程，以起点为中心两边各一半 |
 | `EXPOSURE_US` | 10000 | 1000–15000 | 曝光，传给 zed_record |
-| `ANALOG_GAIN_MDB` | 1000 | 1000–16000 | 模拟增益，传给 zed_record |
-| `MAX_BLUR_PX` / `NEAREST_DEPTH_M` | 1.0 / 1.0 | 0.3–2.0 / 0.3–20 | 允许的运动模糊（1080p 像素）和画面最近物体距离 |
-| `HOLD_START_S` / `HOLD_MID_S` / `HOLD_END_S` | 5 / 3 / 5 | 3–30 / 2–30 / 3–30 | 静止时长 |
-| `WIGGLE_DEG` / `WIGGLE_DEG_S` / `WIGGLE_CYCLES` | 10 / 20 / 2 | 5–15 / 12–40 / 1–4 | 同步摆动 |
+| `ANALOG_GAIN_MDB` | 1000 | 1000–16000 | 模拟增益，传给 zed_record；缩短曝光后画面偏暗时调大 |
+| `MAX_BLUR_PX` / `NEAREST_DEPTH_M` | 1.0 / 1.0 | 0.3–2.0 / 0.3–20 | 允许的运动模糊（1080p 像素），以及画面里最近物体的距离 |
+| `HOLD_START_S` / `HOLD_MID_S` / `HOLD_END_S` | 5 / 3 / 5 | 3–30 / 2–30 / 3–30 | 开头、中间、结尾的静止时长 |
+| `WIGGLE_DEG` / `WIGGLE_DEG_S` / `WIGGLE_CYCLES` | 10 / 20 / 2 | 5–15 / 12–40 / 1–4 | 同步摆动的幅度、角速度和来回次数 |
+| `SYNC_TEST_HOLD_S` | 10 | 5–60 | sync-test 两次摆动之间的静止时长 |
 | `REPOSITION_MPS` | 0.05 | 0.01–0.10 | 录制前移到起点的速度 |
-| `WEBAPP_SPEED_PCT` | 10 | 1–100 | **WebApp 里的速度百分比，照抄过来**（SDK 读不到）。两边必须一致，改了要重跑 speed-test |
-| `ACCEL_PCT` | 100 | 1–100 | MoveL 加速度百分比（oacc），实际加减速时间看 speed-test 的输出；改了要重跑 speed-test |
+| `WEBAPP_SPEED_PCT` | 10 | 1–100 | WebApp 里的速度百分比，照抄过来（SDK 读不到）；两边必须一致，改了要重跑 speed-test |
+| `ACCEL_PCT` | 100 | 1–100 | MoveL 加速度百分比（oacc）；改了要重跑 speed-test |
 | `SPEED_TEST_PCT` / `SPEED_TEST_MM` | 5 / 100 | 1–10 / 50–150 | speed-test 去程的速度百分比和竖直行程 |
-| `MAX_SPEED_ERROR` | 0.10 | 0.02–0.3 | 平移实测速度和预计相差超过它就警告 |
+| `MAX_SPEED_ERROR` | 0.10 | 0.02–0.3 | 平移实测速度和预计速度相差超过它就警告 |
+| `MAX_SPEED_RIPPLE` | 0.05 | 0.01–0.2 | 平移巡航段速度波动超过它就警告 |
 | `MIN_CAMERA_Z_M` | 0.35 | 0–1.5 | 相机光心最低高度（基坐标系 z） |
-| `JOINT_MIN_DEG` / `JOINT_MAX_DEG` | 见文件 | | 允许的关节范围，按现场确认 |
-| `MAX_SPEED_RIPPLE` | 0.05 | 0.01–0.2 | 平移巡航段速度波动超过它就警告"不平稳" |
+| `JOINT_MIN_DEG` / `JOINT_MAX_DEG` | 见文件 | | 允许的关节范围：覆盖起点附近 ±150 mm 平移和 ±15° 摆动，并离奇异位形至少 15° |
+| `MAX_JOINT_STEP_DEG` | 5 | 1–15 | 路径上每 10 mm / 2° 允许的最大关节变化，超过说明逆解可能跳支 |
+| `MIN_FREE_GB` | 5 | 1–100 | 开始录制前 Box 至少剩余的磁盘空间 |
 
-默认参数下，1 m 处的运动模糊为 0.37 px（前后平移时画面边缘约 0.48 px）。
+`fr5_groundtruth.py` 的命令行选项：`--max-lag-ms`（Δt 搜索范围，默认 300），`--dt-ms`、`--exposure-offset-ms`（手动指定，不估计）。
+`gt_board_check.py` 的命令行选项：`--step`（每隔几张检测一张）、`--scan-ms`（时间扫描范围，默认 ±20 ms）、`--camera`、`--target`、`--calib-repo`。
 
-## 7. 输出数据
+## 5. 使用流程
+
+### 5.1 安装（Box，一次性）
+
+1. **SDK**：把第 2 节那个提交的 `linux/fairino/Robot.py` 放到 `~/.local/lib/python3.10/site-packages/fairino/`，再建一个空的 `__init__.py`，用 `sha256sum` 核对。
+2. **zed_record**：源码在 `~/ROBOT/zed_imu/`，打上 `zed_record/zed_record.patch` 后编译：
+   ```bash
+   cd ~/ROBOT/zed_imu/build && make -j4 zed_record
+   ```
+3. **脚本**：把 `scripts/` 里的文件放到 Box 的 `~/ROBOT/fr5_record/`。
+4. **WebApp**：自动模式的速度百分比不能是 0，并且要和 `WEBAPP_SPEED_PCT` 一致（当前为 10）。
+
+### 5.2 录制
+
+在 Box 自己的终端里运行，人站在机械臂旁边，手边有急停。每次运动前脚本都会列出计划（每段的速度百分比、预计速度和时长），输入 `yes` 才会动。
+
+```bash
+cd ~/ROBOT/fr5_record
+python3 run_session.py set-start               # 读当前位姿，算出相机水平的起点并保存（不动）
+python3 run_session.py plan                    # 空跑：检查 6 条录制和 sync-test 的全部目标点（不动）
+python3 run_session.py goto-start --scale 0.25 # 低速移到起点
+python3 run_session.py speed-test              # 速度标定（不开相机）；改了 WebApp 速度百分比或 ACCEL_PCT 要重跑
+python3 run_session.py sync-test               # 时间同步验证（只做同步摆动）
+python3 run_session.py record forward          # 正式录制，另有 backward / right / left / up / down
+```
+
+- **每条录制的结构**：静止 5 s → 同步摆动 → 静止 3 s → 单向平移 300 mm → 静止 3 s → 同步摆动 → 静止 5 s，共约 32 s、0.4 GB。结束后自动计算真值，并打印 Δt 和前后段差。
+- **每段运动结束后**打印实测的法兰线速度、角速度和用时，可以和计划对照。
+- `--scale 0.25`：按比例降速，用于首次低速演练。这时同步摆动只有 5 °/s，算不出 Δt，数据不用。
+- `--tag board`：给录制目录名加后缀（如 `…_right_board/`），用来区分验证录制和正式录制。
+- 按 Ctrl+C 或 SSH 断开：先停机械臂，再正常停相机，保存已录的数据。断开后的输出写进录制目录里的 `run_session.log`。
+
+### 5.3 标定板真值验证
+
+1. 用标定时的那块 Aprilgrid，竖直放在起点相机正前方约 1 m 处，中心大致和相机同高，固定牢。
+2. 短暂打开 ZED Explorer，确认标定板完整地在画面中间附近，然后关掉。
+3. 在 Box 上录三个平移方向：
+   ```bash
+   python3 run_session.py record right --tag board
+   python3 run_session.py record up --tag board
+   python3 run_session.py record forward --tag board
+   ```
+4. 把每条录制拷到笔记本的 `data/board_check/<录制名>/`。`save_data/right/` 不用拷，其余都拷：验证只用左目，而带上 `fr5_state.csv`、`zed_imu.csv` 以后可以在笔记本上重算真值。然后在 `scripts/` 下用标定仓库的 venv 运行：
+   ```bash
+   python -B gt_board_check.py ..\data\board_check\<录制名>\save_data
+   ```
+
+### 5.4 注意事项
+
+- **20004 只能有一个连接**：录制时不要另开 `Robot.RPC(...)`，运动脚本必须用 `StateRecorder.open_rpc()`。
+- **录制进程里不要做长时间的 Python 计算**：真值计算等重活放在录制停止之后。
+- **不要调用 SDK 的 `LoggerInit()`**：它会持续往磁盘写日志。
+- **相机同一时间只能被一个程序打开**：录制前关掉 ZED Explorer、Depth Viewer、`zed_snapshot.py`。
+- **Box 的 WiFi 会断**：运动和录制在 Box 本机终端运行（Box 没有 tmux / screen）。
+- **开机预热**：Box 重启后相机有冷热漂移，预热 30 分钟以上再录真值数据。
+- **场景**：画面里不要有人走动；数据如果要公开，先征得画面里的人同意。
+- **错误码**：SDK 返回的正数错误码来自控制器，查 FAIRINO 官方“错误码对照表”。例如 172 表示运动速度不能为 0，182 / 183 表示给定的物理速度 / 加速度超限。
+
+## 6. 输出数据
+
+每条录制一个目录（Box 上）：
 
 ```text
-~/ROBOT/sessions/YYYYmmdd_HHMMSS_<名称>/
+~/ROBOT/sessions/YYYYmmdd_HHMMSS_<名称>[_<tag>]/
 ├─ zed_record.log            zed_record 的输出（结束时一次写入）
 ├─ run_session.log           仅在 SSH 断开 / 被终止时才有
 └─ save_data/
    ├─ left/  right/          <ZED 时间戳 ms>.jpg（校正后，JPEG）
    ├─ img_timeline.csv       每帧：图像时间戳、对应 IMU 时间戳、文件名
    ├─ zed_imu.csv            机身 IMU 全部样本（约 200 Hz），含 image_sync_trigger
-   ├─ time_meta.txt          相机设置，含第 30 帧读回的实际曝光
+   ├─ time_meta.txt          相机设置，含第 30 帧读回的实际曝光和增益
    ├─ fr5_state.csv          机械臂状态（约 100 Hz）：Box 时间、控制器时间、关节、法兰位姿、错误码等
-   ├─ fr5_meta.json          丢包、断线、时钟跳变等检查结果
-   ├─ motion_log.json        每段指令的时间、速度百分比、预计速度、实测速度，平移段实际速度和波动，所用速度标定
+   ├─ fr5_meta.json          丢包、断线、时钟跳变、接收缓冲区大小等
+   ├─ motion_log.json        每段指令：时间、速度百分比、预计速度、实测速度；平移段速度和波动；所用速度标定
    ├─ groundtruth_tum.txt    每张图一行：timestamp tx ty tz qx qy qz qw（Unix 秒、米），左目在 FR5 基坐标系下
    ├─ groundtruth_arm_rate_tum.txt   机械臂每个状态包一行，格式同上
    ├─ groundtruth_images.csv         每张图的真值和标记（ok / outside / gap / robot_error）
-   └─ groundtruth_report.json        时钟拟合、Δt、曝光中心偏差、警告
+   └─ groundtruth_report.json        时钟拟合、Δt、前后段差、曝光中心、警告
 ```
 
 真值可以单独重算：
@@ -127,59 +246,7 @@ python3 run_session.py record forward          # 正式录制，依次 backward 
 python3 fr5_groundtruth.py <save_data 目录> --handeye handeye_s003_result.json
 ```
 
-## 8. 时间同步与真值方法
+`gt_board_check.py` 在 `save_data` 目录里输出：
 
-- **统一时钟**：所有时间戳都统一到 Box 系统时间（Unix）。ZED 的图像和 IMU 时间戳本来就是 Box 系统时间；机械臂状态包在 Box 收到时打时间戳，同时记下包里的控制器时间。
-- **控制器时钟换算**：控制器时钟没有同步，比 Box 快约 127 s，漂移约 200 ppm。每 2 s 取一次"到达时间 − 控制器时间"的最小值，直线拟合出偏差和漂移。
-- **剩余时间差 Δt**：用 ZED 陀螺仪角速度大小和法兰姿态差分出的角速度大小做互相关。所以每条录制开头和结尾都要有同步摆动，录制满 60 s 时会把前后两段分开估计、互相核对。
-- **曝光中心**：ZED 图像时间戳不在曝光中间，实测比曝光中心晚约 3 ms。用 `image_sync_trigger=1` 的 IMU 样本，每条录制自动估一次，在曝光中心取真值；输出里仍写图像原来的时间戳。由于 IMU 采样只有 5 ms 一个，这个估计最多有约 ±0.8 ms 的偏差。
-- **合成数据测试结果**：Δt 误差小于 1 ms，真值位置误差 RMS 0.01 mm、转角误差 RMS 0.007°。
-
-## 9. 当前进度（2026-10-10）
-
-**已完成**
-- Box 网络：有线直连 FR5；FAIRINO SDK V2.2.1 安装，读状态和查询都正常。
-- `fr5_record`：实测 100 Hz、无丢包；和 WebApp 同时开着也不受影响（WebApp 用 80 / 9999 端口）。
-- `fr5_groundtruth`：时钟拟合、Δt、曝光中心修正；合成数据测试通过。
-- `zed_record`：曝光和增益参数化。实测设 5000 µs 读回 4999 µs，手动曝光确实生效。
-- `run_session` / `fr5_motion`：参数检查；`set-start` 已保存水平起点；`plan` 空跑 6 条和 sync-test 全部通过控制器逆解检查。
-- SSH 断开时的收尾逻辑已测试（没有运动的情况下）。
-- 21 项离线测试在笔记本和 Box 上都通过（含假机械臂上的运动执行和超速中止测试）。
-- 百分比速度版本已部署到 Box；在真机上做了只读检查：`plan` 和 speed-test 的全部目标点都通过控制器逆解检查。在笔记本上用假机械臂把 `speed-test → plan → goto-start` 完整模拟过一遍。
-
-**已解决：SDK 运动指令全部返回 172**
-- 现象：`MoveL`（各种参数）和 `MoveJ` 都返回 172，机械臂不动。当时处于自动模式、已使能、无报警，SDK 通讯正常。
-- 原因：WebApp 里的**速度百分比是 0**。按 FAIRINO 错误码表，172 的意思是“运动速度不能为 0”。在 WebApp 里把速度百分比从 0 改成 10 后，百分比速度的 `MoveL`/`MoveJ` 返回 0。
-- 这期间试过 SDK V2.2.5，不行（控制器没有 CNDE 20005 端口），已删除。
-
-**已绕开：物理速度模式（mm/s）被拒绝，改用百分比速度**
-- `velAccParamMode=1` 的零行程测试（`movel_probe.py --set physical`）：12.5–200 mm/s、加速度 100–2000 mm/s²、ovl 25/100 全部被拒，返回 182（给定物理速度超限）或 183（给定物理加速度超限）。有可能和 WebApp 速度百分比为 10% 有关，也可能是零行程测试本身的问题，没有再查。
-- 改用百分比速度（`velAccParamMode=0`）。百分比和实际速度的换算用 `speed-test` 实测；运动中还会实时检查速度。
-- 控制器的 `GetDefaultTransVel()` 返回 1000 mm/s。如果 WebApp 的 10% 也作用在 SDK 指令上，1% 约等于 1 mm/s，50 mm/s 需要 50%；speed-test 会给出实际值。
-
-**接下来**
-1. 在 Box 终端运行 `python3 run_session.py speed-test --scale 0.25`（首次低速），然后不加 `--scale` 再跑一次，作为正式标定。看输出的“1% = … mm/s”和“相当于默认速度 × …”。
-2. `python3 run_session.py plan`，确认各段速度百分比都不超过 100%（同步摆动 20°/s 如果超过，需要调高 WebApp 速度百分比，并同时改 `WEBAPP_SPEED_PCT`，然后重跑 speed-test）。
-3. `sync-test --scale 0.25` 低速演练，期间试一次运动中按 Ctrl+C 能否立即停下。
-4. `sync-test` × 3，验证时间同步。
-5. 写 `gt_board_check.py`（在笔记本上跑，调用标定仓库的标定板检测），把标定板竖着放在相机前方 0.8–1 m 处，验证真值。
-6. 撤掉标定板，正式录 6 条。
-7. 可选：加一个加速度计交叉检查；实测确定速度下限。
-
-## 10. 注意事项
-
-- **20004 只能有一个连接**：录制时不要另开 `Robot.RPC(...)`。运动脚本必须用 `StateRecorder.open_rpc()`。
-- **不要调用 SDK 的 `LoggerInit()`**：会持续写日志到磁盘。
-- **WebApp 速度百分比不能是 0**（否则所有运动指令返回 172），并且要和 `WEBAPP_SPEED_PCT` 一致。改了它就重跑 speed-test。万一忘了改，运动中的超速检查会在速度超过预期 1.5 倍 + 5 mm/s 时中止。
-- **FAIRINO 错误码**：SDK 返回的正数错误码在官方“错误码对照表”里查，例如 172 运动速度不能为 0；182 给定物理速度超限；183 给定物理加速度超限。
-- **相机同一时间只能被一个程序打开**：录制前关掉 ZED Explorer、Depth Viewer 和 `zed_snapshot.py`。
-- **Box 的 WiFi 断过**：运动和录制尽量在 Box 本机终端跑。Box 没装 tmux 或 screen。
-- **Box 上 Python 的 OpenCV 导入失败**（用户目录里的 numpy 2 和系统 OpenCV 冲突），所以标定板检测放在笔记本上做。
-- **Box 开机后先预热**：标定时记录过 Box 重启后相机有冷热跳变，开机后先预热 30 分钟以上再录真值数据。
-- **画面里不要有人走动**：静态场景实验要求场景完全静止。数据如果要公开，先征得画面里的人同意。
-
-## 11. 变更记录
-
-- 2026-10-09：Box 有线网口固定为 192.168.58.11 直连 FR5；安装 FAIRINO SDK V2.2.1；完成 `fr5_record.py`。
-- 2026-10-10：完成 `fr5_groundtruth.py`（含曝光中心修正）、`fr5_motion.py`、`run_session.py` 和两个测试文件；`zed_record` 增加曝光和增益参数；加入断线收尾；排查 172（`movel_probe.py`、`plain_sdk_test.py`），确认 SDK V2.2.5 不兼容；在笔记本上建立本备份。
-- 2026-10-10（下午）：查明 172 是 WebApp 速度百分比为 0（已改成 10）；物理速度模式返回 182/183，`fr5_motion.py` 改用百分比速度。新增 `speed-test` 子命令和 `speed_calibration.json`；每段运动实时测速，超速就中止；没到位又 5 s 不动就中止；每段运动后打印实测速度。删去 `ACCEL_MPS2`、`WIGGLE_ACCEL_MPS2`，新增 `WEBAPP_SPEED_PCT`、`ACCEL_PCT`、`SPEED_TEST_PCT`、`SPEED_TEST_MM`、`MAX_SPEED_ERROR`。测试增加到 21 项。
+- `board_check_report.json`：重复性、静止组之间的差（分解到起点相机系）、按位置分组的时间扫描。
+- `board_check_frames.csv`：每帧的 tag 数、重投影误差、相机速度、标定板中心和偏差。

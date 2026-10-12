@@ -46,6 +46,7 @@ MIN_STATIC_MS = 500.0
 MIN_MOTION_DEG_S = 10.0    # 估 Δt 至少需要的峰值角速度
 MIN_PEAK_CORR = 0.9
 MAX_SEGMENT_LAG_DIFF_MS = 2.0
+MIN_SPLIT_S = 20.0         # 录制至少这么长，才把前 40% 和后 40% 分开估 Δt、互相核对（sync-test 和正式录制约 30 s）
 MIN_EXPOSURE_FRAMES = 20   # 估曝光中心至少需要的带标记帧数
 MAX_EXPOSURE_SD_MS = 3.0   # 各帧曝光中心偏差的标准差上限
 
@@ -450,7 +451,7 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
                              "last_40pct": (hi - 0.4 * (hi - lo), hi)}.items():
             sel_w = (t_w >= a) & (t_w <= b)
             sel_i = (t_imu >= a) & (t_imu <= b)
-            if (hi - lo) >= 60_000 and w_arm[sel_w].max(initial=0) >= MIN_MOTION_DEG_S:
+            if (hi - lo) >= MIN_SPLIT_S * 1000.0 and w_arm[sel_w].max(initial=0) >= MIN_MOTION_DEG_S:
                 segments[name] = estimate_lag(t_imu[sel_i], g[sel_i], t_w, w_arm,
                                               min(max_lag_ms, 50.0) + abs(lag["dt_ms"]))
         lag["segments"] = segments
@@ -460,7 +461,7 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
             if diff > MAX_SEGMENT_LAG_DIFF_MS:
                 warnings.append(f"前后两段的 Δt 相差 {diff:.1f} ms，时钟漂移拟合可能不准")
         else:
-            warnings.append("开头和结尾没有都做同步摆动（或录制不足 60 s），没能核对前后 Δt 是否一致")
+            warnings.append(f"开头和结尾没有都做同步摆动（或录制不足 {MIN_SPLIT_S:.0f} s），没能核对前后 Δt 是否一致")
     shift = lag["dt_ms"]
 
     # 3. 真值

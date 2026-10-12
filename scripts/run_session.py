@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""一条录制的总控：FR5 运动 + fr5_record（机械臂状态）+ zed_record（图像和 IMU）+ 真值。
+"""一条录制的总控：FR5 运动（fr5_motion）+ 机械臂状态（fr5_record）+ 图像和 IMU（zed_capture）+ 真值（fr5_groundtruth）。
+所有可改参数都在本文件开头，其他模块不放可调参数。
 
 在 Box 自己的终端里运行（人在机械臂旁边，手边有急停）：
     python3 run_session.py set-start        读当前位姿，算出相机水平的起点并保存（不动机械臂）
@@ -8,7 +9,8 @@
     python3 run_session.py speed-test       速度标定：实测速度百分比对应的 mm/s 和 °/s（会先确认，不开相机）
     python3 run_session.py sync-test        时间同步验证：只做同步摆动的录制（会先确认）
     python3 run_session.py record forward   正式录制一条：forward/backward/right/left/up/down（会先确认）
-选项：--scale 0.25  首次运行按比例降速；--yes  跳过确认（只在你已经看过计划时用）
+选项：--scale 0.25  首次运行按比例降速；--yes  跳过确认（只在你已经看过计划时用）；
+      --tag board  加在录制目录名后面（区分验证录制和正式录制）
 
 每条录制单独一个目录 SESSIONS_DIR/时间_名称/，相机和机械臂数据都在其中的 save_data/ 里。
 sync-test 和 record 需要先有 speed-test 的结果；改了 WebApp 速度百分比要重跑 speed-test。
@@ -78,19 +80,15 @@ RANGES = {
 # ==========================================================================
 
 import argparse
-import csv
 import dataclasses
 import datetime as dt
 import hashlib
 import json
-import os
+import re
 import shutil
 import signal
-import subprocess
 import sys
 import tempfile
-import threading
-import time
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +96,7 @@ import numpy as np
 import fr5_groundtruth as gt
 import fr5_motion as fm
 from fr5_record import StateRecorder
+from zed_capture import ZedRecord, camera_users
 
 DATA_MB_PER_S = 12.0  # zed_record 双目 JPEG 约 0.8 MB/帧 × 15 fps
 HANGUP_LOG = Path(tempfile.gettempdir()) / "run_session_hangup.log"  # 有录制目录时改成目录里的 run_session.log
@@ -179,12 +178,6 @@ def parameter_problems() -> list[str]:
     return out
 
 
-def camera_users() -> list[str]:
-    out = subprocess.run(["pgrep", "-a", "-f", "ZED_Depth_Viewer|ZED_Explorer|ZED_Sensor_Viewer|ZEDfu|"
-                          "zed_record|zed_snapshot"], capture_output=True, text=True).stdout
-    return [line for line in out.splitlines() if line.strip()]
-
-
 def load_start() -> dict:
     path = p(START_POSE)
     if not path.exists():
@@ -199,15 +192,26 @@ def current_pose(rec: StateRecorder):
     return fm.fr5_to_matrix(list(pkg.flange_cur_pos)), list(pkg.jt_cur_pos), pkg
 
 
-def confirm(text: str, assume_yes: bool) -> bool:
+def check_segments(rec: StateRecorder, rpc, segs: list[fm.Segment], f_t_c, model, scale: float) -> list[str]:
+    """从当前位姿出发做逆解检查，并按速度模型换算每段的速度百分比。返回问题列表。"""
+    flange, joints, _ = current_pose(rec)
+    return (fm.check_plan(rpc, segs, flange, joints, f_t_c, JOINT_MIN_DEG, JOINT_MAX_DEG,
+                          MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
+            + fm.apply_speed(segs, model, scale))
+
+
+def confirm_plan(text: str, assume_yes: bool) -> None:
+    """列出计划，等操作员输入 yes；没确认就抛 MotionAborted（还没有运动）。"""
     print(text)
     if assume_yes:
         print("（--yes：跳过确认）")
-        return True
+        return
     try:
-        return input("确认机械臂周围无人、急停在手边后，输入 yes 开始运动：").strip() == "yes"
+        ok = input("确认机械臂周围无人、急停在手边后，输入 yes 开始运动：").strip() == "yes"
     except EOFError:
-        return False
+        ok = False
+    if not ok:
+        raise fm.MotionAborted("没有确认，没有运动")
 
 
 def describe(segments: list[fm.Segment], pending: dict | None = None, totals: bool = True) -> str:
@@ -229,7 +233,7 @@ def describe(segments: list[fm.Segment], pending: dict | None = None, totals: bo
                                       f"{s.expect_deg_s:.1f} °/s" if s.expect_deg_s and s.angle_deg > 0.05 else "")
                           if t)
         dur = ((f"约 {s.duration_s:.1f} s" if s.speed_known or s.percent is None else f"至少 {s.duration_s:.1f} s")
-               if s.duration_s else "时长待实测")
+               if s.duration_s or s.speed_known else "时长待实测")
         lines.append(head + ("" if s.percent is None else f"速度 {s.percent:.2f}%，")
                      + (f"{word} {rates}，" if rates else "") + dur + tail)
     if totals:
@@ -277,8 +281,7 @@ def cmd_set_start(args) -> int:
     return 0
 
 
-def cmd_plan(args) -> int:
-    problems = parameter_problems()
+def cmd_plan(args, problems: list[str]) -> int:
     for m in problems:
         print(f"参数问题：{m}")
     f_t_c, _ = gt.load_handeye(p(HANDEYE))
@@ -298,13 +301,10 @@ def cmd_plan(args) -> int:
         rec.start()
         try:
             rpc = rec.open_rpc()
-            flange, joints, _ = current_pose(rec)
             for name in names:
                 segs = (fm.plan_sync_test(start["camera"], f_t_c, cfg) if name == "sync-test"
                         else fm.plan_recording(name, start["camera"], f_t_c, cfg))
-                found = fm.check_plan(rpc, segs, flange, joints, f_t_c, JOINT_MIN_DEG, JOINT_MAX_DEG,
-                                      MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
-                found += fm.apply_speed(segs, model, args.scale)
+                found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
                 print(f"\n=== {name}：{'通过' if not found else '有问题'}")
                 print(describe(segs))
                 for m in found:
@@ -316,91 +316,19 @@ def cmd_plan(args) -> int:
     return 0 if not problems else 1
 
 
-class ZedRecord:
-    """以子进程运行 zed_record。用硬链接放进录制目录，它的 save_data/ 就写在这条录制自己的目录里。"""
-
-    def __init__(self, session_dir: Path):
-        self.session_dir = session_dir
-        self.link = session_dir / "zed_record"
-        self.lines, self.proc, self.reader = [], None, None
-        self.grabbing = threading.Event()
-        self.info = {}
-
-    def start(self) -> None:
-        src = p(ZED_RECORD)
-        try:
-            os.link(src, self.link)
-        except OSError:
-            shutil.copy2(src, self.link)
-        cmd = [str(self.link), "--exposure-us", str(EXPOSURE_US), "--analog-gain-mdb", str(ANALOG_GAIN_MDB)]
-        self.info["start_box_ns"] = time.time_ns()
-        # 子进程继承“忽略 SIGHUP”：SSH 掉线时 zed_record 不会被直接杀掉，由本脚本收尾时用 SIGINT 正常停止
-        old = signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        try:
-            self.proc = subprocess.Popen(cmd, cwd=self.session_dir, stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
-        finally:
-            signal.signal(signal.SIGHUP, old)
-        self.reader = threading.Thread(target=self._read, daemon=True)
-        self.reader.start()
-
-    def _read(self) -> None:
-        for line in self.proc.stdout:
-            self.lines.append(f"{time.time_ns()} {line.rstrip()}")
-            if "ZED 捕获" in line and not self.grabbing.is_set():
-                self.info["grabbing_box_ns"] = time.time_ns()
-                self.grabbing.set()
-
-    def wait_grabbing(self, timeout: float) -> None:
-        end = time.monotonic() + timeout
-        while not self.grabbing.wait(0.2):
-            if self.proc.poll() is not None or time.monotonic() > end:
-                raise RuntimeError("zed_record 没有开始采集：\n" + "\n".join(self.lines[-10:]))
-
-    def stop(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGINT)
-            try:
-                self.proc.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
-        if self.reader is not None:
-            self.reader.join(timeout=5)
-        self.info["stop_box_ns"] = time.time_ns()
-        self.info["returncode"] = None if self.proc is None else self.proc.returncode
-        (self.session_dir / "zed_record.log").write_text("\n".join(self.lines) + "\n", encoding="utf-8")
-        if self.link.exists():
-            self.link.unlink()
-
-
-def translate_speed(data_dir: Path, seg: fm.Segment, scale: float) -> dict | None:
-    """平移段的实际速度（用全部状态包）：按控制器时间跨 50 ms 差分，只看行程中间 20%–80% 的巡航段。"""
-    t0, t1 = seg.log.get("moving_box_ns"), seg.log.get("arrived_box_ns")
-    if not t0 or not t1:
+def translate_summary(seg: fm.Segment, scale: float) -> dict | None:
+    """平移段的实测速度（运动中已算好）和预计、设计速度对照。"""
+    m = (seg.log.get("measured") or {}).get("linear_mm_s")
+    if not m or not seg.expect_mm_s:
         return None
-    with open(data_dir / "fr5_state.csv", newline="", encoding="utf-8") as f:
-        rows = [r for r in csv.DictReader(f) if t0 <= int(r["box_realtime_ns"]) <= t1 and r["ctrl_unix_ms"]]
-    if len(rows) < 20:
-        return None
-    t = np.array([float(r["ctrl_unix_ms"]) for r in rows]) / 1000.0
-    xyz = np.array([[float(r[k]) for k in ("x_mm", "y_mm", "z_mm")] for r in rows])
-    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(xyz, axis=0), axis=1))]
-    rate = fm.cruise_rate(t, s)
-    if rate is None:
-        return None
-    error = rate["mean"] / seg.expect_mm_s - 1.0
+    error = m["mean"] / seg.expect_mm_s - 1.0
     return {"design_mm_s": SPEED_MPS * 1000.0 * scale, "expected_mm_s": seg.expect_mm_s, "percent": seg.percent,
-            "mean_mm_s": rate["mean"], "min_mm_s": rate["min"], "max_mm_s": rate["max"],
-            "ripple": rate["ripple"], "smooth": rate["ripple"] <= MAX_SPEED_RIPPLE,
-            "error": error, "speed_ok": abs(error) <= MAX_SPEED_ERROR, "distance_mm": float(s[-1])}
+            "mean_mm_s": m["mean"], "min_mm_s": m["min"], "max_mm_s": m["max"], "ripple": m["ripple"],
+            "smooth": m["ripple"] is not None and m["ripple"] <= MAX_SPEED_RIPPLE,
+            "error": error, "speed_ok": abs(error) <= MAX_SPEED_ERROR}
 
 
 def cmd_motion(args, kind: str, direction: str | None) -> int:
-    problems = parameter_problems()
-    if problems:
-        print("参数问题，没有运动：\n  " + "\n  ".join(problems))
-        return 1
     busy = camera_users() if kind != "goto-start" else []
     if busy:
         print("相机正被占用，先关掉这些程序：\n  " + "\n  ".join(busy))
@@ -421,7 +349,7 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         if free_gb < MIN_FREE_GB:
             print(f"磁盘只剩 {free_gb:.1f} GB，少于 MIN_FREE_GB={MIN_FREE_GB}")
             return 1
-        session_dir = root / f"{dt.datetime.now():%Y%m%d_%H%M%S}_{name}"
+        session_dir = root / (f"{dt.datetime.now():%Y%m%d_%H%M%S}_{name}" + (f"_{args.tag}" if args.tag else ""))
         session_dir.mkdir()
         data_dir = session_dir / "save_data"
         global HANGUP_LOG
@@ -438,25 +366,21 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
 
     rec = StateRecorder(data_dir, ROBOT_IP)
     rec.start()
-    zed = ZedRecord(session_dir) if session_dir else None
+    zed = ZedRecord(p(ZED_RECORD), session_dir, EXPOSURE_US, ANALOG_GAIN_MDB) if session_dir else None
     error, ran = None, False
     try:
         rpc = rec.open_rpc()
-        runner = fm.MotionRunner(rec, rpc, ROBOT_IP, ACCEL_PCT)
+        runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
         runner.precheck()
         if model is None:                        # 只有 goto-start 允许没标定
             model = conservative_model(rpc)
             note = "还没有速度标定，按保守假设换算（实际只会更慢）"
-        flange, joints, _ = current_pose(rec)
-        found = fm.check_plan(rpc, segs, flange, joints, f_t_c, JOINT_MIN_DEG, JOINT_MAX_DEG,
-                              MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
-        found += fm.apply_speed(segs, model, args.scale)
-        header = (f"{name}：速度比例 {args.scale}" + (f"，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
-                  + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%")
+        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
         if found:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
-        if not confirm(header + "\n" + describe(segs, totals=zed is not None), args.yes):
-            raise fm.MotionAborted("没有确认，没有运动")
+        header = (f"{name}：速度比例 {args.scale}" + (f"，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
+                  + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%")
+        confirm_plan(header + "\n" + describe(segs, totals=zed is not None), args.yes)
         ran = True
         runner.run(segs[0])                      # 移到起点（相机还没开始录）
         report_move(segs[0])
@@ -489,7 +413,7 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         return 0 if error is None else 1
 
     log = {
-        "kind": kind, "direction": direction, "speed_scale": args.scale, "error": error,
+        "kind": kind, "direction": direction, "tag": args.tag, "speed_scale": args.scale, "error": error,
         "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG"]},
         "speed_model": dataclasses.asdict(model) if model else None,
         "start_pose": {k: start[k] for k in ("base_T_camera", "flange", "joints", "created")},
@@ -504,7 +428,7 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
     }
     translate = next((s for s in segs if s.name == "translate"), None)
     if translate is not None and error is None:
-        log["translate_speed"] = translate_speed(data_dir, translate, args.scale)
+        log["translate_speed"] = translate_summary(translate, args.scale)
     (data_dir / "motion_log.json").write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n数据目录：{session_dir}")
     speed = log.get("translate_speed")
@@ -517,7 +441,8 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         try:
             report = gt.process(data_dir, p(HANDEYE), data_dir)
             lag, imgs = report["time_offset"], report["images"]
-            print(f"真值：Δt {lag['dt_ms']:+.2f} ms，图像 {imgs['with_groundtruth']}/{imgs['total']} 张有真值")
+            seg = f"（前后段差 {lag['segment_diff_ms']:.2f} ms）" if "segment_diff_ms" in lag else ""
+            print(f"真值：Δt {lag['dt_ms']:+.2f} ms{seg}，图像 {imgs['with_groundtruth']}/{imgs['total']} 张有真值")
             for w in report["warnings"]:
                 print(f"  警告：{w}")
         except (OSError, ValueError, KeyError) as exc:
@@ -533,10 +458,6 @@ def _per_pct(seg: fm.Segment, key: str) -> float | None:
 
 def cmd_speed_test(args) -> int:
     """实测 MoveL 速度百分比和实际速度的换算，保存到 SPEED_CAL。不开相机，机械臂状态也不存盘。"""
-    problems = parameter_problems()
-    if problems:
-        print("参数问题，没有运动：\n  " + "\n  ".join(problems))
-        return 1
     f_t_c, _ = gt.load_handeye(p(HANDEYE))
     start = load_start()
     segs = fm.plan_speed_test(start["camera"], f_t_c, motion_config(), SPEED_TEST_MM, SPEED_TEST_PCT)
@@ -547,24 +468,19 @@ def cmd_speed_test(args) -> int:
         rec.start()
         try:
             rpc = rec.open_rpc()
-            runner = fm.MotionRunner(rec, rpc, ROBOT_IP, ACCEL_PCT)
+            runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
             runner.precheck()
             model = conservative_model(rpc)
             vmax = model.mm_s_per_pct * 100.0
-            flange, joints, _ = current_pose(rec)
-            found = fm.check_plan(rpc, segs, flange, joints, f_t_c, JOINT_MIN_DEG, JOINT_MAX_DEG,
-                                  MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
-            found += fm.apply_speed(segs, model, args.scale)
+            found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
             if found:
                 raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
             pending = {"test_down": f"速度按 test_up 实测换算，目标 {SPEED_MPS * 1000 * args.scale:.1f} mm/s",
                        "test_yaw_back": f"速度按 test_yaw 实测换算，目标 {WIGGLE_DEG_S * args.scale:.1f} °/s"}
-            text = (f"speed-test：速度比例 {args.scale}；控制器默认速度 {vmax:.0f} mm/s，"
-                    f"WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%，加速度百分比 {ACCEL_PCT}%\n"
-                    "只录机械臂状态，不开相机。“最快”是没标定时的上限，实际可能慢很多\n"
-                    + describe(segs, pending, totals=False))
-            if not confirm(text, args.yes):
-                raise fm.MotionAborted("没有确认，没有运动")
+            confirm_plan(f"speed-test：速度比例 {args.scale}；控制器默认速度 {vmax:.0f} mm/s，"
+                         f"WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%，加速度百分比 {ACCEL_PCT}%\n"
+                         "只录机械臂状态，不开相机。“最快”是没标定时的上限，实际可能慢很多\n"
+                         + describe(segs, pending, totals=False), args.yes)
             ran = True
             for seg in segs:
                 if seg.name in pending:          # 回程：按去程实测换算到录制用的速度
@@ -646,15 +562,22 @@ def main(argv=None) -> int:
     for sp in sub.choices.values():
         sp.add_argument("--scale", type=float, default=1.0, help="速度比例 (0, 1]，首次运行建议 0.25")
         sp.add_argument("--yes", action="store_true", help="跳过确认")
+        sp.add_argument("--tag", default="", help="加在录制目录名后面的标签，例如 board（标定板验证）")
     args = parser.parse_args(argv)
     if not 0 < args.scale <= 1:
         parser.error("--scale 必须在 (0, 1] 之间")
+    if args.tag and not re.fullmatch(r"[A-Za-z0-9-]{1,20}", args.tag):
+        parser.error("--tag 只能用字母、数字和 -，最多 20 个字符")
     signal.signal(signal.SIGHUP, _on_hangup)
     signal.signal(signal.SIGTERM, _on_hangup)
     if args.command == "set-start":
         return cmd_set_start(args)
+    problems = parameter_problems()
     if args.command == "plan":
-        return cmd_plan(args)
+        return cmd_plan(args, problems)
+    if problems:
+        print("参数问题，没有运动：\n  " + "\n  ".join(problems))
+        return 1
     if args.command == "speed-test":
         return cmd_speed_test(args)
     return cmd_motion(args, args.command, getattr(args, "direction", None))

@@ -1,0 +1,6 @@
+# 从 Box 拷来的录制数据（图像很大），只放在本机
+data/
+
+# Python 缓存
+__pycache__/
+*.pyc

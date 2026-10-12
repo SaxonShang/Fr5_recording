@@ -187,6 +187,18 @@ class MeasureTest(unittest.TestCase):
         self.assertAlmostEqual(m["angular_deg_s"]["mean"], 20.0, delta=0.3)
         self.assertIsNone(m["linear_mm_s"])
 
+    def test_vectorised_angles_match_and_are_fast(self):
+        rng = np.random.default_rng(3)
+        poses = [[*rng.uniform(-500, 500, 3), *rng.uniform(-170, 170, 3)] for _ in range(50)]
+        mats = [fm.fr5_to_matrix(p) for p in poses]
+        rots = np.array([m[:3, :3] for m in mats])
+        expected = [fm.rotation_deg(mats[7], m) for m in mats]
+        np.testing.assert_allclose(fm.angles_to(rots, rots[7]), expected, atol=1e-6)
+        samples = [(i * 10, [400.0, -300.0, 500.0 + 0.05 * i, -90.0, 0.0, -100.0 + 0.001 * i]) for i in range(2000)]
+        t0 = time.perf_counter()
+        fm.motion_stats(samples)
+        self.assertLess(time.perf_counter() - t0, 0.2)          # 原来逐个样本算要约 1 s（Box 上）
+
     def test_recent_speed(self):
         samples = [(i * 10, [i * 0.5, 0, 0, 0, 0, 0]) for i in range(3)]   # 50 mm/s，但还不到 50 ms
         j, v = fm.recent_speed(samples, 0)
@@ -205,14 +217,19 @@ class _FakeArm:
         self.k = mm_s_per_pct
         self.target, self.speed, self.calls, self.ms, self.count = None, 0.0, [], 1000, 0
         self.lose_state_after = lose_state_after   # MoveL 之后再给这么多包就“断线”
+        self.frozen = False                        # True：断线，不再有新包
         self.pkg = None
+        self.latest_monotonic = None               # 同 StateRecorder：最新一包的到达时刻
 
     def wait_state(self, last_count, timeout):
         if self.calls and self.lose_state_after is not None:
             if self.lose_state_after <= 0:
-                time.sleep(min(timeout, 0.05))        # 断线：没有新包，返回上一个
-                return self.count, self.pkg
+                self.frozen = True
             self.lose_state_after -= 1
+        if self.frozen:
+            time.sleep(min(timeout, 0.05))            # 断线：没有新包，返回上一个
+            return self.count, self.pkg
+        self.latest_monotonic = time.monotonic()
         self.ms += 10
         state = 1
         if self.target is not None:
@@ -256,7 +273,7 @@ class RunnerTest(unittest.TestCase):
     def test_move_uses_percent_mode_and_measures(self):
         arm = _FakeArm(self.START, mm_s_per_pct=1.0)
         seg = self._segment(60.0)
-        fm.MotionRunner(arm, arm, "-", accel_percent=50).run(seg)
+        fm.MotionRunner(arm, arm, accel_percent=50).run(seg)
         call = arm.calls[0]
         self.assertEqual((call["velAccParamMode"], call["vel"], call["ovl"], call["oacc"], call["blendR"]),
                          (0, 20.0, 100.0, 50, 0.0))
@@ -268,7 +285,7 @@ class RunnerTest(unittest.TestCase):
         arm = _FakeArm(self.START, mm_s_per_pct=3.0)             # 标定失效：实际快 3 倍
         seg = self._segment(60.0)
         with self.assertRaisesRegex(fm.MotionAborted, "超过上限"):
-            fm.MotionRunner(arm, arm, "-", accel_percent=100).run(seg)
+            fm.MotionRunner(arm, arm, accel_percent=100).run(seg)
         self.assertIsNotNone(arm.target)                         # 还在半路就中止了
 
     def test_state_loss_aborts(self):
@@ -276,9 +293,21 @@ class RunnerTest(unittest.TestCase):
         seg = self._segment(60.0)
         t0 = time.monotonic()
         with self.assertRaisesRegex(fm.MotionAborted, "没收到机械臂状态"):
-            fm.MotionRunner(arm, arm, "-", accel_percent=100).run(seg)
+            fm.MotionRunner(arm, arm, accel_percent=100).run(seg)
         self.assertLess(time.monotonic() - t0, fm.STATE_LOST_S + 1.0)
         self.assertIn("measured", seg.log)                       # 中止时也留下已测到的部分
+
+    def test_stale_state_blocks_movel(self):
+        """断线前到达、但还没被取走的包：计数是新的，内容已过时，不能凭它发运动指令。"""
+        arm = _FakeArm(self.START, mm_s_per_pct=1.0)
+        runner = fm.MotionRunner(arm, arm, accel_percent=100)
+        runner.latest()
+        arm.wait_state(arm.count, 0.0)                           # 又到了一包，runner 还没取
+        arm.frozen = True
+        arm.latest_monotonic -= 1.0                              # 这包其实是 1 s 前到的
+        with self.assertRaisesRegex(fm.MotionAborted, "没有发运动指令"):
+            runner.run(self._segment(10.0))
+        self.assertEqual(arm.calls, [])
 
     def test_invalid_percent_refused(self):
         arm = _FakeArm(self.START, mm_s_per_pct=1.0)
@@ -286,7 +315,7 @@ class RunnerTest(unittest.TestCase):
             seg = self._segment(10.0)
             seg.percent = bad
             with self.assertRaises(fm.MotionAborted):
-                fm.MotionRunner(arm, arm, "-", accel_percent=100).run(seg)
+                fm.MotionRunner(arm, arm, accel_percent=100).run(seg)
         self.assertEqual(arm.calls, [])
 
 

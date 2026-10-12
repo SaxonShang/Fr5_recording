@@ -17,8 +17,8 @@ import numpy as np
 
 import fr5_motion as fm
 from fr5_record import StateRecorder
+from run_session import ROBOT_IP
 
-ROBOT_IP = "192.168.58.2"
 MAX_JOINT_CHANGE_DEG = 0.05
 
 PHYSICAL = dict(blendR=-1.0, velAccParamMode=1)
@@ -33,7 +33,7 @@ VARIANT_SETS["physical"] = [
     ("P7 物理 50 mm/s、oacc 1000，ovl 100，非阻塞", "L",
      dict(vel=50.0, oacc=1000.0, ovl=100.0, blendR=0.0, velAccParamMode=1)),
 ]
-VARIANT_SETS["basic"] = VARIANTS = [
+VARIANT_SETS["basic"] = [
     ("A MoveL 百分比速度 20%，阻塞（SDK 默认）", "L", dict(vel=20.0, ovl=100.0, blendR=-1.0)),
     ("B MoveL 同 A，但由控制器自己算逆解", "L", dict(vel=20.0, ovl=100.0, blendR=-1.0, no_joints=True)),
     ("C MoveL 百分比速度 20%，非阻塞 blendR=0", "L", dict(vel=20.0, ovl=100.0, blendR=0.0)),
