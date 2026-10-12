@@ -281,7 +281,7 @@ python3 run_session.py record forward          # 正式录制，另有 backward 
    └─ groundtruth_report.json        时钟拟合、Δt、前后段差、曝光中心、时间修正、行程放大、警告
 ```
 
-笔记本上的副本放在 `data/` 下（不进 git）：正式录制在 `data/recordings/<录制名>/`（10-12 的 10 条：推荐的静态场景 6 条，加 4 条画面里有人的早期录制；含左右目，4.0 GB；给数据使用者的说明是同目录的 `使用说明.md`，标定文件在 `calib/`），标定板验证录制在 `data/board_check/<录制名>/`。
+笔记本上的副本放在 `data/` 下（不进 git）：正式录制在 `data/recordings/<录制名>/`（10-12 的 6 条，含左右目，2.4 GB；给数据使用者的说明是同目录的 `使用说明.md`，标定文件在 `calib/`），标定板验证录制在 `data/board_check/<录制名>/`。
 
 真值可以单独重算：
 
