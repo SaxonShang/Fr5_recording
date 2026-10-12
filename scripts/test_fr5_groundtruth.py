@@ -80,7 +80,20 @@ def rotvec(r):
     return np.where(n > 0, v / np.where(n > 0, n, 1) * ang, 0.0)
 
 
-def write_session(d: Path, rng, flags: bool = True, duration_s: float = DURATION_S, pose=flange_pose) -> None:
+def write_motion_log(d: Path, kind: str, direction: str, start_m, end_m) -> None:
+    """只写 fr5_groundtruth 用到的字段：录制类型、方向、路径两端的法兰目标（mm）。"""
+    segs = [{"name": "goto_start", "flange": [*(np.asarray(start_m) * 1000), 0, 0, 0]},
+            {"name": "translate", "flange": [*(np.asarray(end_m) * 1000), 0, 0, 0]}]
+    (d / "motion_log.json").write_text(json.dumps({"kind": kind, "direction": direction, "segments": segs}))
+
+
+def read_tum(path: Path) -> np.ndarray:
+    return np.loadtxt(path, comments="#", ndmin=2)
+
+
+def write_session(d: Path, rng, flags: bool = True, duration_s: float = DURATION_S, pose=flange_pose,
+                  gyro_lag_ms: float = 0.0) -> None:
+    """gyro_lag_ms：陀螺仪输出比真实运动晚（模拟标定板验证发现的固定偏移），时间戳不变。"""
     # 机械臂：6 ms 采样，10 ms 发一包（带最新样本）
     t_send = SEND_PHASE_MS + 10.0 * np.arange(int(duration_s * 100))
     t_sample = 6.0 * np.floor(t_send / 6.0)
@@ -101,8 +114,8 @@ def write_session(d: Path, rng, flags: bool = True, duration_s: float = DURATION
     # ZED IMU：200 Hz，陀螺仪 = 相机体坐标系角速度 + 零偏 + 噪声（°/s）
     t_imu = 0.37 + 5.0 * np.arange(int(duration_s * 200))
     h = 0.5
-    _, r_a = pose((t_imu - h) / 1000.0)
-    _, r_b = pose((t_imu + h) / 1000.0)
+    _, r_a = pose((t_imu - gyro_lag_ms - h) / 1000.0)
+    _, r_b = pose((t_imu - gyro_lag_ms + h) / 1000.0)
     w_flange = rotvec(np.swapaxes(r_a, 1, 2) @ r_b) / (2 * h / 1000.0)
     w_cam = w_flange @ FLANGE_T_CAM[:3, :3]  # = R_fcᵀ ω
     gyro = np.rad2deg(w_cam) + np.array([0.3, -0.2, 0.1]) + rng.normal(0, 0.05, w_cam.shape)
@@ -147,12 +160,27 @@ class RotationTest(unittest.TestCase):
         self.assertAlmostEqual(np.rad2deg(gt.rotation_angle_between(q0, q1)), 1e-6, delta=1e-9)
 
 
+def pose_errors(d: Path):
+    """groundtruth_images.csv 相对合成真值的位置误差（mm）和转角误差（°）。"""
+    with open(d / "groundtruth_images.csv", encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if r["flag"] == "ok"]
+    t_img = np.load(d / "truth_t_img.npy")
+    p, r = flange_pose(t_img / 1000.0)
+    r_cam = r @ FLANGE_T_CAM[:3, :3]
+    t_cam = p + r @ FLANGE_T_CAM[:3, 3]
+    est_t = np.array([[float(x[k]) for k in ("tx_m", "ty_m", "tz_m")] for x in rows])
+    est_q = np.array([[float(x[k]) for k in ("qw", "qx", "qy", "qz")] for x in rows])
+    pos_err_mm = np.linalg.norm(est_t - t_cam, axis=1) * 1000
+    rot_err_deg = np.rad2deg(gt.rotation_angle_between(est_q, gt.matrix_to_quat(r_cam)))
+    return pos_err_mm, rot_err_deg
+
+
 class SyntheticSessionTest(unittest.TestCase):
     def test_recovers_clock_lag_and_poses(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             write_session(d, np.random.default_rng(0))
-            report = gt.process(d, d / "handeye.json", d)
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)   # 合成数据里陀螺仪没有滞后
             self.assertEqual(report["warnings"], [])
             self.assertAlmostEqual(report["clock_fit"]["drift_ppm"], -DRIFT * 1e6, delta=5.0)
             lag = report["time_offset"]
@@ -168,14 +196,8 @@ class SyntheticSessionTest(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual(report["images"]["with_groundtruth"], len(rows))
             self.assertTrue(all(r["flag"] == "ok" for r in rows))
-            t_img = np.load(d / "truth_t_img.npy")
-            p, r = flange_pose(t_img / 1000.0)
-            r_cam = r @ FLANGE_T_CAM[:3, :3]
-            t_cam = p + r @ FLANGE_T_CAM[:3, 3]
-            est_t = np.array([[float(x[k]) for k in ("tx_m", "ty_m", "tz_m")] for x in rows])
-            est_q = np.array([[float(x[k]) for k in ("qw", "qx", "qy", "qz")] for x in rows])
-            pos_err_mm = np.linalg.norm(est_t - t_cam, axis=1) * 1000
-            rot_err_deg = np.rad2deg(gt.rotation_angle_between(est_q, gt.matrix_to_quat(r_cam)))
+            self.assertEqual(report["travel_scale"]["factor"], 1.0)               # 没有 motion_log.json
+            pos_err_mm, rot_err_deg = pose_errors(d)
             print(f"\n合成数据：Δt={lag['dt_ms']:.2f} ms（期望约 {EXPECTED_DT_MS:.1f}），"
                   f"曝光中心 {exp['applied_ms']:+.2f} ms（期望约 {EXPECTED_EXPOSURE_OFFSET_MS:+.1f}），"
                   f"漂移 {report['clock_fit']['drift_ppm']:.1f} ppm，"
@@ -205,6 +227,67 @@ class SyntheticSessionTest(unittest.TestCase):
             self.assertTrue(any("image_sync_trigger" in w for w in report["warnings"]))
             manual = gt.process(d, d / "handeye.json", d, exposure_offset_ms=-3.2)
             self.assertEqual(manual["exposure_centre"]["applied_ms"], -3.2)
+
+    def test_time_correction_removes_gyro_lag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0), gyro_lag_ms=gt.TIME_CORRECTION_MS)
+            report = gt.process(d, d / "handeye.json", d)                        # 默认加时间修正
+            self.assertEqual(report["warnings"], [])
+            self.assertEqual(report["time_correction"]["applied_ms"], gt.TIME_CORRECTION_MS)
+            pos_err_mm, rot_err_deg = pose_errors(d)
+            self.assertLess(pos_err_mm.max(), 0.5)
+            self.assertLess(rot_err_deg.max(), 0.1)
+            gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            _, rot_err_raw = pose_errors(d)
+            self.assertGreater(rot_err_raw.max(), 0.15)                          # 47 °/s × 4.27 ms ≈ 0.2°
+
+    def test_travel_scale_along_motion_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0))
+            axis = np.array([1.0, 0.0, 0.0])                                     # 合成平移主要沿 x
+            write_motion_log(d, "record", "right", P0, P0 + 0.3 * axis)
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            k = gt.TRAVEL_SCALE["right"]
+            self.assertEqual(report["travel_scale"]["factor"], k)
+            fixed, raw = read_tum(d / "groundtruth_tum.txt"), read_tum(d / "groundtruth_tum_uncorrected.txt")
+            np.testing.assert_array_equal(fixed[:, 0], raw[:, 0])
+            diff = fixed[:, 1:4] - raw[:, 1:4]
+            np.testing.assert_allclose(raw[:, 4:], fixed[:, 4:], atol=1e-9)    # 姿态不变
+            p, _ = flange_pose(np.load(d / "truth_t_img.npy") / 1000.0)
+            np.testing.assert_allclose(diff @ axis, (k - 1) * ((p - P0) @ axis), atol=2e-5)
+            np.testing.assert_allclose(diff[:, 1:], 0.0, atol=1e-9)             # 垂直方向不动
+            self.assertGreater(np.abs(diff @ axis).max(), 0.5e-3)                 # 0.1 m × 0.7%
+
+            write_motion_log(d, "sync-test", "", P0, P0)
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            self.assertEqual(report["travel_scale"]["factor"], 1.0)
+
+    def test_duplicate_timestamp_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0))
+            with open(d / "img_timeline.csv", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+            dup = [rows[1][0], rows[1][1], rows[1][2].replace(".jpg", "_2.jpg"), rows[1][3].replace(".jpg", "_2.jpg")]
+            with open(d / "img_timeline.csv", "w", newline="") as f:
+                csv.writer(f).writerows([rows[0], rows[1], dup, *rows[2:]])     # ZED 把第一帧抓了两次
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            self.assertEqual(report["images"]["duplicate_timestamp"], 1)
+            with open(d / "groundtruth_images.csv", encoding="utf-8") as f:
+                flags = [r["flag"] for r in csv.DictReader(f)]
+            self.assertEqual(flags[1], "duplicate")
+            t = read_tum(d / "groundtruth_tum.txt")[:, 0]
+            self.assertEqual(len(t), len(np.unique(t)))
+
+    def test_warns_time_correction_at_other_exposure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0))
+            (d / "time_meta.txt").write_text("exposure_us=5000\n")
+            report = gt.process(d, d / "handeye.json", d)
+            self.assertTrue(any("时间修正" in w for w in report["warnings"]))
 
     def test_refuses_without_rotation(self):
         with tempfile.TemporaryDirectory() as tmp:

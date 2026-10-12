@@ -13,8 +13,13 @@ SESSION_DIR 里需要 fr5_state.csv（fr5_record.py）以及 zed_imu.csv、img_t
    做互相关。角速度大小与坐标系无关，不需要外参，但录制里要有足够快的转动（同步摆动）。
 3. 曝光中心：ZED 把在左目采集期间取到的 IMU 样本标成 image_sync_trigger=1。每帧取这些样本
    时间的中点，减去图像时间戳，整段平均得到“曝光中心 - 图像时间戳”（实测约 -3 ms）。
-4. 相机真值 base_T_camera = base_T_flange(曝光中心 - Δt) · flange_T_left_camera，
+4. 标定板验证得到的两项修正（见开头的 TIME_CORRECTION_MS、TRAVEL_SCALE）：
+   - 时间：Δt 对齐的是陀螺仪，真值仍比图像晚一个固定量，取真值的时刻再晚 TIME_CORRECTION_MS；
+   - 行程：机械臂实际行程比报告的长，法兰平移沿本条录制的运动方向、相对路径起点放大（方向和
+     路径两端从 motion_log.json 读；不是平移录制就不缩放）。
+5. 相机真值 base_T_camera = base_T_flange(曝光中心 + 时间修正 - Δt) · flange_T_left_camera，
    平移线性插值，旋转 SLERP。输出里的时间戳仍是图像原来的时间戳，方便和 SLAM 结果对齐。
+   时间戳重复的图（ZED 偶尔把同一帧抓两次）只保留第一张。
 
 时间约定：输出时间戳都是 ZED / Box 系统时间（Unix 秒）。机械臂样本在 ZED 时间轴上的时刻
 = 映射到 Box 时间的控制器时间 + Δt。假设 ZED 图像和 IMU 时间戳在同一时钟上，且 image_sync_trigger
@@ -22,9 +27,10 @@ SESSION_DIR 里需要 fr5_state.csv（fr5_record.py）以及 zed_imu.csv、img_t
 
 输出（默认写在 SESSION_DIR）：
   groundtruth_tum.txt           每张图一行：timestamp tx ty tz qx qy qz qw（s, m），左目相机在基坐标系下
-  groundtruth_arm_rate_tum.txt  每个机械臂状态包一行，格式同上
+  groundtruth_tum_uncorrected.txt  同上，但不加第 4 步的两项修正（对照用）
+  groundtruth_arm_rate_tum.txt  每个机械臂状态包一行，格式同上（已加修正）
   groundtruth_images.csv        每张图的真值和标记
-  groundtruth_report.json       时钟拟合、Δt、质量检查和警告
+  groundtruth_report.json       时钟拟合、Δt、修正、质量检查和警告
 """
 
 from __future__ import annotations
@@ -49,6 +55,12 @@ MAX_SEGMENT_LAG_DIFF_MS = 2.0
 MIN_SPLIT_S = 20.0         # 录制至少这么长，才把前 40% 和后 40% 分开估 Δt、互相核对（sync-test 和正式录制约 30 s）
 MIN_EXPOSURE_FRAMES = 20   # 估曝光中心至少需要的带标记帧数
 MAX_EXPOSURE_SD_MS = 3.0   # 各帧曝光中心偏差的标准差上限
+# 标定板验证（2026-10-12，见 data_recording/实验记录.md）得到的修正
+TIME_CORRECTION_MS = 4.27            # 真值比图像晚的固定量（3 条录制、12 个位置平均，±0.26 ms）
+TIME_CORRECTION_EXPOSURE_US = 10000  # 上面的值是在这个曝光下测的；曝光不同时报警
+# 机械臂实际行程 / 报告行程，按录制方向。只适用于 start_pose.json 起点 ±150 mm 的这 6 段平移
+TRAVEL_SCALE = {"right": 1.0070, "left": 1.0070, "up": 1.0070, "down": 1.0070,
+                "forward": 1.0015, "backward": 1.0015}
 
 ARM_COLUMNS = ["box_realtime_ns", "ctrl_unix_ms", "x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg",
                "robot_state", "main_code", "sub_code", "tool", "user"]
@@ -368,6 +380,29 @@ def camera_pose(p_flange, q_flange, flange_t_cam):
     return t_c, matrix_to_quat(r_c)
 
 
+def travel_scale(session: Path, factor: float | None = None) -> dict:
+    """本条录制的行程放大：方向、路径起点（法兰，m）和系数。factor=None 时按 TRAVEL_SCALE 取。"""
+    path = session / "motion_log.json"
+    log = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    segs = {s["name"]: s for s in log.get("segments", [])}
+    if log.get("kind") != "record" or "goto_start" not in segs or "translate" not in segs:
+        return {"factor": 1.0, "source": "none", "note": "不是平移录制（或没有 motion_log.json），不缩放"}
+    start = np.array(segs["goto_start"]["flange"][:3], dtype=float) / 1000.0
+    end = np.array(segs["translate"]["flange"][:3], dtype=float) / 1000.0
+    direction = log.get("direction")
+    return {"factor": float(TRAVEL_SCALE.get(direction, 1.0) if factor is None else factor),
+            "source": "TRAVEL_SCALE" if factor is None else "manual", "direction": direction,
+            "origin_flange_m": start.tolist(), "axis_base": ((end - start) / np.linalg.norm(end - start)).tolist()}
+
+
+def apply_travel_scale(pos: np.ndarray, scale: dict) -> np.ndarray:
+    """法兰位置沿运动方向、相对路径起点放大 factor 倍；垂直方向不动。"""
+    if scale["factor"] == 1.0:
+        return pos
+    origin, axis = np.array(scale["origin_flange_m"]), np.array(scale["axis_base"])
+    return pos + (scale["factor"] - 1.0) * ((pos - origin) @ axis)[:, None] * axis
+
+
 def write_tum(path: Path, t_ms, pos, quat) -> None:
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("# timestamp tx ty tz qx qy qz qw  (Unix s, m; left camera in FR5 base frame)\n")
@@ -377,15 +412,18 @@ def write_tum(path: Path, t_ms, pos, quat) -> None:
 
 
 def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float = 300.0,
-            dt_ms: float | None = None, exposure_offset_ms: float | None = None) -> dict:
+            dt_ms: float | None = None, exposure_offset_ms: float | None = None,
+            time_correction_ms: float | None = None, scale_factor: float | None = None) -> dict:
     warnings = []
     flange_t_cam, handeye = load_handeye(handeye_path)
     arm = load_arm(session / "fr5_state.csv")
     t_imu, gyro, trigger = load_imu(session / "zed_imu.csv")
     t_img, names = load_images(session / "img_timeline.csv")
+    duplicate = np.ones(len(t_img), dtype=bool)
+    duplicate[np.unique(t_img, return_index=True)[1]] = False   # 同一时间戳只保留第一张
 
     # 曝光中心相对图像时间戳的偏差
-    exposure = exposure_centre(t_img, t_imu, trigger)
+    exposure = exposure_centre(t_img[~duplicate], t_imu, trigger)
     if exposure_offset_ms is not None:
         exposure = {**(exposure or {}), "source": "manual", "applied_ms": exposure_offset_ms}
     elif exposure is None:
@@ -464,24 +502,44 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
             warnings.append(f"开头和结尾没有都做同步摆动（或录制不足 {MIN_SPLIT_S:.0f} s），没能核对前后 Δt 是否一致")
     shift = lag["dt_ms"]
 
-    # 3. 真值
+    # 3. 标定板验证得到的修正
+    correction = {"applied_ms": TIME_CORRECTION_MS if time_correction_ms is None else time_correction_ms,
+                  "source": "TIME_CORRECTION_MS" if time_correction_ms is None else "manual"}
+    time_correction_ms = correction["applied_ms"]
+    exp_us = read_time_meta(session / "time_meta.txt").get("exposure_us")
+    if exp_us:
+        correction["exposure_ms"] = float(exp_us) / 1000
+        if time_correction_ms and float(exp_us) != TIME_CORRECTION_EXPOSURE_US:
+            warnings.append(f"时间修正 {time_correction_ms} ms 是在曝光 {TIME_CORRECTION_EXPOSURE_US / 1000:.0f} ms 下测的，"
+                            f"这条录制曝光 {float(exp_us) / 1000:.1f} ms，修正可能不准")
+    scale = travel_scale(session, scale_factor)
+    pos_c = apply_travel_scale(pos, scale)
+
+    # 4. 真值（t_arm_cam 对齐陀螺仪，t_arm_img 再对齐到图像）
     output.mkdir(parents=True, exist_ok=True)
     t_arm_cam = t_arm + shift
-    cam_t, cam_q = camera_pose(pos, quat, flange_t_cam)
-    write_tum(output / "groundtruth_arm_rate_tum.txt", t_arm_cam, cam_t, cam_q)
+    t_arm_img = t_arm_cam - time_correction_ms
+    cam_t, cam_q = camera_pose(pos_c, quat, flange_t_cam)
+    write_tum(output / "groundtruth_arm_rate_tum.txt", t_arm_img, cam_t, cam_q)
 
-    p_f, q_f, inside, span, i0, i1 = interpolate(t_img + exposure["applied_ms"], t_arm_cam, pos, quat)
+    t_query = t_img + exposure["applied_ms"]
+    p_f, q_f, inside, span, i0, i1 = interpolate(t_query, t_arm_img, pos_c, quat)
     img_t, img_q = camera_pose(p_f, q_f, flange_t_cam)
     gap = inside & (span > MAX_GAP_MS)
     bad_robot = inside & (error_rows[i0] | error_rows[i1])
-    good = inside & ~gap
+    good = inside & ~gap & ~duplicate
     write_tum(output / "groundtruth_tum.txt", t_img[good], img_t[good], img_q[good])
+    p_u, q_u, inside_u, span_u, *_ = interpolate(t_query, t_arm_cam, pos, quat)   # 不加修正，对照用
+    raw_t, raw_q = camera_pose(p_u, q_u, flange_t_cam)
+    good_u = inside_u & (span_u <= MAX_GAP_MS) & ~duplicate
+    write_tum(output / "groundtruth_tum_uncorrected.txt", t_img[good_u], raw_t[good_u], raw_q[good_u])
     with open(output / "groundtruth_images.csv", "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["zed_timestamp_ms", "filename_left", "flag", "arm_span_ms",
                     "tx_m", "ty_m", "tz_m", "qx", "qy", "qz", "qw"])
         for k in range(len(t_img)):
-            flag = "outside" if not inside[k] else "gap" if gap[k] else "robot_error" if bad_robot[k] else "ok"
+            flag = ("duplicate" if duplicate[k] else "outside" if not inside[k] else "gap" if gap[k]
+                    else "robot_error" if bad_robot[k] else "ok")
             vals = ([f"{v:.6f}" for v in img_t[k]] + [f"{v:.9f}" for v in img_q[k][[1, 2, 3, 0]]]
                     if good[k] else [""] * 7)
             w.writerow([f"{t_img[k]:.0f}", names[k], flag, f"{span[k]:.1f}" if inside[k] else ""] + vals)
@@ -497,13 +555,19 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
         "arm_peak_angular_speed_deg_s": float(w_arm.max(initial=0)),
         "time_offset": lag,
         "exposure_centre": exposure,
+        "time_correction": correction,
+        "travel_scale": scale,
         "images": {"total": int(len(t_img)), "with_groundtruth": int(good.sum()),
+                   "duplicate_timestamp": int(duplicate.sum()),
                    "outside_arm_data": int((~inside).sum()), "in_arm_gap": int(gap.sum()),
                    "robot_error": int(bad_robot.sum())},
         "warnings": warnings,
         "conventions": [
-            "时间戳：ZED / Box 系统时间（Unix 秒）。机械臂样本时刻 = 映射后的控制器时间 + time_offset.dt_ms。",
+            "时间戳：ZED / Box 系统时间（Unix 秒）。机械臂样本时刻 = 映射后的控制器时间 + time_offset.dt_ms"
+            " - time_correction.applied_ms。",
             "每张图的真值取在曝光中心 = 图像时间戳 + exposure_centre.applied_ms；输出时间戳仍是图像时间戳。",
+            "法兰平移沿 travel_scale.axis_base、相对 travel_scale.origin_flange_m 放大 travel_scale.factor 倍"
+            "（机械臂实际行程比报告的长）。groundtruth_tum_uncorrected.txt 不加时间修正和行程放大。",
             "位姿：ZED 左目（校正后光学坐标系）在 FR5 基坐标系下，TUM 顺序 tx ty tz qx qy qz qw，单位 m。",
             "base_T_camera = base_T_flange · flange_T_left_camera；FR5 姿态 R = Rz(rz)·Ry(ry)·Rx(rx)。",
             "假设 ZED 图像与 IMU 在同一时钟上、image_sync_trigger 正确标出采集期间，且相机安装自手眼标定后没有变动。",
@@ -524,11 +588,16 @@ def main(argv=None) -> int:
     parser.add_argument("--dt-ms", type=float, help="手动指定 Δt，跳过陀螺仪互相关")
     parser.add_argument("--exposure-offset-ms", type=float,
                         help="手动指定“曝光中心 - 图像时间戳”（ms），跳过 image_sync_trigger 估计")
+    parser.add_argument("--time-correction-ms", type=float,
+                        help=f"真值比图像晚的固定量（ms），默认 TIME_CORRECTION_MS={TIME_CORRECTION_MS}；0 表示不修正")
+    parser.add_argument("--scale-factor", type=float,
+                        help="行程放大系数，默认按录制方向取 TRAVEL_SCALE；1 表示不缩放")
     args = parser.parse_args(argv)
     session = args.session.expanduser()
     try:
         report = process(session, args.handeye.expanduser(), (args.output or session).expanduser(),
-                         args.max_lag_ms, args.dt_ms, args.exposure_offset_ms)
+                         args.max_lag_ms, args.dt_ms, args.exposure_offset_ms,
+                         args.time_correction_ms, args.scale_factor)
     except (OSError, ValueError, KeyError) as exc:
         print(f"失败：{exc}", file=sys.stderr)
         return 1
@@ -541,7 +610,11 @@ def main(argv=None) -> int:
     exp = report["exposure_centre"]
     print(f"曝光中心 = 图像时间戳 {exp['applied_ms']:+.2f} ms（{exp['source']}"
           + (f"，{exp['frames']} 帧，标准差 {exp['sd_ms']:.2f} ms" if "frames" in exp else "") + "）")
-    print(f"图像 {imgs['total']} 张，有真值 {imgs['with_groundtruth']} 张")
+    tc, sc = report["time_correction"], report["travel_scale"]
+    print(f"修正：取真值的时刻再晚 {tc['applied_ms']:+.2f} ms（{tc['source']}）；"
+          + (f"行程 ×{sc['factor']:.4f}（{sc['direction']}，{sc['source']}）" if sc["factor"] != 1.0 else "行程不缩放"))
+    dup = f"，重复时间戳 {imgs['duplicate_timestamp']} 张已去掉" if imgs["duplicate_timestamp"] else ""
+    print(f"图像 {imgs['total']} 张，有真值 {imgs['with_groundtruth']} 张{dup}")
     for w in report["warnings"]:
         print(f"警告：{w}")
     return 0

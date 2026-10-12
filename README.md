@@ -29,7 +29,13 @@
 
 ### 3.1 相机真值
 
-机械臂状态以约 100 Hz 推送法兰位姿（20004 端口）。每张图像在其曝光中心时刻插值法兰位姿（位置线性插值，姿态用 SLERP），再乘手眼外参得到左目相机在 FR5 基坐标系下的位姿。超出机械臂数据范围、或两侧状态包间隔超过 30 ms（丢包）的帧不输出真值；带机械臂错误码的帧会在 `groundtruth_images.csv` 中标记出来。
+机械臂状态以约 100 Hz 推送法兰位姿（20004 端口）。每张图像在其曝光中心时刻插值法兰位姿（位置线性插值，姿态用 SLERP），再乘手眼外参得到左目相机在 FR5 基坐标系下的位姿。超出机械臂数据范围、或两侧状态包间隔超过 30 ms（丢包）的帧不输出真值；带机械臂错误码的帧会在 `groundtruth_images.csv` 中标记出来；时间戳重复的帧（ZED 偶尔把同一帧抓两次）只保留第一张。
+
+真值里加了两项由标定板验证（3.3）得到的修正：
+- **时间**：取真值的时刻再晚 4.27 ms（`TIME_CORRECTION_MS`）。
+- **行程**：法兰平移沿本条录制的运动方向、相对路径起点放大（`TRAVEL_SCALE`）：right / left / up / down 为 1.0070，forward / backward 为 1.0015。录制方向和路径两端从 `motion_log.json` 读取；不是平移录制（如 sync-test）就不缩放。
+
+同时输出一份不加这两项修正的真值，用于对照。
 
 ### 3.2 时间同步
 
@@ -91,7 +97,7 @@
 - **时间**：**真值比图像晚 4.27 ms**（三条平均，标准差 0.26 ms；12 个位置分别在 +3.7 到 +4.9 ms 之间）。
   - 这是陀螺仪和图像之间的固定偏移，不是时钟拟合的问题。依据：“Δt + δ”在三条之间相差 1.0 ms，而 δ 只差 0.5 ms。
   - 偏移来源有两种可能：ZED 陀螺仪输出滞后（内部滤波）；或者由 `image_sync_trigger` 估出的曝光中心（−3.5 ms）有偏差。曝光固定为 10 ms 时两者效果相同，改变曝光后要重新验证。
-  - `fr5_groundtruth.py` 目前**还没有**加入这个修正。
+  - 修正已加入 `fr5_groundtruth.py`（3.1）。加修正后重算这三条，时间扫描得到 −0.30 / +0.13 / +0.17 ms。
 - **空间**：下表是机械臂实际行程相对控制器报告值的偏差，正值表示实际走得更长。
 
   | 方向 | 单目（以标定板 412.5 mm 为尺度） | 双目（以出厂基线为尺度，扣除视差偏差） | 结论 |
@@ -141,7 +147,7 @@
 | `scripts/zed_capture.py` | zed_record 的子进程管理（启动、等待开始采集、正常停止、保存输出），以及检查相机是否被其他程序占用 |
 | `scripts/fr5_groundtruth.py` | 离线真值：时钟拟合 → 陀螺仪互相关求 Δt → 曝光中心修正 → 插值出相机真值（只依赖 numpy） |
 | `scripts/gt_board_check.py` | 标定板真值验证，在笔记本上运行；只读调用标定仓库的 Aprilgrid 检测、s003 内参和标定板尺寸 |
-| `scripts/test_fr5_groundtruth.py`、`test_fr5_motion.py`、`test_gt_board_check.py` | 离线测试（合成数据，不连机械臂），共 27 项；标定板测试只在笔记本上运行，Box 上自动跳过 |
+| `scripts/test_fr5_groundtruth.py`、`test_fr5_motion.py`、`test_gt_board_check.py` | 离线测试（合成数据，不连机械臂），共 31 项；标定板测试只在笔记本上运行，Box 上自动跳过；参数检查需要 FAIRINO SDK，笔记本上自动跳过 |
 | `scripts/movel_probe.py` | 诊断：发零行程的 MoveL / MoveJ（目标 = 当前位姿），看控制器拒绝哪种参数；`--set physical` 测试物理速度模式 |
 | `scripts/handeye_s003_result.json` | 标定仓库 `results/s003/result.json` 的副本（手眼外参） |
 | `scripts/start_pose.json` | `set-start` 保存的水平起点：相机光心约 (597, −476, 562) mm，关节 [119.51, 14.41, −74.33, −119.99, −44.77, −0.02]° |
@@ -175,7 +181,8 @@
 | `MAX_JOINT_STEP_DEG` | 5 | 1–15 | 路径上每 10 mm / 2° 允许的最大关节变化，超过说明逆解可能跳支 |
 | `MIN_FREE_GB` | 5 | 1–100 | 开始录制前 Box 至少剩余的磁盘空间 |
 
-`fr5_groundtruth.py` 的命令行选项：`--max-lag-ms`（Δt 搜索范围，默认 300），`--dt-ms`、`--exposure-offset-ms`（手动指定，不估计）。
+`fr5_groundtruth.py` 开头的修正参数：`TIME_CORRECTION_MS`（4.27，曝光 10 ms 下测得，曝光不同时报警）、`TRAVEL_SCALE`（按录制方向的行程放大系数，只适用于当前起点 ±150 mm 的 6 段路径）。
+`fr5_groundtruth.py` 的命令行选项：`--max-lag-ms`（Δt 搜索范围，默认 300），`--dt-ms`、`--exposure-offset-ms`（手动指定，不估计），`--time-correction-ms`（0 表示不加时间修正）、`--scale-factor`（1 表示不缩放）。
 `gt_board_check.py` 的命令行选项：`--step`（每隔几张检测一张）、`--scan-ms`（时间扫描范围，默认 ±20 ms）、`--camera`、`--target`、`--calib-repo`。
 
 ## 5. 使用流程
@@ -252,10 +259,11 @@ python3 run_session.py record forward          # 正式录制，另有 backward 
    ├─ fr5_state.csv          机械臂状态（约 100 Hz）：Box 时间、控制器时间、关节、法兰位姿、错误码等
    ├─ fr5_meta.json          丢包、断线、时钟跳变、接收缓冲区大小等
    ├─ motion_log.json        每段指令：时间、速度百分比、预计速度、实测速度；平移段速度和波动；所用速度标定
-   ├─ groundtruth_tum.txt    每张图一行：timestamp tx ty tz qx qy qz qw（Unix 秒、米），左目在 FR5 基坐标系下
-   ├─ groundtruth_arm_rate_tum.txt   机械臂每个状态包一行，格式同上
-   ├─ groundtruth_images.csv         每张图的真值和标记（ok / outside / gap / robot_error）
-   └─ groundtruth_report.json        时钟拟合、Δt、前后段差、曝光中心、警告
+   ├─ groundtruth_tum.txt    每张图一行：timestamp tx ty tz qx qy qz qw（Unix 秒、米），左目在 FR5 基坐标系下（已加修正）
+   ├─ groundtruth_tum_uncorrected.txt  同上，不加时间修正和行程放大（对照用）
+   ├─ groundtruth_arm_rate_tum.txt   机械臂每个状态包一行，格式同上（已加修正）
+   ├─ groundtruth_images.csv         每张图的真值和标记（ok / duplicate / outside / gap / robot_error）
+   └─ groundtruth_report.json        时钟拟合、Δt、前后段差、曝光中心、时间修正、行程放大、警告
 ```
 
 真值可以单独重算：
