@@ -254,7 +254,7 @@ python3 run_session.py record forward          # 正式录制，另有 backward 
 - **不要调用 SDK 的 `LoggerInit()`**：它会持续往磁盘写日志。
 - **相机同一时间只能被一个程序打开**：录制前关掉 ZED Explorer、Depth Viewer、`zed_snapshot.py`。
 - **Box 的 WiFi 会断**：运动和录制在 Box 本机终端运行（Box 没有 tmux / screen）。
-- **开机预热**：Box 重启后相机有冷热漂移，预热 30 分钟以上再录真值数据。
+- **开机预热**：Box 重启后相机有冷热漂移，预热 30 分钟以上再录真值数据。重启后的头几分钟系统时间还在对时调整，时钟拟合残差可能超过 1 ms（10-12 实测对真值影响 ≤ 0.03 mm）；预热完再录，这个问题也一起避开。
 - **场景**：画面里不要有人走动；数据如果要公开，先征得画面里的人同意。
 - **错误码**：SDK 返回的正数错误码来自控制器，查 FAIRINO 官方“错误码对照表”。例如 172 表示运动速度不能为 0，182 / 183 表示给定的物理速度 / 加速度超限。
 
@@ -280,6 +280,8 @@ python3 run_session.py record forward          # 正式录制，另有 backward 
    ├─ groundtruth_images.csv         每张图的真值和标记（ok / duplicate / outside / gap / robot_error）
    └─ groundtruth_report.json        时钟拟合、Δt、前后段差、曝光中心、时间修正、行程放大、警告
 ```
+
+笔记本上的副本放在 `data/` 下（不进 git）：正式录制在 `data/recordings/<录制名>/`（10-12 的 10 条：推荐的静态场景 6 条，加 4 条画面里有人的早期录制；含左右目，4.0 GB；给数据使用者的说明是同目录的 `使用说明.md`，标定文件在 `calib/`），标定板验证录制在 `data/board_check/<录制名>/`。
 
 真值可以单独重算：
 
