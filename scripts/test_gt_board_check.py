@@ -102,12 +102,12 @@ class BoardCheckTest(unittest.TestCase):
         syn = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(syn)
         syn.WIDTH, syn.HEIGHT = 1920, 1080                                  # 录制用 HD1080
-        k = bc.load_camera(bc.CALIB_REPO / bc.CAMERA_YAML)
+        k = bc.load_camera(bc.CAMERA_YAML)
         board = read_board(bc.CALIB_REPO / bc.TARGET_YAML)
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             write_session(d, syn, board, k, np.random.default_rng(0))
-            r = bc.check(d, bc.CALIB_REPO, bc.CALIB_REPO / bc.CAMERA_YAML, bc.CALIB_REPO / bc.TARGET_YAML, d,
+            r = bc.check(d, bc.CALIB_REPO, bc.CAMERA_YAML, bc.CALIB_REPO / bc.TARGET_YAML, d,
                          scan_ms=15.0)
             print("\n" + bc.summary(r))
             self.assertLess(r["check_csv_vs_arm_rate_max_mm"], 0.01)

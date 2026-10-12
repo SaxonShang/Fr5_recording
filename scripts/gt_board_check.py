@@ -11,7 +11,8 @@
 2. 运动帧和静止帧的离散程度：时间不同步会让运动帧变散。
 3. 时间扫描：把真值时间整体平移 δ，找让运动帧最一致的 δ。这是用图像独立检验 Δt 和曝光中心修正，应接近 0。
 
-需要标定仓库（Aprilgrid 检测、s003 的内参和标定板尺寸），只读，不改它。
+需要标定仓库（Aprilgrid 检测、标定板尺寸），只读，不改它。内参默认用同目录的 camera_s003_refit.yaml
+（s003 图像重标，比 ZED 出厂内参准；出厂值在标定仓库 results/s003/camera.yaml，可用 --camera 指定）。
 输出写进 save_data 目录：board_check_frames.csv（每帧）、board_check_report.json（汇总）。
 """
 
@@ -33,8 +34,8 @@ import yaml  # noqa: E402
 import fr5_groundtruth as gt  # noqa: E402
 
 CALIB_REPO = Path(__file__).resolve().parents[2] / "calibration"   # D:\天府绛溪实验室\calibration
-CAMERA_YAML = "results/s003/camera.yaml"      # 相对标定仓库
-TARGET_YAML = "results/s003/target.yaml"
+CAMERA_YAML = Path(__file__).resolve().parent / "camera_s003_refit.yaml"   # 内参（s003 图像重标）
+TARGET_YAML = "results/s003/target.yaml"      # 相对标定仓库
 MIN_TAGS = 8                  # 少于这么多个 tag 的帧不用
 MAX_REPROJ_PX = 1.0           # PnP 重投影 RMS 超过它的帧不用
 SPEED_HALF_MS = 20.0          # 相机速度按 ±20 ms 差分
@@ -338,14 +339,14 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("save_data", type=Path, help="录制的 save_data 目录（已经算过真值）")
     parser.add_argument("--calib-repo", type=Path, default=CALIB_REPO, help="标定仓库路径")
-    parser.add_argument("--camera", type=Path, help=f"内参，默认 <标定仓库>/{CAMERA_YAML}")
+    parser.add_argument("--camera", type=Path, help=f"内参，默认 {CAMERA_YAML.name}（同目录）")
     parser.add_argument("--target", type=Path, help=f"标定板，默认 <标定仓库>/{TARGET_YAML}")
     parser.add_argument("--output", type=Path, help="输出目录，默认 save_data 目录")
     parser.add_argument("--step", type=int, default=1, help="每隔几张图检测一张（加快速度）")
     parser.add_argument("--scan-ms", type=float, default=20.0, help="时间扫描范围 ±ms")
     args = parser.parse_args(argv)
     try:
-        r = check(args.save_data, args.calib_repo, args.camera or args.calib_repo / CAMERA_YAML,
+        r = check(args.save_data, args.calib_repo, args.camera or CAMERA_YAML,
                   args.target or args.calib_repo / TARGET_YAML, args.output or args.save_data,
                   step=max(1, args.step), scan_ms=args.scan_ms)
     except (OSError, ValueError, KeyError) as exc:
