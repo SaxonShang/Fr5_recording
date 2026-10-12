@@ -4,6 +4,7 @@
 """
 
 import dataclasses
+import threading
 import time
 import types
 import unittest
@@ -366,11 +367,16 @@ def _circle(p0, p1, p2):
 class _FakeArm:
     """假的状态录制器 + RPC：每次 wait_state 前进 10 ms。
     MoveL：位置按 速度百分比 × mm_s_per_pct 匀速直线走向目标，姿态同步 slerp；
-    MoveC：按 速度百分比 × deg_s_per_pct 的角速度，位置沿过 via 的圆弧、姿态 slerp（movec_as_line=True 时位置走直线）。"""
+    MoveC：按 速度百分比 × deg_s_per_pct 的角速度，位置沿过 via 的圆弧、姿态 slerp（movec_as_line=True 时位置走直线）；
+    movec_blocks=True 时像真控制器一样走完才返回（10-12 实测），movec_error 非 0 时直接返回这个错误码。"""
 
-    def __init__(self, start6, mm_s_per_pct, lose_state_after=None, deg_s_per_pct=0.5, movec_as_line=False):
+    def __init__(self, start6, mm_s_per_pct, lose_state_after=None, deg_s_per_pct=0.5, movec_as_line=False,
+                 movec_blocks=False, movec_error=0, pos_lead=1.0):
         self.pos = np.array(start6, dtype=float)
         self.k, self.k_rot, self.movec_as_line = mm_s_per_pct, deg_s_per_pct, movec_as_line
+        self.movec_blocks, self.movec_error = movec_blocks, movec_error
+        self.pos_lead = pos_lead                   # >1：位置比姿态先走（位置进度 = min(1, u × pos_lead)）
+        self.idle = threading.Event()              # 运动走完时置位（阻塞的 MoveC 等它）
         self.target, self.speed, self.calls, self.ms, self.count = None, 0.0, [], 1000, 0
         self.lose_state_after = lose_state_after   # MoveL 之后再给这么多包就“断线”
         self.frozen = False                        # True：断线，不再有新包
@@ -396,9 +402,10 @@ class _FakeArm:
             if self.u >= 1.0:
                 self.pos = self.target.copy()
                 self.target = None
+                self.idle.set()
             else:
                 pose = np.eye(4)
-                pose[:3, 3] = position(self.u)
+                pose[:3, 3] = position(min(1.0, self.u * self.pos_lead))
                 q0, q1 = fm.gt.matrix_to_quat(m0[:3, :3]), fm.gt.matrix_to_quat(m1[:3, :3])
                 pose[:3, :3] = fm.gt.quat_to_matrix(fm.gt.slerp(q0, q1, np.array(self.u)))
                 self.pos = np.array(fm.matrix_to_fr5(pose))
@@ -412,9 +419,11 @@ class _FakeArm:
         return self.count, self.pkg
 
     def _start(self, target6, du, position):
-        m0 = fm.fr5_to_matrix(self.pos)
-        self.target, self.u = np.array(target6, dtype=float), 0.0
-        self.motion = (m0, fm.fr5_to_matrix(target6), du, position)
+        # MoveC 可能在另一个线程里调用：先备好 motion，最后才设 target（wait_state 看到 target 就会用 motion）
+        self.idle.clear()
+        self.motion = (fm.fr5_to_matrix(self.pos), fm.fr5_to_matrix(target6), du, position)
+        self.u = 0.0
+        self.target = np.array(target6, dtype=float)
 
     def MoveL(self, **kw):  # noqa: N802 - SDK 的名字
         self.calls.append(("MoveL", kw))
@@ -430,6 +439,8 @@ class _FakeArm:
 
     def MoveC(self, **kw):  # noqa: N802 - SDK 的名字
         self.calls.append(("MoveC", kw))
+        if self.movec_error:
+            return self.movec_error
         m0, m1 = fm.fr5_to_matrix(self.pos), fm.fr5_to_matrix(kw["desc_pos_t"])
         p0, pv, p1 = m0[:3, 3], fm.fr5_to_matrix(kw["desc_pos_p"])[:3, 3], m1[:3, 3]
         angle = fm.rotation_deg(m0, m1)
@@ -441,6 +452,8 @@ class _FakeArm:
                 return p0 + u * (p1 - p0)
             return c + fm.axis_angle(n, u * phi) @ (p0 - c)
         self._start(kw["desc_pos_t"], kw["vel_t"] * self.k_rot * 0.01 / angle, position)
+        if self.movec_blocks:
+            self.idle.wait(10.0)                   # 运动由主线程的 wait_state 推进；中止后最多挂 10 s
         return 0
 
 
@@ -542,6 +555,47 @@ class RunnerTest(unittest.TestCase):
             fm.MotionRunner(arm, arm, accel_percent=100).run(rot)
         self.assertIsNotNone(arm.target)                         # 半路就停了
         self.assertGreater(rot.log["pivot_dev_max_mm"], fm.MAX_PIVOT_DEV_MM)
+
+    def test_blocking_movec_still_monitored(self):
+        """真控制器上 MoveC 走完才返回：放在线程里调用，运动中照样逐包采样、算光心偏离和角速度。"""
+        start6, rot = self._rotation()
+        arm = _FakeArm(start6, mm_s_per_pct=1.0, deg_s_per_pct=0.5, movec_blocks=True)
+        fm.MotionRunner(arm, arm, accel_percent=50).run(rot)
+        np.testing.assert_allclose(arm.pos, rot.flange, atol=1e-9)
+        m = rot.log["measured"]
+        self.assertGreater(m["samples"], 100)                     # 不是只有起点、终点两三个样本
+        self.assertLess(m["max_gap_s"], 0.05)
+        self.assertAlmostEqual(m["angular_deg_s"]["mean"], 5.0, delta=0.1)
+        self.assertLess(rot.log["pivot_dev_max_mm"], 0.01)
+        self.assertIsNotNone(rot.log["movec"]["returned_box_ns"])
+
+    def test_blocking_movec_off_pivot_aborts(self):
+        start6, rot = self._rotation("pitch_down")
+        arm = _FakeArm(start6, mm_s_per_pct=1.0, deg_s_per_pct=0.5, movec_as_line=True, movec_blocks=True)
+        try:
+            with self.assertRaisesRegex(fm.MotionAborted, "光心偏离"):
+                fm.MotionRunner(arm, arm, accel_percent=100).run(rot)
+            self.assertIsNotNone(arm.target)                     # MoveC 还没返回，半路就停了
+        finally:
+            arm.idle.set()                                       # 放掉挂着的线程
+
+    def test_movec_error_code_aborts(self):
+        start6, rot = self._rotation()
+        arm = _FakeArm(start6, mm_s_per_pct=1.0, movec_error=112)
+        with self.assertRaisesRegex(fm.MotionAborted, "MoveC 返回错误码 112"):
+            fm.MotionRunner(arm, arm, accel_percent=100).run(rot)
+
+    def test_rotation_ignores_linear_transient(self):
+        """同步摆动（MoveL 绕光心转）起步时位置先走：线速度远超预计，但角速度正常，不应中止。"""
+        start = fm.fr5_to_matrix(self.START)
+        seg = fm._move("wiggle", fm.rotate_about(start @ F_T_C, [0, 0, 1.0], 10.0), F_T_C, rate_deg_s=5.0, pivot=True)
+        fm.fill_geometry([seg], start)
+        fm.apply_speed([seg], MODEL, 1.0)
+        arm = _FakeArm(self.START, mm_s_per_pct=1.0, deg_s_per_pct=0.5, pos_lead=4.0)
+        fm.MotionRunner(arm, arm, accel_percent=100).run(seg)
+        m = seg.log["measured"]["linear_mm_s"]
+        self.assertGreater(m["max"], seg.expect_mm_s * fm.OVERSPEED_FACTOR + fm.OVERSPEED_MARGIN_MM_S)   # 旧规则会误报
+        np.testing.assert_allclose(arm.pos, seg.flange, atol=1e-9)
 
     def test_rotation_overspeed_aborts(self):
         start6, rot = self._rotation()

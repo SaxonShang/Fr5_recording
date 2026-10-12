@@ -629,32 +629,35 @@ def cmd_movec_test(args) -> int:
     start = load_start()
     segs = fm.plan_movec_test(start["camera"], f_t_c, motion_config(), SPEED_TEST_PCT)
     error, ran = None, False
-    with tempfile.TemporaryDirectory() as tmp:
-        rec = StateRecorder(tmp, ROBOT_IP)
+    # 原始状态包存下来（结束时写一次），事后能逐包查速度和光心；没有运动就不留目录
+    state_dir = p(SESSIONS_DIR) / f"{dt.datetime.now():%Y%m%d_%H%M%S}_movec-test"
+    rec = StateRecorder(state_dir, ROBOT_IP)
+    try:
         rec.start()
-        try:
-            rpc = rec.open_rpc()
-            runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
-            runner.precheck()
-            found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
-            if found:
-                raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
-            confirm_plan(f"movec-test：圆弧（MoveC）和直线（MoveL）各转 +{WIGGLE_DEG:g}°、-{2 * WIGGLE_DEG:g}°、+{WIGGLE_DEG:g}°，"
-                         f"速度都是 {SPEED_TEST_PCT}%（预计按摆动标定估算，超过 1.5 倍就中止；"
-                         f"圆弧时光心偏离超过 {fm.MAX_PIVOT_DEV_MM} mm 也中止）\n{note}\n只录机械臂状态，不开相机\n"
-                         + describe(segs, totals=False), args.yes)
-            ran = True
-            for seg in segs:
-                print(f"[{seg.name}]", flush=True)
-                runner.run(seg)
-                report_move(seg)
-        except BaseException as exc:  # noqa: BLE001 - 包括 Ctrl+C：先停机械臂
-            error = f"{type(exc).__name__}: {exc}"
-            if ran:
-                fm.emergency_stop(ROBOT_IP)
-            print(f"\n中止：{error}")
-        finally:
-            rec.stop(write=False)
+        rpc = rec.open_rpc()
+        runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
+        runner.precheck()
+        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
+        if found:
+            raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
+        confirm_plan(f"movec-test：圆弧（MoveC）和直线（MoveL）各转 +{WIGGLE_DEG:g}°、-{2 * WIGGLE_DEG:g}°、+{WIGGLE_DEG:g}°，"
+                     f"速度都是 {SPEED_TEST_PCT}%（预计按摆动标定估算，超过 1.5 倍就中止；"
+                     f"圆弧时光心偏离超过 {fm.MAX_PIVOT_DEV_MM} mm 也中止）\n{note}\n只录机械臂状态，不开相机\n"
+                     + describe(segs, totals=False), args.yes)
+        ran = True
+        for seg in segs:
+            print(f"[{seg.name}]", flush=True)
+            runner.run(seg)
+            report_move(seg)
+    except BaseException as exc:  # noqa: BLE001 - 包括 Ctrl+C：先停机械臂
+        error = f"{type(exc).__name__}: {exc}"
+        if ran:
+            fm.emergency_stop(ROBOT_IP)
+        print(f"\n中止：{error}")
+    finally:
+        rec.stop(write=ran)
+        if not ran and state_dir.is_dir() and not any(state_dir.iterdir()):
+            state_dir.rmdir()
     if not ran:
         return 1
 
@@ -669,9 +672,11 @@ def cmd_movec_test(args) -> int:
               "settings": {k: globals()[k] for k in (*CAL_KEYS, "SPEED_TEST_PCT")}, "speed_scale": args.scale,
               "movec": {"segments_done": n_c, "deg_s_per_pct": rate_c, "pivot_dev_max_mm": dev_c},
               "movel": {"segments_done": n_l, "deg_s_per_pct": rate_l, "pivot_dev_max_mm": dev_l},
-              "segments": [segment_log(s) for s in segs]}
-    p(MOVEC_TEST).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n已保存 {p(MOVEC_TEST)}")
+              "state_dir": str(state_dir), "segments": [segment_log(s) for s in segs]}
+    text = json.dumps(result, ensure_ascii=False, indent=2)
+    p(MOVEC_TEST).write_text(text, encoding="utf-8")
+    (state_dir / "movec_test.json").write_text(text, encoding="utf-8")
+    print(f"\n已保存 {p(MOVEC_TEST)}；原始状态在 {state_dir}/")
 
     def fmt(v, spec):
         return "—" if v is None else format(v, spec)

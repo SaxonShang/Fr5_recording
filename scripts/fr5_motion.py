@@ -5,7 +5,8 @@ flange = camera · (flange_T_camera)⁻¹。FR5 位姿 [x, y, z mm, rx, ry, rz �
 
 速度：MoveL / MoveC 用百分比速度模式（velAccParamMode=0）。物理速度模式（mm/s）被这台控制器拒绝（182/183）。
 百分比和实际速度的换算受 WebApp 速度百分比影响，由 run_session.py speed-test 实测（SpeedModel）。
-指令非阻塞下发，再由 20004 状态判断到位，这样运动中随时可以发 StopMotion；
+指令非阻塞下发，再由 20004 状态判断到位，这样运动中随时可以发 StopMotion。MoveC 在这台控制器上
+即使 blendR=0 也要走完才返回（10-12 movec-test 实测），所以放到后台线程里调用，主线程照常监视；
 运动中实时检查法兰线速度和角速度，超过预期就中止（标定失效或 WebApp 速度改过时的保护）。
 
 旋转：MoveL 让法兰走直线、姿态匀速插值，绕光心转时光心会在半路鼓出去（30° 约 4 mm）。
@@ -15,6 +16,7 @@ flange = camera · (flange_T_camera)⁻¹。FR5 位姿 [x, y, z mm, rx, ry, rz �
 from __future__ import annotations
 
 import math
+import threading
 import time
 import xmlrpc.client
 from dataclasses import dataclass, field
@@ -48,6 +50,7 @@ MAX_PIVOT_DEV_MM = 2.0       # MoveC 旋转时光心偏离旋转中心超过这�
 STALL_S = 5.0                # 没到位、又连续这么久没有移动，就中止
 STALL_MM, STALL_DEG = 0.05, 0.02
 STATE_LOST_S = 2.0           # 运动中超过这么久没有新的状态包（20004 断开），就中止
+CALL_RETURN_S = 3.0          # 阻塞式指令（MoveC）到位后最多再等这么久让调用返回
 FRESH_S = 0.1                # 发运动指令前，最新状态包必须是这么久之内到达的（正常每 10 ms 一包）
 ONSET_MM, ONSET_DEG = 0.1, 0.05   # 实测用时：从离开起点这么远开始算
 DAY_MS = 86_400_000
@@ -530,6 +533,35 @@ def ctrl_ms(pkg) -> int:
     return ((pkg.hour * 60 + pkg.minute) * 60 + pkg.second) * 1000 + pkg.millisecond
 
 
+class BlockingCall:
+    """在后台线程里执行会阻塞到运动结束的指令（MoveC），主线程照常监视状态。
+    中止时由调用方另开连接发 StopMotion，控制器停下后这个调用也会返回（线程是 daemon，不会拖住退出）。"""
+
+    def __init__(self, fn):
+        self.result, self.exc, self.returned_ns = None, None, None
+        self._thread = threading.Thread(target=self._run, args=(fn,), name="blocking-call", daemon=True)
+        self._thread.start()
+
+    def _run(self, fn):
+        try:
+            self.result = fn()
+        except BaseException as exc:  # noqa: BLE001 - 交给主线程处理
+            self.exc = exc
+        self.returned_ns = time.time_ns()
+
+    def done(self, timeout: float = 0.0) -> bool:
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def problem(self) -> str | None:
+        """已返回且出错时给出原因，否则 None。"""
+        if not self.done():
+            return None
+        if self.exc is not None:
+            return f"调用出错：{type(self.exc).__name__}: {self.exc}"
+        return None if self.result == 0 else f"返回错误码 {self.result}"
+
+
 class MotionRunner:
     """逐段执行：hold 只监视状态；move 发 MoveL / MoveC 后由状态判断到位，运动中做各项保护并记录实测。
     recorder 需提供 wait_state() 和 latest_monotonic（StateRecorder）。"""
@@ -588,15 +620,17 @@ class MotionRunner:
         start_pkg = self.fresh(seg.name)
         start_pos = np.array(start_pkg.flange_cur_pos[:3])
         samples = [(ctrl_ms(start_pkg), list(start_pkg.flange_cur_pos))]
+        call = None
         if seg.motion == "C":
             if seg.via_flange is None or seg.via_joints is None or seg.joints is None:
                 raise MotionAborted(f"{seg.name}: MoveC 缺中间点或关节角（没做 check_plan？）")
-            err = self.rpc.MoveC(desc_pos_p=seg.via_flange, tool_p=0, user_p=0,
-                                 desc_pos_t=seg.flange, tool_t=0, user_t=0,
-                                 joint_pos_p=seg.via_joints, joint_pos_t=seg.joints,
-                                 vel_p=seg.percent, vel_t=seg.percent, ovl=100.0, blendR=0.0,
-                                 oacc=self.accel_percent, velAccParamMode=0)
-            cmd = "MoveC"
+            rpc, percent, oacc = self.rpc, seg.percent, self.accel_percent
+            call = BlockingCall(lambda: rpc.MoveC(desc_pos_p=seg.via_flange, tool_p=0, user_p=0,
+                                                  desc_pos_t=seg.flange, tool_t=0, user_t=0,
+                                                  joint_pos_p=seg.via_joints, joint_pos_t=seg.joints,
+                                                  vel_p=percent, vel_t=percent, ovl=100.0, blendR=0.0,
+                                                  oacc=oacc, velAccParamMode=0))
+            cmd, err = "MoveC", 0
         else:
             err = self.rpc.MoveL(desc_pos=seg.flange, tool=0, user=0, joint_pos=seg.joints,
                                  vel=seg.percent, ovl=100.0, blendR=0.0, oacc=self.accel_percent,
@@ -608,7 +642,10 @@ class MotionRunner:
             raise MotionAborted(f"{seg.name}: {cmd} 返回错误码 {err}")
         # 超时只兜底；没到位又不动由 STALL_S 发现
         timeout = time.monotonic() + (2.0 * seg.duration_s + 60.0 if seg.speed_known else 300.0)
-        limit = (seg.expect_mm_s * OVERSPEED_FACTOR + OVERSPEED_MARGIN_MM_S) if seg.expect_mm_s else None
+        # 以转动为主的段（旋转、同步摆动）只查角速度：控制器起步时先平移约 1 mm、腕部随后才转
+        # （10-12 movec-test 实测，50 ms 内 8–13 mm/s，预计只有 3.5 mm/s），线速度会误报；标定失效时角速度一样超
+        limit = (seg.expect_mm_s * OVERSPEED_FACTOR + OVERSPEED_MARGIN_MM_S
+                 if seg.expect_mm_s and not seg.expect_deg_s else None)
         limit_rot = (seg.expect_deg_s * OVERSPEED_FACTOR + OVERSPEED_MARGIN_DEG_S) if seg.expect_deg_s else None
         moving_seen = False
         mark_pose, mark_time = fr5_to_matrix(samples[0][1]), time.monotonic()
@@ -622,6 +659,8 @@ class MotionRunner:
                     raise MotionAborted(f"{seg.name}: {problem}")
                 if self.state_age() > STATE_LOST_S:
                     raise MotionAborted(f"{seg.name}: 超过 {STATE_LOST_S:.0f} s 没收到机械臂状态（20004 断开？），已中止")
+                if call is not None and call.problem():
+                    raise MotionAborted(f"{seg.name}: {cmd} {call.problem()}")
                 pose6 = list(pkg.flange_cur_pos)
                 now_ms = ctrl_ms(pkg)
                 if (now_ms - samples[-1][0]) % DAY_MS != 0:
@@ -650,6 +689,12 @@ class MotionRunner:
                            and rotation_deg(current, target) < ARRIVE_ROT_DEG)
                 if arrived and pkg.robot_state == 1:
                     seg.log["arrived_box_ns"] = time.time_ns()
+                    if call is not None:
+                        if not call.done(CALL_RETURN_S):
+                            raise MotionAborted(f"{seg.name}: 到位 {CALL_RETURN_S:.0f} s 后 {cmd} 还没返回")
+                        seg.log[cmd.lower()]["returned_box_ns"] = call.returned_ns
+                        if call.problem():
+                            raise MotionAborted(f"{seg.name}: {cmd} {call.problem()}")
                     return
                 if (np.linalg.norm(current[:3, 3] - mark_pose[:3, 3]) * 1000.0 > STALL_MM
                         or rotation_deg(current, mark_pose) > STALL_DEG):
