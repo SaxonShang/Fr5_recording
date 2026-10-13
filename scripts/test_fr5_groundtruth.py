@@ -72,6 +72,31 @@ def sync_test_pose(t_s):
     return np.broadcast_to(P0, (len(t), 3)), R0 @ _rz(wiggle(5.0) + wiggle(21.0))
 
 
+PIVOT = P0 + R0 @ FLANGE_T_CAM[:3, 3]                          # 起点时左目光心（基坐标系）
+PITCH_AXIS = R0 @ FLANGE_T_CAM[:3, :3] @ np.array([1.0, 0.0, 0.0])   # 相机 x 轴（基坐标系）
+
+
+def _about(axis, deg):
+    """绕单位轴 axis 转 deg 度（可为数组）的旋转矩阵。"""
+    a = np.deg2rad(np.asarray(deg, dtype=float))[..., None, None]
+    kx = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+    return np.eye(3) + np.sin(a) * kx + (1 - np.cos(a)) * (kx @ kx)
+
+
+def pitch_turn_deg(t_s):
+    """旋转录制：单侧同步摆动 0→10°→0（3 次）→ 静止 → 转 30° → 静止 → 往回摆 30→20→30（3 次）→ 静止。"""
+    t = np.asarray(t_s, dtype=float)
+    swing = lambda a: np.where((t >= a) & (t <= a + 3), 10 * np.sin(np.pi * (t - a)) ** 2, 0.0)
+    u = np.clip((t - 20.0) / 6.0, 0.0, 1.0)
+    return swing(5.0) + 30 * (3 * u ** 2 - 2 * u ** 3) - swing(50.0)
+
+
+def pitch_pose(t_s):
+    """法兰绕左目光心、绕相机 x 轴转（光心不动）。"""
+    r = _about(PITCH_AXIS, pitch_turn_deg(t_s))
+    return PIVOT + (r @ (P0 - PIVOT)), r @ R0
+
+
 def rotvec(r):
     q = gt.matrix_to_quat(r)
     v = q[:, 1:]
@@ -271,6 +296,45 @@ class SyntheticSessionTest(unittest.TestCase):
             report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
             self.assertEqual(report["travel_scale"]["factor"], 1.0)
             self.assertEqual(report["travel_scale"]["source"], "none")
+            self.assertEqual(report["rotation_scale"]["source"], "none")              # 没有转轴
+
+    def test_rotation_scale_about_pivot(self):
+        """俯仰旋转录制：真值姿态相对起点、绕转轴的转角放大 k 倍，其他方向不变，光心不动。"""
+        def rotation_log(direction):
+            ry = -np.rad2deg(np.arcsin(R0[2, 0]))
+            rx, rz = np.rad2deg(np.arctan2(R0[2, 1], R0[2, 2])), np.rad2deg(np.arctan2(R0[1, 0], R0[0, 0]))
+            segs = [{"name": "goto_start", "flange": [*(P0 * 1000), rx, ry, rz]},
+                    {"name": "rotate", "arc_axis": PITCH_AXIS.tolist(), "pivot_m": PIVOT.tolist()}]
+            (d / "motion_log.json").write_text(json.dumps({"kind": "record", "direction": direction, "segments": segs}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0), pose=pitch_pose)
+            rotation_log("pitch_up")
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            self.assertEqual(report["warnings"], [])
+            k = gt.ROTATION_SCALE["pitch_up"]
+            self.assertEqual(report["rotation_scale"]["factor"], k)
+            self.assertEqual(report["travel_scale"]["factor"], 1.0)
+            fixed, raw = read_tum(d / "groundtruth_tum.txt"), read_tum(d / "groundtruth_tum_uncorrected.txt")
+            np.testing.assert_array_equal(fixed[:, 0], raw[:, 0])
+            q_fix, q_raw = fixed[:, [7, 4, 5, 6]], raw[:, [7, 4, 5, 6]]
+            r_start = R0 @ FLANGE_T_CAM[:3, :3]
+            # 未修正真值相对起点的转角 φ（绕转轴）；修正后应多转 (k-1)·φ，且只绕转轴
+            phi = np.rad2deg(gt.quat_to_rotvec(gt.quat_mul(q_raw, gt.quat_conj(gt.matrix_to_quat(r_start)))) @ PITCH_AXIS)
+            extra = np.rad2deg(gt.quat_to_rotvec(gt.quat_mul(q_fix, gt.quat_conj(q_raw))))
+            np.testing.assert_allclose(extra @ PITCH_AXIS, (k - 1) * phi, atol=1e-6)
+            np.testing.assert_allclose(np.linalg.norm(extra - np.outer(extra @ PITCH_AXIS, PITCH_AXIS), axis=1), 0.0, atol=1e-6)
+            self.assertGreater(phi.max(), 29.9)
+            self.assertAlmostEqual(np.linalg.norm(extra, axis=1).max(), (k - 1) * 30.0, delta=0.002)   # 转满 30° 时约 0.13°
+            np.testing.assert_allclose(fixed[:, 1:4], raw[:, 1:4], atol=2e-6)          # 光心不动
+            np.testing.assert_allclose(fixed[:, 1:4], np.broadcast_to(PIVOT, (len(fixed), 3)), atol=2e-6)
+
+            rotation_log("yaw_left")                                                    # 偏航不修正
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            self.assertEqual(report["rotation_scale"]["factor"], 1.0)
+            fixed = read_tum(d / "groundtruth_tum.txt")
+            np.testing.assert_array_equal(fixed, read_tum(d / "groundtruth_tum_uncorrected.txt"))
 
     def test_duplicate_timestamp_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,10 +13,12 @@ SESSION_DIR 里需要 fr5_state.csv（fr5_record.py）以及 zed_imu.csv、img_t
    做互相关。角速度大小与坐标系无关，不需要外参，但录制里要有足够快的转动（同步摆动）。
 3. 曝光中心：ZED 把在左目采集期间取到的 IMU 样本标成 image_sync_trigger=1。每帧取这些样本
    时间的中点，减去图像时间戳，整段平均得到“曝光中心 - 图像时间戳”（实测约 -3 ms）。
-4. 标定板验证得到的两项修正（见开头的 TIME_CORRECTION_MS、TRAVEL_SCALE）：
+4. 标定板验证得到的修正（见开头的 TIME_CORRECTION_MS、TRAVEL_SCALE、ROTATION_SCALE）：
    - 时间：Δt 对齐的是陀螺仪，真值仍比图像晚一个固定量，取真值的时刻再晚 TIME_CORRECTION_MS；
    - 行程：机械臂实际行程比报告的长，法兰平移沿本条录制的运动方向、相对路径起点放大（方向和
-     路径两端从 motion_log.json 读；不是平移录制就不缩放）。
+     路径两端从 motion_log.json 读；不是平移录制就不缩放）；
+   - 转角：俯仰旋转录制里机械臂实际转角比报告的大，法兰姿态相对本条起点、绕转轴的转角放大，
+     绕转动中心（左目光心）转（转轴和转动中心从 motion_log.json 读；不是旋转录制就不放大）。
 5. 相机真值 base_T_camera = base_T_flange(曝光中心 + 时间修正 - Δt) · flange_T_left_camera，
    平移线性插值，旋转 SLERP。输出里的时间戳仍是图像原来的时间戳，方便和 SLAM 结果对齐。
    时间戳重复的图（ZED 偶尔把同一帧抓两次）只保留第一张。
@@ -27,7 +29,7 @@ SESSION_DIR 里需要 fr5_state.csv（fr5_record.py）以及 zed_imu.csv、img_t
 
 输出（默认写在 SESSION_DIR）：
   groundtruth_tum.txt           每张图一行：timestamp tx ty tz qx qy qz qw（s, m），左目相机在基坐标系下
-  groundtruth_tum_uncorrected.txt  同上，但不加第 4 步的两项修正（对照用）
+  groundtruth_tum_uncorrected.txt  同上，但不加第 4 步的修正（对照用）
   groundtruth_arm_rate_tum.txt  每个机械臂状态包一行，格式同上（已加修正）
   groundtruth_images.csv        每张图的真值和标记
   groundtruth_report.json       时钟拟合、Δt、修正、质量检查和警告
@@ -61,6 +63,10 @@ TIME_CORRECTION_EXPOSURE_US = 10000  # 上面的值是在这个曝光下测的�
 # 机械臂实际行程 / 报告行程，按录制方向。只适用于 start_pose.json 起点 ±150 mm 的这 6 段平移
 TRAVEL_SCALE = {"right": 1.0070, "left": 1.0070, "up": 1.0070, "down": 1.0070,
                 "forward": 1.0015, "backward": 1.0015}
+# 机械臂实际转角 / 报告转角，按录制方向（2026-10-13 标定板验证：pitch_up 3 条 +0.39～+0.46%，平均 +0.43%；
+# pitch_down 2 条 +0.50、+0.54%，平均 +0.52%）。只适用于 start_pose.json 起点、俯仰 ±15° 的这两条旋转路径；
+# 偏航、横滚实测在 ±0.03% 以内，不修正
+ROTATION_SCALE = {"pitch_up": 1.0043, "pitch_down": 1.0052}
 
 ARM_COLUMNS = ["box_realtime_ns", "ctrl_unix_ms", "x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg",
                "robot_state", "main_code", "sub_code", "tool", "user"]
@@ -135,6 +141,20 @@ def quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def quat_conj(q: np.ndarray) -> np.ndarray:
     return q * np.array([1.0, -1.0, -1.0, -1.0])
+
+
+def quat_to_rotvec(q: np.ndarray) -> np.ndarray:
+    """四元数 -> 旋转向量（弧度，转角在 [0, π]）。"""
+    q = np.where(q[..., :1] < 0, -q, q)
+    n = np.linalg.norm(q[..., 1:], axis=-1, keepdims=True)
+    return np.where(n > 1e-15, q[..., 1:] / np.where(n > 1e-15, n, 1.0), 0.0) * 2.0 * np.arctan2(n, q[..., :1])
+
+
+def rotvec_to_quat(v: np.ndarray) -> np.ndarray:
+    """旋转向量（弧度） -> 四元数。"""
+    ang = np.linalg.norm(v, axis=-1, keepdims=True)
+    k = np.where(ang > 1e-15, np.sin(ang / 2) / np.where(ang > 1e-15, ang, 1.0), 0.5)
+    return np.concatenate([np.cos(ang / 2), k * v], axis=-1)
 
 
 def rotation_angle_between(q0: np.ndarray, q1: np.ndarray) -> np.ndarray:
@@ -412,6 +432,37 @@ def apply_travel_scale(pos: np.ndarray, scale: dict) -> np.ndarray:
     return pos + (scale["factor"] - 1.0) * ((pos - origin) @ axis)[:, None] * axis
 
 
+def rotation_scale(session: Path, factor: float | None = None) -> dict:
+    """本条录制的转角放大：方向、起点法兰位姿、转轴和转动中心（基坐标系）、系数。factor=None 时按 ROTATION_SCALE 取。"""
+    path = session / "motion_log.json"
+    log = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    segs = {s["name"]: s for s in log.get("segments", [])}
+    rot = segs.get("rotate", {})
+    if log.get("kind") != "record" or "goto_start" not in segs or not rot.get("arc_axis") or not rot.get("pivot_m"):
+        return {"factor": 1.0, "source": "none", "note": "不是旋转录制（或没有 motion_log.json），不放大转角"}
+    direction = log.get("direction")
+    axis = np.array(rot["arc_axis"], dtype=float)
+    return {"factor": float(ROTATION_SCALE.get(direction, 1.0) if factor is None else factor),
+            "source": "ROTATION_SCALE" if factor is None else "manual", "direction": direction,
+            "origin_flange": [float(v) for v in segs["goto_start"]["flange"]],
+            "axis_base": (axis / np.linalg.norm(axis)).tolist(), "pivot_m": [float(v) for v in rot["pivot_m"]]}
+
+
+def apply_rotation_scale(pos: np.ndarray, quat: np.ndarray, scale: dict) -> tuple[np.ndarray, np.ndarray]:
+    """法兰姿态相对本条起点、绕转轴的转角放大 factor 倍，绕转动中心（左目光心）转，光心不动；其他方向的转动不变。"""
+    if scale["factor"] == 1.0:
+        return pos, quat
+    o = scale["origin_flange"]
+    q0 = matrix_to_quat(euler_to_matrix(o[3], o[4], o[5]))
+    axis, pivot = np.array(scale["axis_base"]), np.array(scale["pivot_m"])
+    phi = quat_to_rotvec(quat_mul(quat, quat_conj(q0))) @ axis      # 基坐标系下相对起点、绕转轴的转角（弧度）
+    extra = rotvec_to_quat((scale["factor"] - 1.0) * phi[:, None] * axis)
+    q = quat_mul(extra, quat)
+    q = np.where(np.sum(q * quat, axis=1, keepdims=True) < 0, -q, q)  # 和原来同一半球，SLERP 仍走短路径
+    p = pivot + np.einsum("nij,nj->ni", quat_to_matrix(extra), pos - pivot)
+    return p, q
+
+
 def write_tum(path: Path, t_ms, pos, quat) -> None:
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("# timestamp tx ty tz qx qy qz qw  (Unix s, m; left camera in FR5 base frame)\n")
@@ -422,7 +473,8 @@ def write_tum(path: Path, t_ms, pos, quat) -> None:
 
 def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float = 300.0,
             dt_ms: float | None = None, exposure_offset_ms: float | None = None,
-            time_correction_ms: float | None = None, scale_factor: float | None = None) -> dict:
+            time_correction_ms: float | None = None, scale_factor: float | None = None,
+            rotation_factor: float | None = None) -> dict:
     warnings = []
     flange_t_cam, handeye = load_handeye(handeye_path)
     arm = load_arm(session / "fr5_state.csv")
@@ -523,16 +575,18 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
                             f"这条录制曝光 {float(exp_us) / 1000:.1f} ms，修正可能不准")
     scale = travel_scale(session, scale_factor)
     pos_c = apply_travel_scale(pos, scale)
+    rscale = rotation_scale(session, rotation_factor)
+    pos_c, quat_c = apply_rotation_scale(pos_c, quat, rscale)
 
     # 4. 真值（t_arm_cam 对齐陀螺仪，t_arm_img 再对齐到图像）
     output.mkdir(parents=True, exist_ok=True)
     t_arm_cam = t_arm + shift
     t_arm_img = t_arm_cam - time_correction_ms
-    cam_t, cam_q = camera_pose(pos_c, quat, flange_t_cam)
+    cam_t, cam_q = camera_pose(pos_c, quat_c, flange_t_cam)
     write_tum(output / "groundtruth_arm_rate_tum.txt", t_arm_img, cam_t, cam_q)
 
     t_query = t_img + exposure["applied_ms"]
-    p_f, q_f, inside, span, i0, i1 = interpolate(t_query, t_arm_img, pos_c, quat)
+    p_f, q_f, inside, span, i0, i1 = interpolate(t_query, t_arm_img, pos_c, quat_c)
     img_t, img_q = camera_pose(p_f, q_f, flange_t_cam)
     gap = inside & (span > MAX_GAP_MS)
     bad_robot = inside & (error_rows[i0] | error_rows[i1])
@@ -566,6 +620,7 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
         "exposure_centre": exposure,
         "time_correction": correction,
         "travel_scale": scale,
+        "rotation_scale": rscale,
         "images": {"total": int(len(t_img)), "with_groundtruth": int(good.sum()),
                    "duplicate_timestamp": int(duplicate.sum()),
                    "outside_arm_data": int((~inside).sum()), "in_arm_gap": int(gap.sum()),
@@ -576,7 +631,9 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
             " - time_correction.applied_ms。",
             "每张图的真值取在曝光中心 = 图像时间戳 + exposure_centre.applied_ms；输出时间戳仍是图像时间戳。",
             "法兰平移沿 travel_scale.axis_base、相对 travel_scale.origin_flange_m 放大 travel_scale.factor 倍"
-            "（机械臂实际行程比报告的长）。groundtruth_tum_uncorrected.txt 不加时间修正和行程放大。",
+            "（机械臂实际行程比报告的长）。",
+            "法兰姿态相对 rotation_scale.origin_flange、绕 rotation_scale.axis_base 的转角放大 rotation_scale.factor 倍，"
+            "绕 rotation_scale.pivot_m 转（机械臂实际转角比报告的大）。groundtruth_tum_uncorrected.txt 不加这三项修正。",
             "位姿：ZED 左目（校正后光学坐标系）在 FR5 基坐标系下，TUM 顺序 tx ty tz qx qy qz qw，单位 m。",
             "base_T_camera = base_T_flange · flange_T_left_camera；FR5 姿态 R = Rz(rz)·Ry(ry)·Rx(rx)。",
             "假设 ZED 图像与 IMU 在同一时钟上、image_sync_trigger 正确标出采集期间，且相机安装自手眼标定后没有变动。",
@@ -601,12 +658,14 @@ def main(argv=None) -> int:
                         help=f"真值比图像晚的固定量（ms），默认 TIME_CORRECTION_MS={TIME_CORRECTION_MS}；0 表示不修正")
     parser.add_argument("--scale-factor", type=float,
                         help="行程放大系数，默认按录制方向取 TRAVEL_SCALE；1 表示不缩放")
+    parser.add_argument("--rotation-scale-factor", type=float,
+                        help="转角放大系数，默认按录制方向取 ROTATION_SCALE；1 表示不放大")
     args = parser.parse_args(argv)
     session = args.session.expanduser()
     try:
         report = process(session, args.handeye.expanduser(), (args.output or session).expanduser(),
                          args.max_lag_ms, args.dt_ms, args.exposure_offset_ms,
-                         args.time_correction_ms, args.scale_factor)
+                         args.time_correction_ms, args.scale_factor, args.rotation_scale_factor)
     except (OSError, ValueError, KeyError) as exc:
         print(f"失败：{exc}", file=sys.stderr)
         return 1
@@ -619,9 +678,10 @@ def main(argv=None) -> int:
     exp = report["exposure_centre"]
     print(f"曝光中心 = 图像时间戳 {exp['applied_ms']:+.2f} ms（{exp['source']}"
           + (f"，{exp['frames']} 帧，标准差 {exp['sd_ms']:.2f} ms" if "frames" in exp else "") + "）")
-    tc, sc = report["time_correction"], report["travel_scale"]
+    tc, sc, rc = report["time_correction"], report["travel_scale"], report["rotation_scale"]
     print(f"修正：取真值的时刻再晚 {tc['applied_ms']:+.2f} ms（{tc['source']}）；"
-          + (f"行程 ×{sc['factor']:.4f}（{sc['direction']}，{sc['source']}）" if sc["factor"] != 1.0 else "行程不缩放"))
+          + (f"行程 ×{sc['factor']:.4f}（{sc['direction']}，{sc['source']}）" if sc["factor"] != 1.0 else "行程不缩放")
+          + (f"；转角 ×{rc['factor']:.4f}（{rc['direction']}，{rc['source']}）" if rc["factor"] != 1.0 else "；转角不放大"))
     dup = f"，重复时间戳 {imgs['duplicate_timestamp']} 张已去掉" if imgs["duplicate_timestamp"] else ""
     print(f"图像 {imgs['total']} 张，有真值 {imgs['with_groundtruth']} 张{dup}")
     for w in report["warnings"]:
