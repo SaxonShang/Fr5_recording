@@ -179,14 +179,24 @@ def load_arm(path: Path) -> dict:
     return arm
 
 
-def load_imu(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+def complete_lines(path: Path, warnings: list[str] | None = None) -> list[str]:
+    """文件的各行。zed_record 没有正常退出时最后一行可能只写了一半（没有换行），去掉它。"""
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    if len(lines) > 1 and not lines[-1].endswith("\n"):
+        lines.pop()
+        if warnings is not None:
+            warnings.append(f"{path.name} 最后一行没写完（zed_record 可能没有正常退出），已去掉")
+    return lines
+
+
+def load_imu(path: Path, warnings: list[str] | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """返回 IMU 时间（ms）、陀螺仪（°/s）、image_sync_trigger（没有这一列时为 None）。"""
-    with open(path, encoding="utf-8") as f:
-        header = f.readline().strip().split(",")
+    lines = complete_lines(path, warnings)
+    header = lines[0].strip().split(",")
     names = ["zed_imu_timestamp_ns", "gx", "gy", "gz"]
     has_trigger = "image_sync_trigger" in header
     cols = [header.index(c) for c in names + (["image_sync_trigger"] if has_trigger else [])]
-    data = np.loadtxt(path, delimiter=",", skiprows=1, usecols=cols, ndmin=2)
+    data = np.loadtxt(lines[1:], delimiter=",", usecols=cols, ndmin=2)
     t_ms = data[:, 0] / 1e6
     t_ms, first = np.unique(t_ms, return_index=True)
     return t_ms, data[first, 1:4], (data[first, 4] if has_trigger else None)
@@ -218,9 +228,8 @@ def read_time_meta(path: Path) -> dict:
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
 
 
-def load_images(path: Path) -> tuple[np.ndarray, list[str]]:
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = [r for r in csv.DictReader(f)]
+def load_images(path: Path, warnings: list[str] | None = None) -> tuple[np.ndarray, list[str]]:
+    rows = list(csv.DictReader(complete_lines(path, warnings)))
     return np.array([float(r["zed_timestamp_ms"]) for r in rows]), [r["filename_left"] for r in rows]
 
 
@@ -417,8 +426,8 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
     warnings = []
     flange_t_cam, handeye = load_handeye(handeye_path)
     arm = load_arm(session / "fr5_state.csv")
-    t_imu, gyro, trigger = load_imu(session / "zed_imu.csv")
-    t_img, names = load_images(session / "img_timeline.csv")
+    t_imu, gyro, trigger = load_imu(session / "zed_imu.csv", warnings)
+    t_img, names = load_images(session / "img_timeline.csv", warnings)
     duplicate = np.ones(len(t_img), dtype=bool)
     duplicate[np.unique(t_img, return_index=True)[1]] = False   # 同一时间戳只保留第一张
 

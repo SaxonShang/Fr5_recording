@@ -7,7 +7,8 @@
     python gt_board_check.py <save_data 目录>
 
 看三样东西：
-1. 不同静止位置之间的差（例如平移前、平移后）：真值的空间误差（手眼外参、机械臂精度、PnP 偏差）。
+1. 不同静止位姿之间的差（平移前后、旋转前后）：真值的空间误差（手眼外参、机械臂精度、PnP 偏差）。
+   旋转录制另外对照相机转了多少：机械臂真值给的转角和从标定板图像算出的转角（和平移录制的行程对照一样）。
 2. 运动帧和静止帧的离散程度：时间不同步会让运动帧变散。
 3. 时间扫描：把真值时间整体平移 δ，找让运动帧最一致的 δ。这是用图像独立检验 Δt 和曝光中心修正，应接近 0。
 
@@ -41,9 +42,12 @@ MAX_REPROJ_PX = 1.0           # PnP 重投影 RMS 超过它的帧不用
 SPEED_HALF_MS = 20.0          # 相机速度按 ±20 ms 差分
 STATIC_MM_S, STATIC_DEG_S = 1.0, 0.5      # 低于这两个值算静止帧
 MOVING_MM_S, MOVING_DEG_S = 5.0, 2.0      # 高于任一个算运动帧（之间的过渡帧两边都不算）
-GROUP_GAP_MS, GROUP_MOVE_MM = 1000.0, 5.0  # 静止帧分组：间隔超过 1 s 或相机移动超过 5 mm 就是新的一组
+GROUP_GAP_MS, GROUP_MOVE_MM, GROUP_TURN_DEG = 1000.0, 5.0, 1.0   # 静止帧分组：间隔超过 1 s、相机移动超过 5 mm
+                                                                 # 或转动超过 1° 就是新的一组
 MIN_MOVING_FRAMES = 20        # 摆动帧少于这么多就不做时间扫描
-NEAR_GROUP_MM = 20.0          # 相机离某个静止位置不到 20 mm 的运动帧算“在这个位置摆动”（摆动时光心偏离约 2 mm）
+NEAR_GROUP_MM, NEAR_GROUP_DEG = 20.0, 12.0   # 离某个静止位姿不到 20 mm、转动不到 12° 的运动帧算“在这个位姿摆动”
+                                             # （摆动 10°，光心偏离约 2 mm）
+SCAN_SKIP_SEGMENTS = ("translate", "rotate")   # 有 motion_log.json 时这两段的帧不进时间扫描（见 check）
 
 
 def load_camera(path: Path) -> np.ndarray:
@@ -117,12 +121,38 @@ def mean_rotation(rs: np.ndarray) -> np.ndarray:
     return gt.quat_to_matrix(m / np.linalg.norm(m))
 
 
-def static_groups(t_ms, cam_t, is_static) -> list[np.ndarray]:
-    """按时间顺序把静止帧分组（同一个静止位置的为一组），返回每组的帧下标。"""
+def angle_deg(ra: np.ndarray, rb: np.ndarray) -> np.ndarray:
+    """两个（组）旋转矩阵之间的转角（°），可广播。"""
+    return np.degrees(gt.rotation_angle_between(gt.matrix_to_quat(ra), gt.matrix_to_quat(rb)))
+
+
+def rotvec_deg(r: np.ndarray) -> np.ndarray:
+    """旋转矩阵的旋转向量（°），小角度也准（四元数 atan2）。"""
+    q = gt.matrix_to_quat(r)
+    q = -q if q[0] < 0 else q
+    s = np.linalg.norm(q[1:])
+    return np.zeros(3) if s < 1e-15 else q[1:] / s * np.degrees(2.0 * math.atan2(s, q[0]))
+
+
+def segment_names(save_data: Path, t_ms: np.ndarray) -> np.ndarray | None:
+    """有 motion_log.json 时返回每帧所在的运动段名（静止段和段与段之间为空串）；没有时返回 None。"""
+    path = save_data / "motion_log.json"
+    if not path.exists():
+        return None
+    names = np.full(len(t_ms), "", dtype=object)
+    for s in json.loads(path.read_text(encoding="utf-8")).get("segments", []):
+        if s.get("kind") == "move" and s.get("start_box_ns") and s.get("end_box_ns"):
+            names[(t_ms >= s["start_box_ns"] / 1e6) & (t_ms <= s["end_box_ns"] / 1e6)] = s["name"]
+    return names
+
+
+def static_groups(t_ms, cam_t, cam_r, is_static) -> list[np.ndarray]:
+    """按时间顺序把静止帧分组（同一个静止位姿的为一组），返回每组的帧下标。"""
     groups, current = [], []
     for i in np.nonzero(is_static)[0]:
         if current and (t_ms[i] - t_ms[current[-1]] > GROUP_GAP_MS
-                        or np.linalg.norm(cam_t[i] - cam_t[current[0]]) * 1000.0 > GROUP_MOVE_MM):
+                        or np.linalg.norm(cam_t[i] - cam_t[current[0]]) * 1000.0 > GROUP_MOVE_MM
+                        or angle_deg(cam_r[i], cam_r[current[0]]) > GROUP_TURN_DEG):
             groups.append(np.array(current))
             current = []
         current.append(i)
@@ -214,44 +244,67 @@ def check(save_data: Path, calib_repo: Path, camera_yaml: Path, target_yaml: Pat
     ref_r = mean_rotation(board_r[ref_set])
     rot_dev = np.degrees(gt.rotation_angle_between(gt.matrix_to_quat(board_r), gt.matrix_to_quat(ref_r)[None]))
 
-    groups, group_frames = [], [g for g in static_groups(t_ms[used], cam_t[used], is_static) if len(g) >= 3]
+    groups, group_frames = [], [g for g in static_groups(t_ms[used], cam_t[used], cam_r[used], is_static) if len(g) >= 3]
     for g in group_frames:
         groups.append({"frames": int(len(g)), "t_start_ms": float(t_ms[used][g[0]]),
                        "camera_mm": (cam_t[used][g].mean(axis=0) * 1000.0).round(3).tolist(),
                        "board_centre_mm": centres[g].mean(axis=0).round(4).tolist(),
                        "spread_rms_mm": float(np.sqrt(np.mean(np.sum((centres[g] - centres[g].mean(axis=0)) ** 2, 1)))),
-                       "rotation": mean_rotation(board_r[g])})
-    # 两两比较：差值也分解到第一组的相机系（x 右、y 下、z 前），便于和运动方向对照
-    first_r = cam_r[used][group_frames[0][0]] if groups else None
+                       "rotation": mean_rotation(board_r[g]),                       # 标定板在基坐标系的姿态
+                       "camera_r": mean_rotation(cam_r[used][g]),                   # 真值：相机在基坐标系的姿态
+                       "board_in_camera_r": mean_rotation(np.array([frames[used[i]]["r_board"] for i in g]))})
+    for g in groups:
+        g["camera_turn_from_first_deg"] = float(angle_deg(g["camera_r"], groups[0]["camera_r"]))
+    # 两两比较：差值也分解到第一组的相机系（x 右、y 下、z 前），便于和运动方向对照。
+    # 相机转动：真值 = 两组相机姿态之差；图像 = 两组里标定板相对相机的姿态之差（标定板不动，和机械臂无关）。
+    # 两者之差（残差转动）就是标定板在基坐标系下的姿态差，转角之比对应平移录制的行程放大。
+    first_r = groups[0]["camera_r"] if groups else None
     pairs = []
     for a in range(len(groups)):
         for b in range(a + 1, len(groups)):
             ga, gb = groups[a], groups[b]
             moved = np.subtract(gb["camera_mm"], ga["camera_mm"])
             diff = np.subtract(gb["board_centre_mm"], ga["board_centre_mm"])
+            turn_gt = ga["camera_r"].T @ gb["camera_r"]                          # 相机 a ← 相机 b（真值）
+            turn_img = ga["board_in_camera_r"] @ gb["board_in_camera_r"].T       # 相机 a ← 相机 b（图像）
+            gt_deg, img_deg = float(angle_deg(turn_gt, np.eye(3))), float(angle_deg(turn_img, np.eye(3)))
             pairs.append({"groups": [a, b],
                           "camera_moved_mm": float(np.linalg.norm(moved)),
                           "camera_moved_cam_xyz_mm": (first_r.T @ moved).round(2).tolist(),
+                          "camera_turned_deg": gt_deg,
+                          "camera_turn_axis_cam": (rotvec_deg(turn_gt) / gt_deg).round(4).tolist() if gt_deg > 1e-6 else None,
+                          "image_turned_deg": img_deg,
+                          "turn_scale": img_deg / gt_deg - 1.0 if gt_deg >= GROUP_TURN_DEG else None,
+                          "turn_residual_cam_xyz_deg": rotvec_deg(turn_img @ turn_gt.T).round(4).tolist(),   # 相机 a 系
                           "board_diff_mm": float(np.linalg.norm(diff)),
                           "board_diff_cam_xyz_mm": (first_r.T @ diff).round(3).tolist(),
-                          "board_diff_deg": float(np.degrees(gt.rotation_angle_between(
-                              gt.matrix_to_quat(ga["rotation"]), gt.matrix_to_quat(gb["rotation"]))))})
+                          "board_diff_deg": float(angle_deg(ga["rotation"], gb["rotation"]))})
     for g in groups:
-        del g["rotation"]
+        for key in ("rotation", "camera_r", "board_in_camera_r"):
+            del g[key]
 
-    # 时间扫描只用“在某个静止位置附近转动”的帧（同步摆动），参考点取同一位置静止组的标定板中心。
-    # 平移中的帧不用：它们带着随位置变化的空间误差，会把时间估计带偏。
+    # 时间扫描只用“在某个静止位姿附近转动”的帧（同步摆动），参考点取最近那个静止组的标定板中心。
+    # 平移、旋转段的帧不用（有 motion_log.json 时按段名去掉；没有时只按离静止位姿的远近）：
+    # 它们带着随位姿变化的空间误差，而且和速度同号，会把时间估计带偏。
+    segs = segment_names(save_data, t_ms[used])
     scan, scans_by_group = None, []
     if groups:
         group_cam = np.array([g["camera_mm"] for g in groups])
+        group_r = np.array([mean_rotation(cam_r[used][g]) for g in group_frames])
         moving_idx = np.nonzero(is_moving)[0]
+        if segs is not None:
+            moving_idx = moving_idx[~np.isin(segs[moving_idx], SCAN_SKIP_SEGMENTS)]
         dist = np.linalg.norm(cam_t[used][moving_idx][:, None, :] * 1000.0 - group_cam[None], axis=2)
-        near = dist.min(axis=1) < NEAR_GROUP_MM
-        sel, owner = moving_idx[near], dist[near].argmin(axis=1)
+        turn = angle_deg(cam_r[used][moving_idx][:, None], group_r[None])
+        score = np.where((dist < NEAR_GROUP_MM) & (turn < NEAR_GROUP_DEG), dist / NEAR_GROUP_MM + turn / NEAR_GROUP_DEG,
+                         np.inf)
+        near = np.isfinite(score.min(axis=1)) if len(moving_idx) else np.zeros(0, bool)
+        sel, owner = moving_idx[near], score[near].argmin(axis=1)
         refs = np.array([groups[j]["board_centre_mm"] for j in owner]).reshape(-1, 3)
         if len(sel) >= MIN_MOVING_FRAMES:
             scan = time_scan(t_ms[used][sel], offset_ms, p_cam[sel], refs, arm, scan_ms, scan_step_ms)
             scan["frames"] = int(len(sel))
+            scan["frame_selection"] = "motion_log" if segs is not None else "distance"
             for j in np.unique(owner):
                 m = owner == j
                 if m.sum() >= MIN_MOVING_FRAMES // 2:
@@ -285,8 +338,9 @@ def check(save_data: Path, calib_repo: Path, camera_yaml: Path, target_yaml: Pat
         w = csv.writer(f)
         w.writerow(["zed_timestamp_ms", "filename_left", "state", "tags", "reproj_px", "used",
                     "cam_speed_mm_s", "cam_rate_deg_s", "board_x_mm", "board_y_mm", "board_z_mm",
-                    "dev_mm", "dev_deg"])
+                    "dev_mm", "dev_deg", "segment"])
         dev = dict(zip(used.tolist(), zip(centres, np.linalg.norm(centres - ref_mm, axis=1), rot_dev)))
+        seg_all = segment_names(save_data, t_ms)
         for fr in frames:
             i = fr["i"]
             c, d, dd = dev.get(i, (None, None, None))
@@ -294,7 +348,8 @@ def check(save_data: Path, calib_repo: Path, camera_yaml: Path, target_yaml: Pat
                         "" if fr["reproj_px"] is None else f"{fr['reproj_px']:.3f}", int(fr["used"]),
                         f"{lin[i]:.2f}", f"{ang[i]:.3f}",
                         *(["", "", ""] if c is None else [f"{v:.3f}" for v in c]),
-                        "" if d is None else f"{d:.3f}", "" if dd is None else f"{dd:.4f}"])
+                        "" if d is None else f"{d:.3f}", "" if dd is None else f"{dd:.4f}",
+                        "" if seg_all is None else seg_all[i]])
     return result
 
 
@@ -313,18 +368,26 @@ def summary(r: dict) -> str:
     lines.append("标定板姿态偏差 RMS：静止 " + ("-" if rot["static_rms"] is None else f"{rot['static_rms']:.3f}°")
                  + "，运动 " + ("-" if rot["moving_rms"] is None else f"{rot['moving_rms']:.3f}°"))
     for g in r["static_groups"]:
-        lines.append(f"  静止组：{g['frames']} 帧，相机 {g['camera_mm']} mm，组内离散 {g['spread_rms_mm']:.2f} mm")
+        lines.append(f"  静止组：{g['frames']} 帧，相机 {g['camera_mm']} mm"
+                     + (f"、相对第一组转了 {g['camera_turn_from_first_deg']:.2f}°" if g["camera_turn_from_first_deg"] >= GROUP_TURN_DEG
+                        else "") + f"，组内离散 {g['spread_rms_mm']:.2f} mm")
     for pr in r["static_group_pairs"]:
-        if pr["camera_moved_mm"] < GROUP_MOVE_MM:
-            lines.append(f"  静止组 {pr['groups'][0]}↔{pr['groups'][1]}（同一位置）：标定板位置差 {pr['board_diff_mm']:.2f} mm、"
+        a, b = pr["groups"]
+        if pr["camera_turned_deg"] >= GROUP_TURN_DEG:
+            lines.append(f"  静止组 {a}↔{b}：相机转动 {pr['camera_turned_deg']:.3f}°（转轴 {pr['camera_turn_axis_cam']}，组 {a} 相机系），"
+                         f"图像看到 {pr['image_turned_deg']:.3f}°，差 {pr['turn_scale']:+.2%}；残差转动 "
+                         f"{pr['turn_residual_cam_xyz_deg']}°；相机移动 {pr['camera_moved_mm']:.2f} mm；"
+                         f"标定板位置差 {pr['board_diff_mm']:.2f} mm = {pr['board_diff_cam_xyz_mm']}")
+        elif pr["camera_moved_mm"] < GROUP_MOVE_MM:
+            lines.append(f"  静止组 {a}↔{b}（同一位姿）：标定板位置差 {pr['board_diff_mm']:.2f} mm、"
                          f"姿态差 {pr['board_diff_deg']:.3f}°")
         else:
-            lines.append(f"  静止组 {pr['groups'][0]}↔{pr['groups'][1]}：相机移动 {pr['camera_moved_cam_xyz_mm']} mm（起点相机系），"
+            lines.append(f"  静止组 {a}↔{b}：相机移动 {pr['camera_moved_cam_xyz_mm']} mm（起点相机系），"
                          f"标定板位置差 {pr['board_diff_mm']:.2f} mm = {pr['board_diff_cam_xyz_mm']}，"
                          f"姿态差 {pr['board_diff_deg']:.3f}°")
     s = r["time_scan"]
     if s:
-        lines.append(f"时间扫描（{s['frames']} 个摆动帧，对照同位置静止组）：真值时间再加 {s['best_delta_ms']:+.2f} ms 时最一致"
+        lines.append(f"时间扫描（{s['frames']} 个摆动帧，对照最近的静止位姿）：真值时间再加 {s['best_delta_ms']:+.2f} ms 时最一致"
                      f"（RMS {s['rms_at_0_mm']:.2f} → {s['rms_at_best_mm']:.2f} mm）"
                      + ("；落在扫描边缘，结果不可信" if s["at_edge"] else ""))
         for g in r["time_scan_by_group"]:

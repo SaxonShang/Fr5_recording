@@ -4,10 +4,14 @@
 """
 
 import dataclasses
+import json
+import signal
+import tempfile
 import threading
 import time
 import types
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -155,39 +159,61 @@ class PlanTest(unittest.TestCase):
 
     def test_each_rotation_pivots_about_centre(self):
         c = self.centre
-        sign_check = {"yaw_left": lambda z: z @ c[:3, 0] < 0, "yaw_right": lambda z: z @ c[:3, 0] > 0,   # 光轴转向左 / 右
-                      "pitch_up": lambda z: z[2] > 0, "pitch_down": lambda z: z[2] < 0}                # 光轴抬起 / 低下
+        sign_check = {"yaw_left": lambda r: r[:, 2] @ c[:3, 0] < 0, "yaw_right": lambda r: r[:, 2] @ c[:3, 0] > 0,
+                      "pitch_up": lambda r: r[2, 2] > 0, "pitch_down": lambda r: r[2, 2] < 0,      # 光轴抬起 / 低下
+                      "roll_right": lambda r: r[2, 0] < 0, "roll_left": lambda r: r[2, 0] > 0}     # 相机 x 轴右端向下 / 向上
         self.assertEqual(set(sign_check), set(fm.ROTATIONS))
+        expect_axis = {"up": np.array([0, 0, 1.0]), "x": c[:3, 0], "z": c[:3, 2]}
+        expect_deg = {"up": CFG.yaw_deg, "x": CFG.pitch_deg, "z": CFG.roll_deg}
         for name, check in sign_check.items():
             segs = fm.plan_recording(name, c, F_T_C, CFG)
             by = {s.name: s for s in segs}
             self.assertNotIn("translate", by)
             start, rot = by["goto_start"].camera, by["rotate"]
+            deg = fm.rotation_angle(name, CFG)
+            self.assertEqual(deg, expect_deg[fm.ROTATIONS[name][0]])
             self.assertFalse(by["goto_start"].recorded)
             for cam in (start, rot.camera):
                 np.testing.assert_allclose(cam[:3, 3], c[:3, 3], atol=1e-12)        # 光心不动
-                self.assertAlmostEqual(fm.rotation_deg(cam, c), CFG.rot_deg / 2, places=9)
-            self.assertAlmostEqual(fm.rotation_deg(start, rot.camera), CFG.rot_deg, places=9)
-            self.assertTrue(check(rot.camera[:3, 2]), name)
-            self.assertEqual((rot.motion, rot.arc_deg, rot.rate_deg_s), ("C", CFG.rot_deg, CFG.rot_deg_s))
+                self.assertAlmostEqual(fm.rotation_deg(cam, c), deg / 2, places=9)
+            self.assertAlmostEqual(fm.rotation_deg(start, rot.camera), deg, places=9)
+            self.assertTrue(check(rot.camera[:3, :3]), name)
+            self.assertEqual((rot.motion, rot.arc_deg, rot.rate_deg_s), ("C", deg, CFG.rot_deg_s))
             np.testing.assert_allclose(rot.pivot, c[:3, 3], atol=1e-12)
             # 中间点就是起点姿态（转了一半）
             np.testing.assert_allclose(fm.fr5_to_matrix(rot.via_flange), c @ np.linalg.inv(F_T_C), atol=1e-9)
-            # 俯仰时轴是水平的 x 轴，偏航时是竖直轴
+            # 偏航绕竖直轴，俯仰绕中心姿态的 x 轴，横滚绕中心姿态的光轴
             axis = fm.rotation_axis(name, c)
-            self.assertAlmostEqual(abs(axis @ ([0, 0, 1.0] if name.startswith("yaw") else c[:3, 0])), 1.0, places=12)
-            # 同步摆动绕各自起点的相机竖直轴，结束时回到原姿态，光心不动
-            wig = [s for s in segs if s.name.startswith("wiggle_start")]
-            self.assertEqual(len(wig), 2 * CFG.wiggle_cycles + 1)
-            for s in wig:
-                np.testing.assert_allclose(s.camera[:3, 3], c[:3, 3], atol=1e-12)
-                d = s.camera[:3, :3] @ start[:3, :3].T                              # 相对起点的转动
-                if fm.rotation_deg(s.camera, start) > 1e-6:
-                    w, v = np.linalg.eig(d)
-                    ax = np.real(v[:, np.argmin(np.abs(w - 1))])
-                    self.assertAlmostEqual(abs(ax @ fm.camera_up(start)), 1.0, places=9)
-            self.assertLess(fm.rotation_deg(wig[-1].camera, start), 1e-9)
-            self.assertLess(fm.rotation_deg(by["wiggle_end_5"].camera, rot.camera), 1e-9)
+            self.assertAlmostEqual(abs(axis @ expect_axis[fm.ROTATIONS[name][0]]), 1.0, places=12)
+            # 同步摆动绕同一根转轴、单侧摆，结束时回到原姿态，光心不动
+            for prefix, home in (("wiggle_start", start), ("wiggle_end", rot.camera)):
+                wig = [s for s in segs if s.name.startswith(prefix)]
+                self.assertEqual(len(wig), 2 * CFG.wiggle_cycles)
+                for s in wig:
+                    np.testing.assert_allclose(s.camera[:3, 3], c[:3, 3], atol=1e-12)
+                    if fm.rotation_deg(s.camera, home) > 1e-6:
+                        w, v = np.linalg.eig(s.camera[:3, :3] @ home[:3, :3].T)      # 相对起点的转动
+                        ax = np.real(v[:, np.argmin(np.abs(w - 1))])
+                        self.assertAlmostEqual(abs(ax @ axis), 1.0, places=9)
+                self.assertLess(fm.rotation_deg(wig[-1].camera, home), 1e-9)
+
+    def test_inward_wiggle_keeps_rotation_range(self):
+        """同步摆动往旋转范围内侧摆：全程姿态范围就是旋转本身的范围；摆动幅度大于总转角时从另一头多出来。"""
+        c = self.centre
+        cfg = dataclasses.replace(CFG, yaw_deg=20.0, pitch_deg=20.0, roll_deg=20.0,
+                                  yaw_heading_deg=5.0, pitch_heading_deg=-8.0, roll_heading_deg=-2.0)
+        expect = {"yaw_left": ("heading", (-5.0, 15.0)), "yaw_right": ("heading", (-5.0, 15.0)),
+                  "pitch_up": ("pitch", (-10.0, 10.0)), "pitch_down": ("pitch", (-10.0, 10.0)),
+                  "roll_left": ("roll", (-10.0, 10.0)), "roll_right": ("roll", (-10.0, 10.0))}
+        heading = {"heading": None, "pitch": -8.0, "roll": -2.0}
+        for name, (key, (lo, hi)) in expect.items():
+            span = fm.pose_span(fm.plan_recording(name, c, F_T_C, cfg), c, F_T_C)
+            np.testing.assert_allclose(span[key], (lo, hi), atol=1e-6, err_msg=name)
+            for other in {"heading", "pitch", "roll"} - {key}:
+                h = heading[key] if other == "heading" else 0.0
+                np.testing.assert_allclose(span[other], (h, h), atol=1e-6, err_msg=f"{name} {other}")
+        span = fm.pose_span(fm.plan_recording("yaw_left", c, F_T_C, dataclasses.replace(cfg, yaw_deg=6.0)), c, F_T_C)
+        np.testing.assert_allclose(span["heading"], (-2.0, 12.0), atol=1e-6)
 
     def test_pitch_heading(self):
         """俯仰的中心姿态是起点绕竖直轴转 pitch_heading_deg（仍水平、光心不动），转轴是它的 x 轴；偏航不受影响。"""
@@ -216,7 +242,7 @@ class PlanTest(unittest.TestCase):
 
     def test_rotation_speed_and_arc_length(self):
         flange0 = self.centre @ np.linalg.inv(F_T_C)
-        segs = fm.plan_recording("pitch_up", self.centre, F_T_C, CFG)
+        segs = fm.plan_recording("pitch_up", self.centre, F_T_C, dataclasses.replace(CFG, pitch_deg=30.0))
         fm.fill_geometry(segs, flange0)
         self.assertEqual(fm.apply_speed(segs, MODEL, 1.0), [])
         rot = next(s for s in segs if s.name == "rotate")
@@ -225,17 +251,18 @@ class PlanTest(unittest.TestCase):
         self.assertAlmostEqual(rot.expect_deg_s, 5.0)
         self.assertAlmostEqual(rot.duration_s, 30.0 / 5.0 + 0.3)
         # 弧长 = 沿圆弧采样的折线长度
-        prev = fm.fr5_to_matrix(next(s for s in segs if s.name == "wiggle_start_5").flange)
+        prev = fm.fr5_to_matrix([s for s in segs if s.name.startswith("wiggle_start")][-1].flange)
         target = fm.fr5_to_matrix(rot.flange)
         pts = np.array([fm.path_flange(rot, prev, target, u, F_T_C)[:3, 3] for u in np.linspace(0, 1, 2001)])
         self.assertAlmostEqual(rot.distance_mm, np.linalg.norm(np.diff(pts, axis=0), axis=1).sum() * 1000, places=3)
         self.assertGreater(rot.distance_mm, 50.0)                  # 法兰离光心约 0.12 m，转 30° 走约 65 mm
 
     def test_arc_path_keeps_centre(self):
-        segs = fm.plan_recording("yaw_right", self.centre, F_T_C, CFG)
+        segs = fm.plan_recording("yaw_right", self.centre, F_T_C, dataclasses.replace(CFG, yaw_deg=30.0))
         by = {s.name: s for s in segs}
         rot = by["rotate"]
-        prev, target = fm.fr5_to_matrix(by["wiggle_start_5"].flange), fm.fr5_to_matrix(rot.flange)
+        prev = fm.fr5_to_matrix([s for s in segs if s.name.startswith("wiggle_start")][-1].flange)
+        target = fm.fr5_to_matrix(rot.flange)
         for u in np.linspace(0, 1, 31):
             cam = fm.path_flange(rot, prev, target, u, F_T_C) @ F_T_C
             np.testing.assert_allclose(cam[:3, 3], self.centre[:3, 3], atol=1e-12)
@@ -266,6 +293,30 @@ class PlanTest(unittest.TestCase):
         rot_only = [s for s in segs if s.name == "rotate"]
         problems = fm.check_plan(FakeIK(), rot_only, flange0, [0.0] * 6, F_T_C, *wide, 100.0, 0.0)
         self.assertTrue(any("MoveC 的起点" in m for m in problems), problems)
+
+    def test_check_plan_returns_from_outside_range(self):
+        """当前就在范围外：移到起点可以往回走（越界只减不增），终点和录制段必须在范围内。"""
+        class FakeIK:
+            def GetInverseKinRef(self, typ, pose, ref):             # 关节 = 位姿 / 10
+                return 0, [v / 10.0 for v in pose]
+        centre = self.centre
+        away = centre.copy()
+        away[:3, 3] += [0.1, 0.0, 0.0]                              # 法兰在 x 方向多 100 mm → J1 多 10
+        x_c = fm.matrix_to_fr5(centre @ np.linalg.inv(F_T_C))[0]
+        lo, hi = [-1e4] * 6, [1e4] * 6
+        hi[0] = x_c / 10.0 + 1.0                                    # 起点在范围内，away 处 J1 超出约 9°
+
+        def run(start_cam, target_cam, recorded):
+            seg = fm._move("goto_start", target_cam, F_T_C, 50.0, recorded=recorded)
+            flange0 = start_cam @ np.linalg.inv(F_T_C)
+            return fm.check_plan(FakeIK(), [seg], flange0, [v / 10.0 for v in fm.matrix_to_fr5(flange0)],
+                                 F_T_C, lo, hi, 100.0, 0.0)
+        self.assertEqual(run(away, centre, recorded=False), [])                 # 往回走：放行
+        self.assertTrue(run(centre, away, recorded=False))                      # 往外走：拒绝
+        self.assertTrue(run(away, centre, recorded=True))                       # 录制段：严格
+        far = centre.copy()
+        far[:3, 3] += [0.05, 0.0, 0.0]                                          # 终点仍在范围外
+        self.assertTrue(any("100%" in m for m in run(away, far, recorded=False)))
 
     def test_movec_test_plan(self):
         segs = fm.plan_movec_test(self.centre, F_T_C, CFG, 5.0)
@@ -519,10 +570,11 @@ class RunnerTest(unittest.TestCase):
                 fm.MotionRunner(arm, arm, accel_percent=100).run(seg)
         self.assertEqual(arm.calls, [])
 
-    def _rotation(self, name="yaw_left"):
-        """规划好的旋转段（从起点姿态开始），关节角用假的（假机械臂不看关节）。"""
+    def _rotation(self, name="yaw_left", deg=None):
+        """规划好的旋转段（从起点姿态开始），关节角用假的（假机械臂不看关节）。deg：改转角（偏航、俯仰都用它）。"""
         centre = fm.level_camera(NOW)
-        segs = fm.plan_recording(name, centre, F_T_C, CFG)
+        cfg = CFG if deg is None else dataclasses.replace(CFG, yaw_deg=deg, pitch_deg=deg)
+        segs = fm.plan_recording(name, centre, F_T_C, cfg)
         by = {s.name: s for s in segs}
         start6 = by["goto_start"].flange
         rot = by["rotate"]
@@ -549,7 +601,7 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("arrived_box_ns", rot.log)
 
     def test_movec_off_pivot_aborts(self):
-        start6, rot = self._rotation("pitch_down")
+        start6, rot = self._rotation("pitch_down", deg=30.0)     # 当成直线走时光心鼓出约 4 mm
         arm = _FakeArm(start6, mm_s_per_pct=1.0, deg_s_per_pct=0.5, movec_as_line=True)   # 控制器把它当直线走
         with self.assertRaisesRegex(fm.MotionAborted, "光心偏离"):
             fm.MotionRunner(arm, arm, accel_percent=100).run(rot)
@@ -570,7 +622,7 @@ class RunnerTest(unittest.TestCase):
         self.assertIsNotNone(rot.log["movec"]["returned_box_ns"])
 
     def test_blocking_movec_off_pivot_aborts(self):
-        start6, rot = self._rotation("pitch_down")
+        start6, rot = self._rotation("pitch_down", deg=30.0)
         arm = _FakeArm(start6, mm_s_per_pct=1.0, deg_s_per_pct=0.5, movec_as_line=True, movec_blocks=True)
         try:
             with self.assertRaisesRegex(fm.MotionAborted, "光心偏离"):
@@ -651,13 +703,145 @@ class ParametersTest(unittest.TestCase):
         for j, (lo, hi) in traversed.items():
             self.assertLessEqual(rs.JOINT_MIN_DEG[j - 1], lo)
             self.assertGreaterEqual(rs.JOINT_MAX_DEG[j - 1], hi)
-        self.assertLessEqual(max(abs(rs.JOINT_MIN_DEG[5]), abs(rs.JOINT_MAX_DEG[5])), 5.0)   # J6 基本不让动
-        # 超出录制实测的部分不超出标定走过的安全范围（标定仓库 README 6.4：J4 −154～−77、J5 −119～−56）
+        # J6 比用户 10-13 目测确认的起点 ±60° 至少保守 10°（起点 J6 ≈ 0）
+        self.assertLessEqual(max(abs(rs.JOINT_MIN_DEG[5]), abs(rs.JOINT_MAX_DEG[5])), 50.0)
+        # J4、J5 超出录制实测的部分不超出标定走过的安全范围（标定仓库 README 6.4：J4 −154～−77、J5 −119～−56）
         self.assertGreaterEqual(rs.JOINT_MIN_DEG[3], -154.0)
         self.assertLessEqual(rs.JOINT_MAX_DEG[3], -77.0)
         self.assertGreaterEqual(rs.JOINT_MIN_DEG[4], -119.0)
-        self.assertIn("pitch_up", rs.RECORD_NAMES)
-        self.assertNotIn("roll", " ".join(rs.RECORD_NAMES))
+        for name in ("pitch_up", "roll_left", "roll_right"):
+            self.assertIn(name, rs.RECORD_NAMES)
+
+    def test_glass_clearance_defaults(self):
+        """真实起点和手眼外参下，默认参数的 6 条旋转录制画面离玻璃窗都 ≥ GLASS_MARGIN_DEG；
+        10-13 演练过的偏航 30°（中心 +8°）会拍到左窗，被拒绝。"""
+        try:
+            import run_session as rs
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        import fr5_groundtruth as gt
+        here = Path(__file__).resolve().parent
+        f_t_c, _ = gt.load_handeye(here / "handeye_s003_result.json")
+        start = np.array(json.loads((here / "start_pose.json").read_text(encoding="utf-8"))["base_T_camera"])
+        cfg = rs.motion_config()
+        for name in fm.ROTATIONS:
+            segs = fm.plan_recording(name, start, f_t_c, cfg)
+            note, found = rs.pose_note(name, segs, start, f_t_c)
+            self.assertEqual(found, [], name)
+            self.assertIn("玻璃窗最近", note)
+        old = (rs.YAW_DEG, rs.YAW_HEADING_DEG)
+        try:
+            rs.YAW_DEG, rs.YAW_HEADING_DEG = 30.0, 8.0
+            segs = fm.plan_recording("yaw_left", start, f_t_c, rs.motion_config())
+            self.assertTrue(rs.pose_note("yaw_left", segs, start, f_t_c)[1])
+        finally:
+            rs.YAW_DEG, rs.YAW_HEADING_DEG = old
+
+
+class GlassTest(unittest.TestCase):
+    """画面和玻璃区域的角距离（方位角正 = 向左，仰角正 = 向上，相对起点水平相机）。"""
+
+    def setUp(self):
+        self.normals = fm.frustum_normals()
+        w, h, f, cx, cy = fm.IMAGE_1080
+        self.left_half, self.right_half = np.degrees(np.arctan(cx / f)), np.degrees(np.arctan((w - cx) / f))
+
+    def _clear(self, r, region):
+        return fm.glass_clearance_deg(r, [region], [fm.region_outline(region)], self.normals)
+
+    def test_level_camera_matches_half_fov(self):
+        """水平相机朝向 h：正前方高度上的一小块玻璃，角距离 = 方位角差 − 半视场。"""
+        for h in (-5.0, 0.0, 3.0):
+            r = fm.axis_angle([0, -1.0, 0], h)               # 绕“上”（-y）转 h：向左为正
+            self.assertAlmostEqual(self._clear(r, (60.0, 61.0, -0.5, 0.5)), 60.0 - h - self.left_half, delta=0.02)
+            self.assertAlmostEqual(self._clear(r, (-61.0, -60.0, -0.5, 0.5)), 60.0 + h - self.right_half, delta=0.02)
+
+    def test_inside_and_behind(self):
+        r = np.eye(3)
+        self.assertEqual(self._clear(r, (-30.0, 30.0, -20.0, 20.0)), -90.0)      # 光轴在区域里
+        self.assertLess(self._clear(r, (10.0, 12.0, 0.0, 2.0)), 0.0)              # 小块玻璃整个在画面里
+        self.assertGreater(self._clear(r, (150.0, 180.0, -10.0, 10.0)), 40.0)     # 在背后
+
+    def test_roll_widens_corners(self):
+        """横滚约 29° 时画面左上角转到水平，左边最远到 atan(√(cx² + cy²)/f)，比不转时远约 3.7°。
+        角落外的点按两条边平面的距离算，比真实的 2° 小一些（偏保守）。"""
+        w, h, f, cx, cy = fm.IMAGE_1080
+        diag = np.degrees(np.arctan(np.hypot(cx, cy) / f))
+        roll = np.degrees(np.arctan(cy / cx))
+        region = (diag + 2.0, diag + 3.0, -0.5, 0.5)
+        self.assertAlmostEqual(self._clear(np.eye(3), region), diag + 2.0 - self.left_half, delta=0.02)
+        best = min(self._clear(fm.axis_angle([0, 0, 1.0], s * roll), region) for s in (-1, 1))
+        self.assertLessEqual(best, 2.0 + 1e-6)
+        self.assertGreater(best, 1.5)
+
+    def test_plan_clearance_follows_heading(self):
+        """偏航录制往左转得越多，离左窗越近（拍到时为负，等于伸进画面的深度）；结果出在左端的那几段。"""
+        c = fm.level_camera(NOW)
+        region = [(57.4, 180.0, -90.0, 90.0)]
+        near = []
+        for heading in (-2.0, 0.0, 2.0):
+            cfg = dataclasses.replace(CFG, yaw_deg=10.0, yaw_heading_deg=heading)
+            clear, where = fm.glass_clearance(fm.plan_recording("yaw_left", c, F_T_C, cfg), c, F_T_C, region)
+            near.append(clear)
+            self.assertIn(where, ("wiggle_start_1", "wiggle_start_3", "rotate", "wiggle_end_2", "wiggle_end_4"))
+        self.assertGreater(near[0], 0.0)                                  # 左端 +3°：差约 1.1°，没拍到
+        self.assertAlmostEqual(near[1], 57.4 - 5.0 - self.left_half, delta=0.02)
+        self.assertAlmostEqual(near[1] - near[2], 2.0, delta=0.02)
+
+
+class _FakeZedProc:
+    """zed_record 子进程的替身：crash_rc 不为 None 时表示停止前已经退出。"""
+
+    def __init__(self, crash_rc=None):
+        self.returncode, self.signals = crash_rc, []
+
+    def poll(self):
+        return self.returncode
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+class ZedRecordTest(unittest.TestCase):
+    def _stopped(self, d: Path, proc: _FakeZedProc) -> dict:
+        from zed_capture import ZedRecord
+        zed = ZedRecord(d / "zed_record_bin", d, 10000, 1000)
+        zed.proc = proc
+        zed.stop()
+        return zed.info
+
+    def test_stop_records_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            proc = _FakeZedProc()
+            info = self._stopped(d, proc)
+            self.assertEqual(proc.signals, [signal.SIGINT])
+            self.assertEqual((info["returncode"], info["exited_before_stop"]), (0, False))
+            info = self._stopped(d, _FakeZedProc(crash_rc=-11))
+            self.assertEqual((info["returncode"], info["exited_before_stop"]), (-11, True))
+
+    def test_zed_failure(self):
+        """10-13 10:50 zed_record 停止时段错误（返回码 -11），没写 time_meta.txt，run_session 却当成正常。"""
+        try:
+            import run_session as rs
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.assertIsNone(rs.zed_failure(None, d))                      # goto-start 不开相机
+            self.assertIsNone(rs.zed_failure({"start_box_ns": 1}, d))       # 相机没启动就中止了
+            ok = {"returncode": 0, "exited_before_stop": False}
+            self.assertIn("time_meta.txt", rs.zed_failure(ok, d))
+            (d / "time_meta.txt").write_text("exposure_us=10000\n")
+            self.assertIsNone(rs.zed_failure(ok, d))
+            msg = rs.zed_failure({"returncode": -11, "exited_before_stop": False}, d)
+            self.assertIn("-11（SIGSEGV）", msg)
+            self.assertIn("没等到停止", rs.zed_failure({"returncode": 0, "exited_before_stop": True}, d))
+            self.assertIn("返回码 1", rs.zed_failure({"returncode": 1, "exited_before_stop": True}, d))
 
 
 if __name__ == "__main__":

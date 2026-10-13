@@ -33,9 +33,11 @@ DIRECTIONS = {               # 平移：方向名 -> (相机系轴名, 符号)�
     "up": ("up", +1), "down": ("up", -1),
 }
 ROTATIONS = {                # 旋转：方向名 -> (轴, 符号)，按右手定则转。轴 up：竖直向上（偏航，正转向左）；
-    "yaw_left": ("up", +1), "yaw_right": ("up", -1),          # 轴 x：中心姿态相机的 x 轴（俯仰，正转向上）。
-    "pitch_up": ("x", +1), "pitch_down": ("x", -1),           # 横滚（绕光轴）不做：J6 在这套安装下没验证过
+    "yaw_left": ("up", +1), "yaw_right": ("up", -1),          # 轴 x：中心姿态相机的 x 轴（俯仰，正转向上）；
+    "pitch_up": ("x", +1), "pitch_down": ("x", -1),           # 轴 z：中心姿态相机的光轴（横滚，正 = 画面顶部
+    "roll_right": ("z", +1), "roll_left": ("z", -1),          # 向右倒，即从相机后面看顺时针）
 }
+IMAGE_1080 = (1920, 1080, 736.23, 987.72, 555.14)   # 宽、高、f、cx、cy（s003 重标的校正后左目内参），判断玻璃是否入画用
 PATH_STEP_MM = 10.0          # 逆解检查的路径采样间隔
 PATH_STEP_DEG = 2.0
 ARRIVE_POS_MM = 0.5          # 判定到位的位置/姿态误差
@@ -166,9 +168,13 @@ class MotionConfig:
     wiggle_cycles: int
     reposition_mps: float
     sync_test_hold_s: float
-    rot_deg: float = 30.0         # 旋转录制的总转角（以中心姿态为中心，两边各一半）
+    yaw_deg: float = 20.0         # 偏航录制的总转角（以中心姿态为中心，两边各一半）
+    pitch_deg: float = 10.0       # 俯仰录制的总转角
     rot_deg_s: float = 5.0        # 旋转角速度
-    pitch_heading_deg: float = 0.0    # 俯仰录制的中心姿态：起点绕竖直轴转这么多（见 rotation_centre）
+    yaw_heading_deg: float = 0.0      # 偏航 / 俯仰 / 横滚录制的中心朝向：起点绕竖直轴转这么多（正 = 向左，见 rotation_centre）
+    pitch_heading_deg: float = 0.0
+    roll_deg: float = 10.0        # 横滚录制的总转角
+    roll_heading_deg: float = 0.0
 
 
 @dataclass
@@ -204,45 +210,59 @@ def _arc(name, start, axis, deg, f_t_c, rate_deg_s, fixed_percent=None) -> Segme
     return seg
 
 
-def _wiggle(prefix, camera, f_t_c, cfg: MotionConfig) -> list[Segment]:
-    """绕过光心的相机自身竖直轴（-y）+θ、-θ 来回 cycles 次，最后回到原朝向。
-    相机水平时就是绕竖直轴；俯仰起点上也不带绕光轴的分量（J6 不动）。MoveL，光心中途会偏离约 1–2 mm（只记录）。"""
-    up = camera_up(camera)
+def _wiggle(prefix, camera, f_t_c, cfg: MotionConfig, side: int = 0, axis=None) -> list[Segment]:
+    """绕过光心的轴 axis（默认相机自身竖直轴 -y）+θ、-θ 来回 cycles 次，最后回到原姿态。
+    side=±1：只往一侧摆（按 axis 的右手定则，正 = 正转），θ、0 来回 cycles 次——真值只用角速度大小，
+    单侧一样能对时间。旋转录制用它绕本条的转轴往范围内侧摆，摆动不会让画面扫出旋转本身的范围。
+    MoveL，光心中途会偏离约 1–2 mm（只记录）。"""
+    axis = camera_up(camera) if axis is None else axis
     targets = []
     for _ in range(cfg.wiggle_cycles):
-        targets += [cfg.wiggle_deg, -cfg.wiggle_deg]
-    targets.append(0.0)
-    return [_move(f"{prefix}_{i + 1}", rotate_about(camera, up, deg), f_t_c, rate_deg_s=cfg.wiggle_deg_s, pivot=True)
+        targets += [cfg.wiggle_deg, -cfg.wiggle_deg] if side == 0 else [side * cfg.wiggle_deg, 0.0]
+    if side == 0:
+        targets.append(0.0)
+    return [_move(f"{prefix}_{i + 1}", rotate_about(camera, axis, deg), f_t_c, rate_deg_s=cfg.wiggle_deg_s, pivot=True)
             for i, deg in enumerate(targets)]
 
 
 def rotation_axis(direction: str, centre: np.ndarray) -> np.ndarray:
     """旋转录制的转轴（基坐标系单位向量，已乘符号）。centre 是 rotation_centre 给出的中心姿态。"""
     axis_name, sign = ROTATIONS[direction]
-    return sign * (WORLD_UP if axis_name == "up" else centre[:3, 0])
+    return sign * {"up": WORLD_UP, "x": centre[:3, 0], "z": centre[:3, 2]}[axis_name]
+
+
+def rotation_angle(direction: str, cfg: MotionConfig) -> float:
+    return {"up": cfg.yaw_deg, "x": cfg.pitch_deg, "z": cfg.roll_deg}[ROTATIONS[direction][0]]
+
+
+def rotation_heading(direction: str, cfg: MotionConfig) -> float:
+    return {"up": cfg.yaw_heading_deg, "x": cfg.pitch_heading_deg, "z": cfg.roll_heading_deg}[ROTATIONS[direction][0]]
 
 
 def rotation_centre(direction: str, start: np.ndarray, cfg: MotionConfig) -> np.ndarray:
-    """旋转录制的中心姿态（光心不变）。偏航就是起点；俯仰先绕竖直轴转 pitch_heading_deg：
-    起点处 J5 约 −45°，J4 轴和相机 x 轴差 45°，直接俯仰要靠 J6 抵消横滚分量；转到 J5 约 −90° 后俯仰只用 J2–J4。"""
-    if ROTATIONS[direction][0] == "x" and cfg.pitch_heading_deg:
-        return rotate_about(start, WORLD_UP, cfg.pitch_heading_deg)
-    return start
+    """旋转录制的中心姿态（光心不变）：起点绕竖直轴转 rotation_heading 度。
+    起点处 J5 约 −45°，J4 轴和相机 x 轴差 45°：俯仰要靠 J6 抵消横滚分量（J6 ≈ 俯仰角 × cot|J5|），
+    向右转能减小 J6，但两边都有玻璃窗，只能转一点。横滚基本只转 J6（相机光轴和法兰 z 轴差约 1.5°）。"""
+    heading = rotation_heading(direction, cfg)
+    return rotate_about(start, WORLD_UP, heading) if heading else start
 
 
 def plan_rotation(direction: str, centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig) -> list[Segment]:
-    """绕光心单轴旋转 rot_deg（以中心姿态为中心），前后各一次同步摆动；旋转段用 MoveC。centre 是 set-start 的起点。"""
+    """绕光心单轴旋转（以中心姿态为中心），前后各一次同步摆动；旋转段用 MoveC。centre 是 set-start 的起点。
+    同步摆动绕同一根转轴、往旋转范围内侧摆（开头顺着旋转方向，结尾逆着），姿态不超出旋转本身的范围
+    （摆动幅度大于总转角时会从另一头多出 wiggle_deg − 总转角）。"""
     centre = rotation_centre(direction, centre, cfg)
     axis = rotation_axis(direction, centre)
-    start = rotate_about(centre, axis, -cfg.rot_deg / 2.0)
-    rotate = _arc("rotate", start, axis, cfg.rot_deg, f_t_c, cfg.rot_deg_s)
+    deg = rotation_angle(direction, cfg)
+    start = rotate_about(centre, axis, -deg / 2.0)
+    rotate = _arc("rotate", start, axis, deg, f_t_c, cfg.rot_deg_s)
     return ([_move("goto_start", start, f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
              Segment("hold_start", "hold", duration_s=cfg.hold_start_s)]
-            + _wiggle("wiggle_start", start, f_t_c, cfg)
+            + _wiggle("wiggle_start", start, f_t_c, cfg, +1, axis)
             + [Segment("hold_before", "hold", duration_s=cfg.hold_mid_s),
                rotate,
                Segment("hold_after", "hold", duration_s=cfg.hold_mid_s)]
-            + _wiggle("wiggle_end", rotate.camera, f_t_c, cfg)
+            + _wiggle("wiggle_end", rotate.camera, f_t_c, cfg, -1, axis)
             + [Segment("hold_end", "hold", duration_s=cfg.hold_end_s)])
 
 
@@ -364,14 +384,24 @@ def path_flange(seg: Segment, prev: np.ndarray, target: np.ndarray, u: float, f_
     return sample
 
 
+def _excess(q, joint_min, joint_max) -> np.ndarray:
+    """每个关节超出允许范围多少度（在范围内为 0）。"""
+    q = np.asarray(q, dtype=float)
+    return np.maximum(np.maximum(np.asarray(joint_min) - q, q - np.asarray(joint_max)), 0.0)
+
+
 def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current_joints, f_t_c,
                joint_min, joint_max, max_joint_step_deg: float, min_camera_z_m: float) -> list[str]:
     """沿实际路径（MoveL 直线 / MoveC 圆弧）采样，用控制器逆解检查：有解、关节在范围内、不跳支、相机不低于下限。
+    机械臂当前就在范围外时（例如上次停在别的朝向），不录制的移动段（移到起点）可以往回走：
+    超出的量只能变小，终点必须回到范围内；录制段一律严格检查。
     同时填好每段的行程、姿态变化和目标关节角（MoveC 还有中间点的关节角）。返回问题列表（空表示通过）。"""
     fill_geometry(segments, current_flange)
     problems = []
     ref = list(map(float, current_joints))
     prev = current_flange
+    slack = _excess(ref, joint_min, joint_max)                      # 允许的越界量，只减不增
+    z_slack = max(0.0, min_camera_z_m - float((current_flange @ f_t_c)[2, 3]))
     for seg in segments:
         if seg.kind != "move":
             continue
@@ -386,21 +416,26 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
                 continue
         for k in range(1, n + 1):
             u = k / n
+            returning = not seg.recorded and k < n                    # 移到起点途中可以从范围外往回走
             sample = path_flange(seg, prev, target, u, f_t_c)
             cam_z = float((sample @ f_t_c)[2, 3])
-            if cam_z < min_camera_z_m:
+            deficit = max(0.0, min_camera_z_m - cam_z)
+            if deficit > (z_slack if returning else 0.0) + 1e-6:
                 problems.append(f"{seg.name}: 相机光心高度 {cam_z:.3f} m 低于下限 {min_camera_z_m} m")
                 break
+            z_slack = min(z_slack, deficit)
             ret = rpc.GetInverseKinRef(0, matrix_to_fr5(sample), ref)
             err, q = (ret[0], ret[1]) if isinstance(ret, tuple) else (ret, None)
             if err != 0 or q is None:
                 problems.append(f"{seg.name}: 路径 {u:.0%} 处控制器逆解失败（错误码 {err}）")
                 break
             q = list(map(float, q))
-            out = [i + 1 for i in range(6) if not joint_min[i] <= q[i] <= joint_max[i]]
+            excess = _excess(q, joint_min, joint_max)
+            out = [i + 1 for i in range(6) if excess[i] > (slack[i] if returning else 0.0) + 1e-6]
             if out:
                 problems.append(f"{seg.name}: 路径 {u:.0%} 处关节 J{out} 超出允许范围：{np.round(q, 1).tolist()}")
                 break
+            slack = np.minimum(slack, excess)
             step = max(abs(a - b) for a, b in zip(q, ref))
             if step > max_joint_step_deg:
                 problems.append(f"{seg.name}: 路径 {u:.0%} 处关节一步变化 {step:.1f}°，可能跳到另一组逆解")
@@ -411,6 +446,86 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
         seg.joints = ref
         prev = target
     return problems
+
+
+# ------------------------------------------------------------------ 玻璃窗是否入画（旋转录制：光心不动）
+def view_direction(az_deg, el_deg) -> np.ndarray:
+    """起点水平相机系（x 右、y 下、z 前）里方位角 az（正 = 向左）、仰角 el（正 = 向上）的单位向量，可广播。"""
+    a, e = np.radians(az_deg), np.radians(el_deg)
+    return np.stack([-np.sin(a) * np.cos(e), -np.sin(e), np.cos(a) * np.cos(e)], axis=-1)
+
+
+def region_outline(region, step_deg: float = 0.2) -> np.ndarray:
+    """区域 (方位角起, 方位角止, 仰角下, 仰角上)（°）边界上的点（起点相机系单位向量）。
+    画面没碰到区域时，区域里离画面最近的点一定在边界上，所以只取边界。"""
+    az0, az1, el0, el1 = region
+    az = np.linspace(az0, az1, max(2, math.ceil((az1 - az0) / step_deg) + 1))
+    el = np.linspace(el0, el1, max(2, math.ceil((el1 - el0) / step_deg) + 1))
+    pts = np.concatenate([np.c_[az, np.full(len(az), el0)], np.c_[az, np.full(len(az), el1)],
+                          np.c_[np.full(len(el), az0), el], np.c_[np.full(len(el), az1), el]])
+    return view_direction(pts[:, 0], pts[:, 1])
+
+
+def frustum_normals(image=IMAGE_1080) -> np.ndarray:
+    """画面四条边各对应一个过光心的平面，返回它们的外法向（相机系单位向量）：方向在画面内 ⇔ 和四个法向的点积都 ≤ 0。"""
+    w, h, f, cx, cy = image
+    n = np.array([[1.0, 0.0, -(w - cx) / f], [-1.0, 0.0, -cx / f], [0.0, 1.0, -(h - cy) / f], [0.0, -1.0, -cy / f]])
+    return n / np.linalg.norm(n, axis=1, keepdims=True)
+
+
+def glass_clearance_deg(r_rel: np.ndarray, regions, outlines, normals) -> float:
+    """相机姿态 r_rel（相机系 → 起点水平相机系的旋转）下，画面离各玻璃区域最近的角距离（°），≤ 0 表示拍到。
+    每个点取到四个边平面的带符号角距离的最大值：画面角落外它比真实距离小，结果偏保守。"""
+    z = r_rel[:, 2]
+    az, el = math.degrees(math.atan2(-z[0], z[2])), math.degrees(math.asin(max(-1.0, min(1.0, -z[1]))))
+    best = math.inf
+    for (az0, az1, el0, el1), pts in zip(regions, outlines):
+        if az0 <= az <= az1 and el0 <= el <= el1:
+            return -90.0                                          # 光轴就在区域里（画面可能整个落在区域内）
+        s = np.clip((pts @ r_rel) @ normals.T, -1.0, 1.0)         # pts @ r_rel：每个点换到相机系
+        best = min(best, float(np.degrees(np.arcsin(s.max(axis=1))).min()))
+    return best
+
+
+def glass_clearance(segments: list[Segment], start_camera: np.ndarray, f_t_c: np.ndarray, regions,
+                    image=IMAGE_1080, step_deg: float = 0.5) -> tuple[float, str]:
+    """沿各录制段（不录制的移动只看终点）每 step_deg 采样相机姿态，返回 (画面离玻璃区域最近的角距离 °, 在哪一段)。
+    regions：[(方位角起, 方位角止, 仰角下, 仰角上)]（°），以光心为球心、相对 start_camera（水平起点）的朝向。
+    只适用于光心不动的旋转录制。"""
+    outlines = [region_outline(r) for r in regions]
+    normals = frustum_normals(image)
+    r0 = start_camera[:3, :3]
+    best, where, prev = math.inf, "", None
+    for seg in segments:
+        if seg.kind != "move":
+            continue
+        target = fr5_to_matrix(seg.flange)
+        n = math.ceil(rotation_deg(prev, target) / step_deg) if prev is not None and seg.recorded else 0
+        for u in [k / n for k in range(1, n)] + [1.0]:
+            flange = target if u == 1.0 else path_flange(seg, prev, target, u, f_t_c)
+            c = glass_clearance_deg(r0.T @ (flange @ f_t_c)[:3, :3], regions, outlines, normals)
+            if c < best:
+                best, where = c, seg.name
+        prev = target
+    return best, where
+
+
+def pose_span(segments: list[Segment], start_camera: np.ndarray, f_t_c: np.ndarray) -> dict:
+    """录制各段终点（含 MoveC 中间点）的光轴方位角、仰角和画面横滚范围（°，相对水平起点；正 = 向左 / 向上 / 顶部向右）。"""
+    r0 = start_camera[:3, :3]
+    vals = []
+    for seg in segments:
+        if seg.kind != "move" or not (seg.recorded or seg.name == "goto_start"):
+            continue
+        for flange in [seg.flange] + ([seg.via_flange] if seg.via_flange else []):
+            r = r0.T @ (fr5_to_matrix(flange) @ f_t_c)[:3, :3]
+            z, x = r[:, 2], r[:, 0]
+            horiz = np.cross(z, [0.0, -1.0, 0.0])                 # 光轴的水平右方向（z × 上）
+            horiz /= np.linalg.norm(horiz)
+            roll = math.degrees(math.atan2(np.cross(horiz, x) @ z, horiz @ x))
+            vals.append((math.degrees(math.atan2(-z[0], z[2])), math.degrees(math.asin(-z[1])), roll))
+    lo, hi = np.min(vals, axis=0), np.max(vals, axis=0)
+    return {k: (float(lo[i]), float(hi[i])) for i, k in enumerate(("heading", "pitch", "roll"))}
 
 
 # ------------------------------------------------------------------ 实测速度

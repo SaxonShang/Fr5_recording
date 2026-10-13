@@ -43,7 +43,25 @@ def camera_in_cam0(t_s):
     return pose
 
 
-def write_session(d: Path, syn, board, k, rng) -> None:
+TURN_DEG, TURN_SCALE = 10.0, 1.01   # 旋转录制：真值说转了 10°，相机实际多转 1%（摆动也一样）
+
+
+def rotation_in_cam0(t_s, scale=1.0):
+    """旋转录制（光心不动）：静止 → 绕自身竖直轴单侧摆 0→10°→0 → 静止 → 转 TURN_DEG → 静止。scale：实际转角比例。"""
+    if 0.8 <= t_s <= 2.8:
+        yaw = 10.0 * np.sin(np.pi * (t_s - 0.8) / 2.0) ** 2
+    else:
+        u = np.clip((t_s - 3.3) / 1.0, 0.0, 1.0)
+        yaw = TURN_DEG * (3 * u ** 2 - 2 * u ** 3)
+    pose = np.eye(4)
+    pose[:3, :3] = _ry(scale * yaw)
+    return pose
+
+
+def write_session(d: Path, syn, board, k, rng, motion=camera_in_cam0, actual=None, segments=None) -> None:
+    """motion：真值的相机运动；actual：渲染图像用的实际运动（默认同 motion）；
+    segments：[(段名, 开始 s, 结束 s)]，给了就写 motion_log.json。"""
+    actual = actual or motion
     base_t_cam0 = np.eye(4)
     base_t_cam0[:3, :3] = gt.euler_to_matrix(-95.0, 3.0, -100.0)
     base_t_cam0[:3, 3] = [0.6, -0.45, 0.55]
@@ -54,7 +72,10 @@ def write_session(d: Path, syn, board, k, rng) -> None:
     base_t_board = base_t_cam0 @ cam0_t_board
 
     def base_t_cam(t_ms):
-        return base_t_cam0 @ camera_in_cam0(t_ms / 1000.0)
+        return base_t_cam0 @ motion(t_ms / 1000.0)
+
+    def base_t_cam_actual(t_ms):
+        return base_t_cam0 @ actual(t_ms / 1000.0)
 
     t_arm = np.arange(0.0, 5000.0, 10.0)
     poses = [base_t_cam(t) for t in t_arm]
@@ -76,7 +97,7 @@ def write_session(d: Path, syn, board, k, rng) -> None:
         w.writerow(["zed_timestamp_ms", "filename_left", "flag", "arm_span_ms",
                     "tx_m", "ty_m", "tz_m", "qx", "qy", "qz", "qw"])
         for i, t in enumerate(t_img):
-            cam_t_board = np.linalg.inv(base_t_cam(t)) @ base_t_board      # 按真实时刻渲染
+            cam_t_board = np.linalg.inv(base_t_cam_actual(t)) @ base_t_board      # 按真实时刻、实际运动渲染
             image = syn.render_view(texture, tex_to_board, cam_t_board, k, rng, blur=0.6, noise=2.0)
             name = f"left/{EPOCH_MS + t:.0f}.jpg"
             cv2.imwrite(str(d / name), image, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -85,6 +106,10 @@ def write_session(d: Path, syn, board, k, rng) -> None:
                         f"{q[1]:.12f}", f"{q[2]:.12f}", f"{q[3]:.12f}", f"{q[0]:.12f}"])
     (d / "groundtruth_report.json").write_text(json.dumps(
         {"time_offset": {"dt_ms": 0.0}, "exposure_centre": {"applied_ms": 0.0}}))
+    if segments:
+        segs = [{"name": n, "kind": "move", "start_box_ns": int((EPOCH_MS + a * 1000) * 1e6),
+                 "end_box_ns": int((EPOCH_MS + b * 1000) * 1e6)} for n, a, b in segments]
+        (d / "motion_log.json").write_text(json.dumps({"kind": "record", "direction": "yaw_left", "segments": segs}))
 
 
 def bc_board_centre(board):
@@ -94,33 +119,68 @@ def bc_board_centre(board):
 
 @unittest.skipIf(SKIP, SKIP)
 class BoardCheckTest(unittest.TestCase):
-    def test_finds_time_error_and_static_consistency(self):
+    @classmethod
+    def setUpClass(cls):
         import sys
         sys.path.insert(0, str(bc.CALIB_REPO))
         from handeye.board import read_board
         spec = importlib.util.spec_from_file_location("synthetic", bc.CALIB_REPO / "sim" / "synthetic.py")
-        syn = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(syn)
-        syn.WIDTH, syn.HEIGHT = 1920, 1080                                  # 录制用 HD1080
-        k = bc.load_camera(bc.CAMERA_YAML)
-        board = read_board(bc.CALIB_REPO / bc.TARGET_YAML)
+        cls.syn = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.syn)
+        cls.syn.WIDTH, cls.syn.HEIGHT = 1920, 1080                         # 录制用 HD1080
+        cls.k = bc.load_camera(bc.CAMERA_YAML)
+        cls.board = read_board(bc.CALIB_REPO / bc.TARGET_YAML)
+
+    def _run(self, d: Path, **kw) -> dict:
+        write_session(d, self.syn, self.board, self.k, np.random.default_rng(0), **kw)
+        r = bc.check(d, bc.CALIB_REPO, bc.CAMERA_YAML, bc.CALIB_REPO / bc.TARGET_YAML, d, scan_ms=15.0)
+        print("\n" + bc.summary(r))
+        self.assertLess(r["check_csv_vs_arm_rate_max_mm"], 0.01)
+        self.assertEqual(r["images"]["board_used"], 70)
+        self.assertEqual(len(r["static_groups"]), 3)
+        scan = r["time_scan"]
+        self.assertFalse(scan["at_edge"])
+        self.assertAlmostEqual(scan["best_delta_ms"], TRUTH_LATE_MS, delta=1.0)
+        self.assertLess(scan["rms_at_best_mm"], scan["rms_at_0_mm"])
+        self.assertTrue((d / "board_check_frames.csv").exists())
+        return r
+
+    def test_finds_time_error_and_static_consistency(self):
         with tempfile.TemporaryDirectory() as tmp:
-            d = Path(tmp)
-            write_session(d, syn, board, k, np.random.default_rng(0))
-            r = bc.check(d, bc.CALIB_REPO, bc.CAMERA_YAML, bc.CALIB_REPO / bc.TARGET_YAML, d,
-                         scan_ms=15.0)
-            print("\n" + bc.summary(r))
-            self.assertLess(r["check_csv_vs_arm_rate_max_mm"], 0.01)
-            self.assertEqual(r["images"]["board_used"], 70)
+            r = self._run(Path(tmp))
             self.assertGreaterEqual(r["images"]["moving"], bc.MIN_MOVING_FRAMES)
             self.assertLess(r["static"]["rms_mm"], 0.5)
-            self.assertEqual(len(r["static_groups"]), 3)
             self.assertTrue(all(p["board_diff_mm"] < 0.5 for p in r["static_group_pairs"]))
-            scan = r["time_scan"]
-            self.assertFalse(scan["at_edge"])
-            self.assertAlmostEqual(scan["best_delta_ms"], TRUTH_LATE_MS, delta=1.0)
-            self.assertLess(scan["rms_at_best_mm"], scan["rms_at_0_mm"])
-            self.assertTrue((d / "board_check_frames.csv").exists())
+            self.assertTrue(all(p["camera_turned_deg"] < bc.GROUP_TURN_DEG and p["turn_scale"] is None
+                                for p in r["static_group_pairs"]))                 # 平移录制，不当旋转看
+            self.assertEqual(r["time_scan"]["frame_selection"], "distance")      # 没有 motion_log.json
+
+    def test_rotation_finds_turn_scale_and_time_error(self):
+        """旋转录制：光心不动，三个静止组按姿态分开；图像看到的转角比真值大 1%；
+        按 motion_log.json 去掉旋转段后，时间扫描仍找回 4 ms。"""
+        segments = [("wiggle_start_1", 0.8, 2.8), ("rotate", 3.3, 4.3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run(Path(tmp), motion=rotation_in_cam0,
+                          actual=lambda t: rotation_in_cam0(t, TURN_SCALE), segments=segments)
+            groups, pairs = r["static_groups"], {tuple(p["groups"]): p for p in r["static_group_pairs"]}
+            self.assertLess(max(np.linalg.norm(np.subtract(g["camera_mm"], groups[0]["camera_mm"])) for g in groups), 0.01)
+            self.assertAlmostEqual(groups[2]["camera_turn_from_first_deg"], TURN_DEG, delta=0.01)
+            self.assertLess(pairs[(0, 1)]["camera_turned_deg"], bc.GROUP_TURN_DEG)
+            self.assertLess(pairs[(0, 1)]["board_diff_mm"], 0.5)
+            turn = pairs[(0, 2)]
+            extra = TURN_DEG * (TURN_SCALE - 1.0)                                          # 多转 0.1°
+            self.assertAlmostEqual(turn["camera_turned_deg"], TURN_DEG, delta=0.01)
+            self.assertAlmostEqual(abs(turn["camera_turn_axis_cam"][1]), 1.0, places=4)    # 绕相机 y 轴
+            # 标定板姿态（PnP）对照转角：单帧姿态精度约 0.03°，10° 时比例误差约 ±0.3%
+            self.assertAlmostEqual(turn["image_turned_deg"], TURN_DEG + extra, delta=0.05)
+            self.assertAlmostEqual(turn["turn_scale"], TURN_SCALE - 1.0, delta=0.005)
+            self.assertAlmostEqual(abs(turn["turn_residual_cam_xyz_deg"][1]), extra, delta=0.05)
+            # 标定板位置（精得多）：多转 0.1° 在 1 m 处横向差 tan(0.1°) m ≈ 1.75 mm
+            self.assertAlmostEqual(abs(turn["board_diff_cam_xyz_mm"][0]), 1000 * np.tan(np.radians(extra)), delta=0.1)
+            self.assertEqual(r["time_scan"]["frame_selection"], "motion_log")
+            with open(Path(tmp) / "board_check_frames.csv", encoding="utf-8") as f:
+                segs = {row["segment"] for row in csv.DictReader(f)}
+            self.assertEqual(segs, {"", "wiggle_start_1", "rotate"})
 
 
 if __name__ == "__main__":

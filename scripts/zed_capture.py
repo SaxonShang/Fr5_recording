@@ -61,6 +61,8 @@ class ZedRecord:
                 raise RuntimeError("zed_record 没有开始采集：\n" + "\n".join(self.lines[-10:]))
 
     def stop(self) -> None:
+        if self.proc is not None:
+            self.info["exited_before_stop"] = self.proc.poll() is not None   # 没等到停止就自己退出了
         if self.proc is not None and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGINT)
             try:

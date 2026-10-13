@@ -4,14 +4,14 @@
 
 在 Box 自己的终端里运行（人在机械臂旁边，手边有急停）：
     python3 run_session.py set-start        读当前位姿，算出相机水平的起点并保存（不动机械臂）
-    python3 run_session.py plan             空跑：检查全部录制（6 条平移、4 条旋转）和 sync-test 的路径（不动机械臂）
+    python3 run_session.py plan             空跑：检查全部录制（6 条平移、6 条旋转）和 sync-test 的路径（不动机械臂）
     python3 run_session.py goto-start       低速移到水平起点（会先确认）
     python3 run_session.py speed-test       速度标定：实测速度百分比对应的 mm/s 和 °/s（会先确认，不开相机）
     python3 run_session.py sync-test        时间同步验证：只做同步摆动的录制（会先确认）
     python3 run_session.py movec-test       MoveC 探测：在起点用 MoveC 和 MoveL 各绕光心竖直轴转 ±10°，对照光心偏离（会先确认，不开相机）
     python3 run_session.py record forward   正式录制一条（会先确认）
                                             平移：forward/backward/right/left/up/down
-                                            旋转（绕光心）：yaw_left/yaw_right/pitch_up/pitch_down
+                                            旋转（绕光心）：yaw_left/yaw_right/pitch_up/pitch_down/roll_left/roll_right
 选项：--scale 0.25  首次运行按比例降速；--yes  跳过确认（只在你已经看过计划时用）；
       --tag board  加在录制目录名后面（区分验证录制和正式录制）
 
@@ -22,11 +22,26 @@ sync-test 和 record 需要先有 speed-test 的结果；改了 WebApp 速度百
 # ================================ 可修改参数 ================================
 SPEED_MPS = 0.05             # 平移速度 m/s
 STROKE_M = 0.30              # 每条录制的行程 m（以 set-start 保存的起点为中心，两边各一半）
-ROT_DEG = 20.0               # 旋转录制的总转角 °（以中心姿态为中心，两边各一半；绕光心，MoveC）
-                             # 20° 时偏航 ±10° 加摆动 ±10°，J5 正好在平移录制走过的范围里；30° 要超出
+YAW_DEG = 10.0               # 偏航录制的总转角 °（以中心姿态为中心，两边各一半；绕光心，MoveC）。左右两边都有玻璃窗，
+                             # 画面（水平视场 105°）只剩约 12° 可转；同步摆动也是 10°，总转角小于摆动幅度时摆动会从另一头扫出去
+PITCH_DEG = 30.0             # 俯仰录制的总转角 °：俯仰要转 J6（约 俯仰角 × cot|J5|），30° 时 J6 约 ±13°、J4 到 −90° 附近
+ROLL_DEG = 30.0              # 横滚录制的总转角 °（绕光轴，基本只转 J6）：和俯仰一样（用户 10-13 定），J6 约 ±15°
 ROT_DEG_S = 5.0              # 旋转角速度 °/s（模糊和景深无关：曝光 10 ms 时 5 °/s 约 0.64 px）
-PITCH_HEADING_DEG = -35.0    # 俯仰录制的中心朝向：起点绕竖直轴转这么多（负 = 向右）。起点处 J5 约 −45°，
-                             # 直接俯仰要靠 J6 抵消横滚分量（俯仰 1° J6 转约 1°）；右转 35° 后 J5 约 −89°，俯仰只用 J2–J4
+YAW_HEADING_DEG = -2.25      # 偏航 / 俯仰 / 横滚录制的中心朝向：起点绕竖直轴转这么多 °（正 = 向左）。
+PITCH_HEADING_DEG = -5.0     # 取在两扇窗中间（左窗 +57.4°、右窗 −60.3°，左半视场 53.3°、右半视场 51.7°），
+ROLL_HEADING_DEG = -2.0      # 由 GLASS_REGIONS 检查；俯仰向右转 J5 离 0° 更远、J6 转得少
+# 画面里不能出现的玻璃（旋转录制全程检查，含同步摆动；平移录制光心在动，不查）。每块是
+# (方位角起, 方位角止, 仰角下, 仰角上)，单位 °，以起点光心为球心、相对起点水平朝向，方位角正 = 向左、仰角正 = 向上。
+# 10-13 用旋转演练的 32 张静止帧拼成全景图量出：左窗玻璃从 +57.4° 往左（再往里到 +55.5° 是窗框），上沿仰角 +27.3°，
+# 下面被压力机挡住，按一直到底处理；右窗玻璃从柱子边缘 −60.3° 往右，在远处，仰角约 −6.5～+4°（上面到天花板的
+# 白条也算进去）；+76° 以左、−87° 以右没拍到，按全是玻璃处理。
+GLASS_REGIONS = [
+    (57.4, 76.0, -90.0, 27.5),
+    (76.0, 180.0, -90.0, 90.0),
+    (-87.0, -60.3, -8.0, 11.0),
+    (-180.0, -87.0, -90.0, 90.0),
+]
+GLASS_MARGIN_DEG = 1.0       # 画面离玻璃至少这么多 °（画面左右边缘 1° 约 35 px）
 EXPOSURE_US = 10000          # 曝光 μs（传给 zed_record）
 ANALOG_GAIN_MDB = 1000       # 模拟增益 mdB（传给 zed_record）；缩短曝光后画面偏暗时调大
 MAX_BLUR_PX = 1.0            # 允许的最大运动模糊（1080p 像素）
@@ -34,7 +49,7 @@ NEAREST_DEPTH_M = 1.0        # 画面里最近物体的距离 m，用来估算�
 HOLD_START_S = 5.0           # 开头静止 s（同时用来估陀螺零偏）
 HOLD_MID_S = 3.0             # 同步摆动和平移之间的静止 s
 HOLD_END_S = 5.0             # 结尾静止 s
-WIGGLE_DEG = 10.0            # 同步摆动幅度 °（绕相机竖直轴转，相机保持水平）
+WIGGLE_DEG = 10.0            # 同步摆动幅度 °（平移录制和 sync-test 绕相机竖直轴两边摆；旋转录制绕本条的转轴往内侧摆）
 WIGGLE_DEG_S = 20.0          # 同步摆动角速度 °/s（真值脚本要求至少 10 °/s）
 WIGGLE_CYCLES = 2            # 同步摆动来回次数
 SYNC_TEST_HOLD_S = 10.0      # sync-test 两次摆动之间的静止 s
@@ -47,10 +62,11 @@ MAX_SPEED_ERROR = 0.10       # 平移实测速度和预计速度相差超过 10%
 MIN_CAMERA_Z_M = 0.35        # 相机光心最低高度（基坐标系 z，m）；按现场桌面和障碍物修改
 # 允许的关节范围（°）。腕部 J4–J6 限制在这套末端装置已经安全走过的范围内（再往外 Box 可能碰到腕部，
 # 见标定仓库 README 6.4 / 6.7）：10-10、10-12 录制实测 J4 −151～−99、J5 −69.5～−22.1、J6 一直是 0，各留约 3° 余量；
-# 俯仰录制（右转 35° 后）要 J4 −128～−96、J5 −103～−76，按标定走过的范围（J4 −154～−77、J5 −119～−56）放宽到 −90、−106。
-# J6 只放 ±5°，需要转 J6 的计划（如横滚）在空跑时就会被拒绝。J1–J3 覆盖起点附近 ±150 mm 平移，离肘部奇异（J3=0）至少 15°。
-JOINT_MIN_DEG = [80.0, -30.0, -130.0, -154.0, -106.0, -5.0]
-JOINT_MAX_DEG = [160.0, 60.0, -15.0, -90.0, -19.0, 5.0]
+# 俯仰 30° 要 J4 到 −90°：用户 10-13 确认不会碰撞，按标定走过的范围（J4 −154～−77）放宽到 J4 上限 −87。
+# J6 ±50：用户 10-13 目测在起点姿态下 J6 转 60° 以内不会碰（横滚），按用户要求再保守 10°；起点 J6 ≈ 0。
+# J1–J3 覆盖起点附近 ±150 mm 平移，离肘部奇异（J3=0）至少 15°。
+JOINT_MIN_DEG = [80.0, -30.0, -130.0, -154.0, -72.0, -50.0]
+JOINT_MAX_DEG = [160.0, 60.0, -15.0, -87.0, -19.0, 50.0]
 MAX_JOINT_STEP_DEG = 5.0     # 路径上每 10 mm / 2° 允许的最大关节变化（超过说明逆解可能跳支）
 MAX_SPEED_RIPPLE = 0.05      # 平移巡航段速度波动（标准差/均值）超过它就警告“速度不平稳”
 MIN_FREE_GB = 5.0            # 开始录制前 Box 至少剩余的磁盘空间 GB
@@ -66,9 +82,14 @@ MOVEC_TEST = "~/ROBOT/fr5_record/movec_test.json"
 RANGES = {
     "SPEED_MPS": (0.02, 0.10),       # 下限暂定，待平稳性测试确认；上限还受 MAX_BLUR_PX 约束
     "STROKE_M": (0.05, 0.30),        # ±150 mm 已做离线可达性检查
-    "ROT_DEG": (5.0, 30.0),          # 能不能转满还要看 plan 的关节检查
+    "YAW_DEG": (5.0, 30.0),          # 能不能转满还要看玻璃窗检查和 plan 的关节检查
+    "PITCH_DEG": (5.0, 30.0),
+    "ROLL_DEG": (5.0, 90.0),         # 90° 时 J6 −46.0～+45.8°（10-13 控制器逆解），在 J6 ±50 以内
     "ROT_DEG_S": (1.0, 10.0),        # 上限还受 MAX_BLUR_PX 约束
-    "PITCH_HEADING_DEG": (-45.0, 0.0),   # 只能向右转：向左 J5 会接近 0°（腕部奇异）
+    "YAW_HEADING_DEG": (-10.0, 20.0),
+    "PITCH_HEADING_DEG": (-10.0, 0.0),   # 向左 J5 接近 0°，J6 要转得更多
+    "ROLL_HEADING_DEG": (-10.0, 10.0),
+    "GLASS_MARGIN_DEG": (0.5, 5.0),
     "EXPOSURE_US": (1000, 15000),
     "ANALOG_GAIN_MDB": (1000, 16000),
     "MAX_BLUR_PX": (0.3, 2.0),
@@ -136,17 +157,30 @@ def p(path: str) -> Path:
 def motion_config() -> fm.MotionConfig:
     return fm.MotionConfig(SPEED_MPS, STROKE_M, HOLD_START_S, HOLD_MID_S, HOLD_END_S,
                            WIGGLE_DEG, WIGGLE_DEG_S, int(WIGGLE_CYCLES), REPOSITION_MPS, SYNC_TEST_HOLD_S,
-                           ROT_DEG, ROT_DEG_S, PITCH_HEADING_DEG)
+                           YAW_DEG, PITCH_DEG, ROT_DEG_S, YAW_HEADING_DEG, PITCH_HEADING_DEG,
+                           ROLL_DEG, ROLL_HEADING_DEG)
 
 
 RECORD_NAMES = [*fm.DIRECTIONS, *fm.ROTATIONS]
 
 
-def heading_note(name: str) -> str:
-    """俯仰录制先转到另一个朝向（见 PITCH_HEADING_DEG），计划里写明。"""
-    if name in fm.ROTATIONS and fm.ROTATIONS[name][0] == "x" and PITCH_HEADING_DEG:
-        return f"中心朝向：起点绕竖直轴向右转 {-PITCH_HEADING_DEG:g}°（画面和平移录制不同）"
-    return ""
+def pose_note(name: str, segs: list[fm.Segment], start_camera: np.ndarray, f_t_c: np.ndarray) -> tuple[str, list[str]]:
+    """旋转录制的全程姿态范围（含同步摆动）和画面离玻璃窗的最近角距离，计划里写明；离得太近就是问题。
+    返回 (说明, 问题列表)；平移录制和 sync-test 光心在动或摆动两边，不查。"""
+    if name not in fm.ROTATIONS:
+        return "", []
+    span = fm.pose_span(segs, start_camera, f_t_c)
+    clear, where = fm.glass_clearance(segs, start_camera, f_t_c, GLASS_REGIONS)
+    parts = []
+    for key, label in (("heading", "朝向"), ("pitch", "俯仰"), ("roll", "横滚")):
+        lo, hi = span[key]
+        if key == "heading" or hi - lo > 0.05:
+            parts.append(f"{label} {lo:+.1f}～{hi:+.1f}°")
+    note =(f"姿态（相对起点，含同步摆动；朝向正 = 向左，俯仰正 = 向上，横滚正 = 画面顶部向右）：{'，'.join(parts)}；"
+            f"画面离玻璃窗最近 {clear:.2f}°（{where}）")
+    if clear >= GLASS_MARGIN_DEG:
+        return note, []
+    return note, [f"画面离玻璃窗最近只有 {clear:.2f}°（{where} 段），少于 GLASS_MARGIN_DEG={GLASS_MARGIN_DEG}°"]
 
 
 CAL_KEYS = ("WEBAPP_SPEED_PCT", "ACCEL_PCT", "WIGGLE_DEG")  # 这些改了，speed-test 的结果就不能用了
@@ -207,6 +241,8 @@ def parameter_problems() -> list[str]:
         w_max = MAX_BLUR_PX / blur_rot * ROT_DEG_S
         out.append(f"旋转 {ROT_DEG_S} °/s、曝光 {EXPOSURE_US} μs 时模糊 {blur_rot:.2f} px，"
                    f"超过 MAX_BLUR_PX={MAX_BLUR_PX}；这个曝光下角速度最高 {w_max:.1f} °/s")
+    if any(len(r) != 4 or not (r[0] < r[1] and r[2] < r[3]) for r in GLASS_REGIONS):
+        out.append("GLASS_REGIONS 每块必须是 (方位角起, 方位角止, 仰角下, 仰角上)，且起 < 止、下 < 上")
     return out
 
 
@@ -337,10 +373,11 @@ def cmd_plan(args, problems: list[str]) -> int:
             for name in names:
                 segs = (fm.plan_sync_test(start["camera"], f_t_c, cfg) if name == "sync-test"
                         else fm.plan_recording(name, start["camera"], f_t_c, cfg))
-                found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
+                note, found = pose_note(name, segs, start["camera"], f_t_c)
+                found = check_segments(rec, rpc, segs, f_t_c, model, args.scale) + found
                 print(f"\n=== {name}：{'通过' if not found else '有问题'}")
-                if heading_note(name):
-                    print(f"  {heading_note(name)}")
+                if note:
+                    print(f"  {note}")
                 print(describe(segs))
                 for m in found:
                     print(f"  问题：{m}")
@@ -390,6 +427,27 @@ def segment_log(s: fm.Segment) -> dict:
             "percent": s.percent, "expect_mm_s": s.expect_mm_s, "expect_deg_s": s.expect_deg_s, **s.log}
 
 
+def zed_failure(info: dict | None, data_dir: Path) -> str | None:
+    """zed_record 没有正常结束时返回原因（这时 img_timeline.csv、zed_imu.csv 会缺结尾，time_meta.txt 可能没写）。"""
+    if not info or "returncode" not in info:      # 没有启动过
+        return None
+    problems = []
+    rc = info["returncode"]
+    if rc != 0:
+        try:
+            name = f"（{signal.Signals(-rc).name}）" if rc is not None and rc < 0 else ""
+        except ValueError:
+            name = ""
+        problems.append(f"返回码 {rc}{name}")
+    if info.get("exited_before_stop"):
+        problems.append("没等到停止就自己退出了")
+    if not (data_dir / "time_meta.txt").exists():
+        problems.append("没有写 time_meta.txt")
+    if not problems:
+        return None
+    return "zed_record 没有正常结束：" + "，".join(problems) + "。图像时间表和 IMU 文件可能缺结尾，这条不能作正式数据，要重录"
+
+
 def cmd_motion(args, kind: str, direction: str | None) -> int:
     busy = camera_users() if kind != "goto-start" else []
     if busy:
@@ -437,12 +495,13 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         if model is None:                        # 只有 goto-start 允许没标定
             model = conservative_model(rpc)
             note = "还没有速度标定，按保守假设换算（实际只会更慢）"
-        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
+        pose, found = pose_note(name, segs, start["camera"], f_t_c)
+        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale) + found
         if found:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
         header = (f"{name}：速度比例 {args.scale}" + (f"，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
                   + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%"
-                  + (f"\n{heading_note(name)}" if heading_note(name) else ""))
+                  + (f"\n{pose}" if pose else ""))
         confirm_plan(header + "\n" + describe(segs, totals=zed is not None), args.yes)
         ran = True
         runner.run(segs[0])                      # 移到起点（相机还没开始录）
@@ -475,9 +534,11 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         print("已到起点" if error is None else "")
         return 0 if error is None else 1
 
+    zed_error = zed_failure(zed.info if zed else None, data_dir)
     log = {
-        "kind": kind, "direction": direction, "tag": args.tag, "speed_scale": args.scale, "error": error,
-        "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG"]},
+        "kind": kind, "direction": direction, "tag": args.tag, "speed_scale": args.scale,
+        "error": "；".join(e for e in (error, zed_error) if e) or None,
+        "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG", "GLASS_REGIONS"]},
         "speed_model": dataclasses.asdict(model) if model else None,
         "start_pose": {k: start[k] for k in ("base_T_camera", "flange", "joints", "created")},
         "handeye_sha256": handeye["sha256"],
@@ -516,7 +577,9 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
                 print(f"  警告：{w}")
         except (OSError, ValueError, KeyError) as exc:
             print(f"真值计算失败：{exc}")
-    return 0 if error is None else 1
+    if zed_error:
+        print(f"\n录制失败：{zed_error}")
+    return 0 if error is None and zed_error is None else 1
 
 
 def _per_pct(seg: fm.Segment, key: str) -> float | None:
@@ -694,7 +757,7 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("set-start")
     plan = sub.add_parser("plan")
-    plan.add_argument("names", nargs="*", help="要检查的录制，默认全部：6 条平移、4 条旋转和 sync-test")
+    plan.add_argument("names", nargs="*", help="要检查的录制，默认全部：6 条平移、6 条旋转和 sync-test")
     for name in ("goto-start", "speed-test", "sync-test"):
         sub.add_parser(name)
     sub.add_parser("movec-test")

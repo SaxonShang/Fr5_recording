@@ -310,6 +310,20 @@ class SyntheticSessionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "无法估计"):
                 gt.process(d, d / "handeye.json", d)
 
+    def test_truncated_last_line_dropped(self):
+        """zed_record 崩溃时 zed_imu.csv、img_timeline.csv 的最后一行只写了一半（10-13 实测）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0))
+            n_img = len((d / "img_timeline.csv").read_text(encoding="utf-8").splitlines()) - 1
+            for name, keep in (("zed_imu.csv", 16), ("img_timeline.csv", 20)):
+                raw = (d / name).read_bytes()
+                last = raw.rstrip(b"\r\n").rfind(b"\n") + 1
+                (d / name).write_bytes(raw[:last + keep])   # 最后一行只剩开头几个字符，没有换行
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            self.assertEqual(sum("最后一行没写完" in w for w in report["warnings"]), 2)
+            self.assertEqual(report["images"]["total"], n_img - 1)
+
 
 if __name__ == "__main__":
     unittest.main()

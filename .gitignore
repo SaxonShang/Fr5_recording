@@ -1,6 +1,9 @@
 # 从 Box 拷来的录制数据（图像很大），只放在本机
 data/
 
+# 检索结果与研究笔记，仅保留在本机
+exa-results/
+
 # Python 缓存
 __pycache__/
 *.pyc
