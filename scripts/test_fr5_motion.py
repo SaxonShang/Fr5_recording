@@ -318,6 +318,74 @@ class PlanTest(unittest.TestCase):
         far[:3, 3] += [0.05, 0.0, 0.0]                                          # 终点仍在范围外
         self.assertTrue(any("100%" in m for m in run(away, far, recorded=False)))
 
+    def test_translation_paths_and_one_sided_wiggle(self):
+        """每对方向的行程中点按（前, 左, 上）偏移、各自的行程；同步摆动只往左转（朝向在 0～+10°），最后回到原朝向。"""
+        paths = {"forward_backward": ((-5.0, 150.0, -100.0), 0.45), "left_right": ((-50.0, 45.0, 50.0), 0.53),
+                 "up_down": ((-100.0, 250.0, 75.0), 0.57)}
+        cfg = dataclasses.replace(CFG, translation_paths=paths, translation_wiggle_side=1)
+        c = self.centre
+        fwd, left, up = c[:3, 2], -c[:3, 0], np.array([0, 0, 1.0])
+        for name in fm.DIRECTIONS:
+            (df, dl, du), stroke = paths[fm.TRANSLATION_PAIRS[name]]
+            by = {s.name: s for s in fm.plan_recording(name, c, F_T_C, cfg)}
+            start, end = by["goto_start"].camera, by["translate"].camera
+            mid = (start[:3, 3] + end[:3, 3]) / 2
+            np.testing.assert_allclose(mid, c[:3, 3] + (df * fwd + dl * left + du * up) / 1000.0, atol=1e-12)
+            self.assertAlmostEqual(np.linalg.norm(end[:3, 3] - start[:3, 3]), stroke, places=12)
+            self.assertLess(fm.rotation_deg(end, c), 1e-9)
+            for prefix, base in (("wiggle_start", start), ("wiggle_end", end)):
+                wig = [s for s in by.values() if s.name.startswith(prefix)]
+                self.assertEqual(len(wig), 2 * cfg.wiggle_cycles)
+                for s in wig:
+                    z = base[:3, :3].T @ s.camera[:3, 2]                 # 光轴在本段起点相机系里
+                    heading = np.degrees(np.arctan2(-z[0], z[2]))         # 正 = 向左
+                    self.assertTrue(-1e-9 <= heading <= cfg.wiggle_deg + 1e-9, (name, s.name, heading))
+                    np.testing.assert_allclose(s.camera[:3, 3], base[:3, 3], atol=1e-12)
+                self.assertLess(fm.rotation_deg(wig[-1].camera, base), 1e-9)
+        # sync-test 也只往左摆
+        sync = [s for s in fm.plan_sync_test(c, F_T_C, cfg) if s.name.startswith("wiggle")]
+        self.assertTrue(all(np.degrees(np.arctan2(-(c[:3, :3].T @ s.camera[:3, 2])[0], (c[:3, :3].T @ s.camera[:3, 2])[2]))
+                            >= -1e-9 for s in sync))
+        # 不给路径时和以前一样：以起点为中点、行程 stroke_m、两边摆
+        by = {s.name: s for s in fm.plan_recording("right", c, F_T_C, CFG)}
+        np.testing.assert_allclose((by["goto_start"].camera[:3, 3] + by["translate"].camera[:3, 3]) / 2, c[:3, 3], atol=1e-12)
+
+    def test_joint_speed_check(self):
+        """假逆解：关节 = 法兰位姿 / 10。按预计速度算出的关节速度和上限比较；只查录制段。"""
+        class FakeIK:
+            def GetInverseKinRef(self, typ, pose, ref):
+                return 0, [v / 10.0 for v in pose]
+        flange0 = self.centre @ np.linalg.inv(F_T_C)
+        wide = ([-1e4] * 6, [1e4] * 6)
+        segs = fm.plan_recording("right", self.centre, F_T_C, CFG)
+        self.assertEqual(fm.check_plan(FakeIK(), segs, flange0, [0.0] * 6, F_T_C, *wide, 100.0, 0.0), [])
+        self.assertEqual(fm.apply_speed(segs, MODEL, 1.0), [])
+        by = {s.name: s for s in segs}
+        tr = by["translate"]
+        d = np.subtract(tr.flange[:3], by["goto_start"].flange[:3])
+        rate = np.abs(d).max() / np.linalg.norm(d) / 10.0          # 变得最快的关节：每 mm 几度
+        self.assertAlmostEqual(tr.joint_rate, rate, places=6)
+        w = rate * 50.0
+        self.assertEqual(fm.joint_speed_problems(segs, 1.01 * w), [])
+        self.assertAlmostEqual(tr.log["max_joint_speed_deg_s"], w, places=6)
+        found = fm.joint_speed_problems(segs, 0.99 * w)
+        self.assertTrue(any(m.startswith("translate:") for m in found), found)
+        self.assertFalse(any(m.startswith("goto_start") for m in found))          # 不录制的移动不查
+        fm.apply_speed(segs, MODEL, 0.5)                                       # 降速（--scale 0.5）后关节也慢一半
+        self.assertEqual([m for m in fm.joint_speed_problems(segs, 0.99 * w) if m.startswith("translate")], [])
+        # 有实测加速度：两端在加减速，关节速度按梯形曲线算。这条路径上关节速率处处相同，最快仍是匀速段
+        fm.apply_speed(segs, MODEL, 1.0)
+        accel = dataclasses.replace(MODEL, accel_mm_s2=1000.0)
+        fm.joint_speed_problems(segs, 1e9, accel)
+        self.assertAlmostEqual(tr.log["max_joint_speed_deg_s"], w, delta=0.01 * w)
+        # 只有终点附近关节变得快（像靠近奇异位形）：匀速估算会超，按减速段算就不超
+        tr.joint_rates = [(u, r if u < 0.97 else 3 * r) for u, r in tr.joint_rates]
+        tr.joint_rate = 3 * rate
+        self.assertTrue(fm.joint_speed_problems([tr], 1.5 * w))                  # 没有加速度：3w > 1.5w
+        self.assertTrue(fm.joint_speed_problems([tr], 1.5 * w, accel))           # 加速很快：终点前仍是满速
+        slow = dataclasses.replace(MODEL, accel_mm_s2=20.0)                     # 最后 5 mm 处速度 √(2·20·5) ≈ 14 mm/s
+        self.assertEqual(fm.joint_speed_problems([tr], 1.5 * w, slow), [])
+
     def test_movec_test_plan(self):
         segs = fm.plan_movec_test(self.centre, F_T_C, CFG, 5.0)
         flange0 = self.centre @ np.linalg.inv(F_T_C)
@@ -678,21 +746,30 @@ class ParametersTest(unittest.TestCase):
         except ImportError as exc:  # 笔记本上没装 fairino 时跳过
             self.skipTest(str(exc))
         self.assertEqual(rs.parameter_problems(), [])
-        old = rs.SPEED_MPS
-        try:
-            rs.SPEED_MPS = 0.2
-            self.assertTrue(any("超出允许范围" in m for m in rs.parameter_problems()))
-            rs.RANGES["SPEED_MPS"] = (0.02, 0.5)
-            self.assertTrue(any("模糊" in m for m in rs.parameter_problems()))
-        finally:
-            rs.SPEED_MPS = old
-            rs.RANGES["SPEED_MPS"] = (0.02, 0.10)
-        old = rs.ROT_DEG_S
-        try:
-            rs.ROT_DEG_S = 10.0                                  # 范围内，但 10 ms 曝光下模糊 1.28 px
-            self.assertTrue(any(m.startswith("旋转") and "模糊" in m for m in rs.parameter_problems()))
-        finally:
-            rs.ROT_DEG_S = old
+
+        def problems_with(**kw):
+            old = {k: getattr(rs, k) for k in kw}
+            try:
+                for k, v in kw.items():
+                    setattr(rs, k, v)
+                return rs.parameter_problems()
+            finally:
+                for k, v in old.items():
+                    setattr(rs, k, v)
+        self.assertTrue(any("超出允许范围" in m for m in problems_with(SPEED_MPS=0.7)))
+        found = problems_with(EXPOSURE_US=10000)          # 0.5 m/s、50 °/s 时 10 ms 曝光模糊太大
+        self.assertTrue(any(m.startswith("速度") and "模糊" in m for m in found), found)
+        self.assertTrue(any(m.startswith("旋转") and "模糊" in m for m in found), found)
+        self.assertTrue(any("CAMERA_FPS" in m for m in problems_with(CAMERA_FPS=25)))
+        self.assertTrue(any("TRANSLATION_WIGGLE_SIDE" in m for m in problems_with(TRANSLATION_WIGGLE_SIDE=0.5)))
+        self.assertTrue(any("PATH_SET" in m for m in problems_with(PATH_SET="fast 1")))
+        paths = dict(rs.TRANSLATION_PATHS)
+        del paths["up_down"]
+        self.assertTrue(any("正好有这几对" in m for m in problems_with(TRANSLATION_PATHS=paths)))
+        paths = {**rs.TRANSLATION_PATHS, "up_down": ((0.0, 400.0, 0.0), 0.3)}
+        self.assertTrue(any("偏移超过" in m for m in problems_with(TRANSLATION_PATHS=paths)))
+        paths = {**rs.TRANSLATION_PATHS, "up_down": ((0.0, 0.0, 0.0), 0.8)}
+        self.assertTrue(any("行程 0.8 m 超出" in m for m in problems_with(TRANSLATION_PATHS=paths)))
 
     def test_joint_limits_cover_traversed_range(self):
         try:
@@ -713,8 +790,8 @@ class ParametersTest(unittest.TestCase):
             self.assertIn(name, rs.RECORD_NAMES)
 
     def test_glass_clearance_defaults(self):
-        """真实起点和手眼外参下，默认参数的 6 条旋转录制画面离玻璃窗都 ≥ GLASS_MARGIN_DEG；
-        10-13 演练过的偏航 30°（中心 +8°）会拍到左窗，被拒绝。"""
+        """真实起点和手眼外参下，默认参数的全部录制（平移按 WINDOW_DISTANCE_M 算视差）画面离右窗都 ≥ GLASS_MARGIN_DEG；
+        左窗可以拍（用户 10-13 定）：偏航往左转到 +22.75° 也通过；中心朝向往右挪到 −5° 时右端碰到右窗，被拒绝。"""
         try:
             import run_session as rs
         except ImportError as exc:
@@ -724,18 +801,21 @@ class ParametersTest(unittest.TestCase):
         f_t_c, _ = gt.load_handeye(here / "handeye_s003_result.json")
         start = np.array(json.loads((here / "start_pose.json").read_text(encoding="utf-8"))["base_T_camera"])
         cfg = rs.motion_config()
-        for name in fm.ROTATIONS:
-            segs = fm.plan_recording(name, start, f_t_c, cfg)
+        for name in [*rs.RECORD_NAMES, "sync-test"]:
+            segs = (fm.plan_sync_test(start, f_t_c, cfg) if name == "sync-test"
+                    else fm.plan_recording(name, start, f_t_c, cfg))
             note, found = rs.pose_note(name, segs, start, f_t_c)
             self.assertEqual(found, [], name)
             self.assertIn("玻璃窗最近", note)
-        old = (rs.YAW_DEG, rs.YAW_HEADING_DEG)
+        segs = fm.plan_recording("yaw_left", start, f_t_c, cfg)
+        self.assertGreater(fm.pose_span(segs, start, f_t_c)["heading"][1], 22.0)
+        old = rs.YAW_HEADING_DEG
         try:
-            rs.YAW_DEG, rs.YAW_HEADING_DEG = 30.0, 8.0
-            segs = fm.plan_recording("yaw_left", start, f_t_c, rs.motion_config())
-            self.assertTrue(rs.pose_note("yaw_left", segs, start, f_t_c)[1])
+            rs.YAW_HEADING_DEG = -5.0
+            segs = fm.plan_recording("yaw_right", start, f_t_c, rs.motion_config())
+            self.assertTrue(rs.pose_note("yaw_right", segs, start, f_t_c)[1])
         finally:
-            rs.YAW_DEG, rs.YAW_HEADING_DEG = old
+            rs.YAW_HEADING_DEG = old
 
 
 class GlassTest(unittest.TestCase):
@@ -789,6 +869,27 @@ class GlassTest(unittest.TestCase):
         self.assertAlmostEqual(near[1] - near[2], 2.0, delta=0.02)
 
 
+class GlassParallaxTest(unittest.TestCase):
+    def test_translation_parallax(self):
+        """右边 −60° 处一小块玻璃，离起点 7 m：相机向右平移 0.3 m 后，它在画面里的方位变成 −atan((7 sin60 − 0.3)/(7 cos60))，
+        离画面右边缘更近。不给距离时只看朝向，平移不改变结果。"""
+        c = fm.level_camera(NOW)
+        right = c.copy()
+        right[:3, 3] += c[:3, 0] * 0.3
+        segs = [fm._move("goto_start", c, F_T_C, 50.0, recorded=False), fm._move("translate", right, F_T_C, 50.0)]
+        region = [(-61.0, -60.0, -0.5, 0.5)]
+        w, h, f, cx, cy = fm.IMAGE_1080
+        half = np.degrees(np.arctan((w - cx) / f))
+        flat, _ = fm.glass_clearance(segs, c, F_T_C, region)
+        near, where = fm.glass_clearance(segs, c, F_T_C, region, distance_m=7.0)
+        az = np.degrees(np.arctan((7 * np.sin(np.radians(60)) - 0.3) / (7 * np.cos(np.radians(60)))))
+        self.assertAlmostEqual(flat, 60.0 - half, delta=0.02)
+        self.assertAlmostEqual(near, az - half, delta=0.02)
+        self.assertEqual(where, "translate")
+        far, _ = fm.glass_clearance(segs, c, F_T_C, region, distance_m=1e6)     # 很远：视差可以忽略
+        self.assertAlmostEqual(far, flat, delta=1e-3)
+
+
 class _FakeZedProc:
     """zed_record 子进程的替身：crash_rc 不为 None 时表示停止前已经退出。"""
 
@@ -823,6 +924,15 @@ class ZedRecordTest(unittest.TestCase):
             self.assertEqual((info["returncode"], info["exited_before_stop"]), (0, False))
             info = self._stopped(d, _FakeZedProc(crash_rc=-11))
             self.assertEqual((info["returncode"], info["exited_before_stop"]), (-11, True))
+
+    def test_fps_argument(self):
+        from zed_capture import ZedRecord
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.assertNotIn("--fps", ZedRecord(d / "bin", d, 10000, 1000).args)       # 15 fps：旧版 zed_record 也能用
+            args = ZedRecord(d / "bin", d, 2500, 13000, 30).args
+            self.assertEqual(args[args.index("--fps") + 1], "30")
+            self.assertEqual(args[args.index("--exposure-us") + 1], "2500")
 
     def test_zed_failure(self):
         """10-13 10:50 zed_record 停止时段错误（返回码 -11），没写 time_meta.txt，run_session 却当成正常。"""

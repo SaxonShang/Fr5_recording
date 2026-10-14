@@ -23,9 +23,11 @@ def camera_users() -> list[str]:
 class ZedRecord:
     """以子进程运行 zed_record。用硬链接放进录制目录，它的 save_data/ 就写在这条录制自己的目录里。"""
 
-    def __init__(self, binary: Path, session_dir: Path, exposure_us: int, analog_gain_mdb: int):
+    def __init__(self, binary: Path, session_dir: Path, exposure_us: int, analog_gain_mdb: int, fps: int = 15):
         self.binary, self.session_dir = binary, session_dir
         self.args = ["--exposure-us", str(exposure_us), "--analog-gain-mdb", str(analog_gain_mdb)]
+        if fps != 15:                     # 默认 15 fps 时不传，旧版 zed_record（没有 --fps）也能用
+            self.args += ["--fps", str(fps)]
         self.link = session_dir / "zed_record"
         self.lines, self.proc, self.reader = [], None, None
         self.grabbing = threading.Event()

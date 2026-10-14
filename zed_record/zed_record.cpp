@@ -31,8 +31,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -52,6 +54,9 @@ namespace fs = std::filesystem;
 // 全局
 // ============================================================
 static std::atomic<bool> g_running{true};
+// 相机帧率；运行时可用 --fps 15|30|60 覆盖（见 main）
+static constexpr int kDefaultCameraFps = 15;
+static int g_camera_fps = kDefaultCameraFps;
 static std::mutex g_log_mtx;
 
 using SteadyClock = std::chrono::steady_clock;
@@ -325,18 +330,21 @@ class ImageTimeline {
     }
   }
 
-  void write_row(uint64_t zed_ms, uint64_t zed_imu_ns,
-                 const std::string& filename_left,
-                 const std::string& filename_right = {}) {
+  // seq：取帧顺序编号（从 0 起，每帧一个）。多个存图线程完成顺序不定，先按编号排好再按顺序写；
+  // row 为空表示这一帧没存成（跳过）。
+  void write_row(uint64_t seq, std::optional<std::string> row) {
     std::lock_guard<std::mutex> lock(mtx_);
-    if (!ofs_) {
-      return;
-    }
-    ofs_ << zed_ms << ',' << zed_imu_ns << ',' << filename_left << ','
-         << filename_right << '\n';
-    ++rows_;
-    if ((rows_ % 15) == 0) {
-      ofs_.flush();
+    pending_[seq] = std::move(row);
+    while (!pending_.empty() && pending_.begin()->first == next_seq_) {
+      if (pending_.begin()->second && ofs_) {
+        ofs_ << *pending_.begin()->second << '\n';
+        ++rows_;
+        if ((rows_ % g_camera_fps) == 0) {
+          ofs_.flush();
+        }
+      }
+      pending_.erase(pending_.begin());
+      ++next_seq_;
     }
   }
 
@@ -358,13 +366,14 @@ class ImageTimeline {
   fs::path path_;
   std::ofstream ofs_;
   uint64_t rows_ = 0;
+  uint64_t next_seq_ = 0;
+  std::map<uint64_t, std::optional<std::string>> pending_;
 };
 
 // ============================================================
-// ZED 初始化（软件 15 FPS 自由运行，不依赖外部触发）
+// ZED 初始化（软件 FPS 自由运行，默认 15，--fps 可改；不依赖外部触发）
 // ============================================================
 // 全手动曝光（ZED X）。单位：EXPOSURE_TIME=μs，ANALOG_GAIN=mdB。
-static constexpr int kCameraFps = 15;
 // 曝光和模拟增益的默认值；运行时可用 --exposure-us / --analog-gain-mdb 覆盖（见 main）
 static constexpr int kDefaultExposureUs = 10000;     // 10ms
 static constexpr int kDefaultAnalogGainMdB = 1000;  // 约 1000–16000，偏暗再调大
@@ -417,12 +426,12 @@ std::unique_ptr<sl::Camera> init_zedx() {
   auto zed = std::make_unique<sl::Camera>();
   sl::InitParameters init_params;
   init_params.camera_resolution = sl::RESOLUTION::HD1080;
-  init_params.camera_fps = kCameraFps;
+  init_params.camera_fps = g_camera_fps;
   init_params.depth_mode = sl::DEPTH_MODE::NONE;
   init_params.camera_image_flip = sl::FLIP_MODE::OFF;
   init_params.camera_disable_self_calib = true;
 
-  log_line("正在打开 ZED X 相机... (软件 FPS=" + std::to_string(kCameraFps) +
+  log_line("正在打开 ZED X 相机... (软件 FPS=" + std::to_string(g_camera_fps) +
            ", 自由运行，不使用硬件触发)");
   const sl::ERROR_CODE err = zed->open(init_params);
   if (err != sl::ERROR_CODE::SUCCESS) {
@@ -531,7 +540,7 @@ void grab_thread_func(sl::Camera* zed, BoundedQueue<ZedFrameItem>& image_q,
       }
       if (last_ts != 0) {
         const double diff = static_cast<double>(current_ts - last_ts);
-        if (frame_count <= 5 || (frame_count % 15) == 0) {
+        if (frame_count <= 5 || (frame_count % g_camera_fps) == 0) {
           std::ostringstream oss;
           oss << "ZED 捕获 #" << frame_count << " ts=" << current_ts
               << " ms, 间隔=" << std::fixed << std::setprecision(2) << diff
@@ -643,49 +652,74 @@ static fs::path unique_jpg_path(const fs::path& image_dir, uint64_t ts_ms) {
 }
 
 // ============================================================
-// ZED 存图线程：左目 left/、右目 right/；文件名用 zed_timestamp_ms
+// ZED 存图线程（kSaveThreads 个并行）：左目 left/、右目 right/；文件名用 zed_timestamp_ms
 // ============================================================
-void zed_save_thread_func(BoundedQueue<ZedFrameItem>& image_q,
+static constexpr int kSaveThreads = 3;   // 30 fps 时单线程 JPEG 编码只到约 20 fps（10-14 实测）
+
+struct SaveShared {
+  std::mutex take_mtx;                  // 取帧 + 编号，保证编号就是取帧顺序
+  uint64_t next_seq = 0;
+  std::mutex path_mtx;                  // unique_jpg_path 查重名 + 占位，避免两个线程取到同一个文件名
+  std::atomic<uint64_t> saved{0};
+};
+
+static fs::path claim_jpg_path(SaveShared& shared, const fs::path& image_dir, uint64_t ts_ms) {
+  std::lock_guard<std::mutex> lock(shared.path_mtx);
+  const fs::path path = unique_jpg_path(image_dir, ts_ms);
+  std::ofstream(path).close();          // 先占住文件名，随后由 SDK 覆盖写入
+  return path;
+}
+
+void zed_save_thread_func(BoundedQueue<ZedFrameItem>& image_q, SaveShared& shared,
                           ImageTimeline& timeline, const fs::path& left_dir,
                           const fs::path& right_dir) {
   try_avoid_last_cpu("存图线程");
   try_lower_nice(10, "存图线程");
-  uint64_t saved = 0;
   while (true) {
     ZedFrameItem item;
-    if (!image_q.pop(item)) {
-      break;
+    uint64_t seq = 0;
+    {
+      std::lock_guard<std::mutex> lock(shared.take_mtx);
+      if (!image_q.pop(item)) {
+        break;
+      }
+      seq = shared.next_seq++;
     }
-    const fs::path path_l = unique_jpg_path(left_dir, item.timestamp_ms);
+    const fs::path path_l = claim_jpg_path(shared, left_dir, item.timestamp_ms);
     const sl::ERROR_CODE wr_l = item.image.write(path_l.string().c_str());
     if (wr_l != sl::ERROR_CODE::SUCCESS) {
       log_line(std::string("存左目失败: ") + path_l.string() + " -> " +
                sl::toString(wr_l).c_str());
+      std::error_code ec;
+      fs::remove(path_l, ec);
+      timeline.write_row(seq, std::nullopt);
       continue;
     }
     std::string name_r;
     if (item.image_right.getWidth() > 0) {
-      const fs::path path_r = unique_jpg_path(right_dir, item.timestamp_ms);
+      const fs::path path_r = claim_jpg_path(shared, right_dir, item.timestamp_ms);
       const sl::ERROR_CODE wr_r =
           item.image_right.write(path_r.string().c_str());
       if (wr_r != sl::ERROR_CODE::SUCCESS) {
         log_line(std::string("存右目失败: ") + path_r.string() + " -> " +
                  sl::toString(wr_r).c_str());
+        std::error_code ec;
+        fs::remove(path_r, ec);
       } else {
         name_r = (fs::path("right") / path_r.filename()).string();
       }
     }
-    timeline.write_row(item.timestamp_ms, item.zed_imu_ns,
-                       (fs::path("left") / path_l.filename()).string(), name_r);
-    ++saved;
+    std::ostringstream row;
+    row << item.timestamp_ms << ',' << item.zed_imu_ns << ','
+        << (fs::path("left") / path_l.filename()).string() << ',' << name_r;
+    timeline.write_row(seq, row.str());
+    const uint64_t saved = ++shared.saved;
     if (saved <= 3 || (saved % 30) == 0) {
       log_line("已保存 ZED 双目 #" + std::to_string(saved) + ": left/" +
                path_l.filename().string() +
                (name_r.empty() ? "" : (" + " + name_r)));
     }
   }
-  log_line("ZED 存图线程结束，共保存 " + std::to_string(saved) + " 对，丢弃队列 " +
-           std::to_string(image_q.dropped()) + " 帧");
 }
 
 void csv_save_thread_func(BoundedQueue<ZedImuSample>& zed_imu_q,
@@ -747,7 +781,7 @@ static bool write_time_meta(const fs::path& path, uint64_t image_rows) {
   ofs << "mode=zed_sdk_free_run\n";
   ofs << "description=grab_stereo_image_and_body_imu_from_sdk; "
          "no_fpga_trigger; no_calib_lock_first_frame\n";
-  ofs << "camera_fps=" << kCameraFps << '\n';
+  ofs << "camera_fps=" << g_camera_fps << '\n';
   ofs << "resolution=HD1080\n";
   ofs << "exposure_us=" << g_exposure_us << '\n';
   ofs << "analog_gain_mdb=" << g_analog_gain_mdb << '\n';
@@ -780,11 +814,16 @@ int main(int argc, char** argv) {
     } else if (arg == "--analog-gain-mdb" && i + 1 < argc &&
                parse_int_arg(argv[i + 1], 1000, 16000, &g_analog_gain_mdb)) {
       ++i;
+    } else if (arg == "--fps" && i + 1 < argc &&
+               parse_int_arg(argv[i + 1], 15, 60, &g_camera_fps) &&
+               (g_camera_fps == 15 || g_camera_fps == 30 || g_camera_fps == 60)) {
+      ++i;
     } else {
       std::cerr << "用法: " << argv[0]
-                << " [--exposure-us 100..60000] [--analog-gain-mdb 1000..16000]\n"
+                << " [--exposure-us 100..60000] [--analog-gain-mdb 1000..16000] [--fps 15|30|60]\n"
                 << "默认: --exposure-us " << kDefaultExposureUs
-                << " --analog-gain-mdb " << kDefaultAnalogGainMdB << std::endl;
+                << " --analog-gain-mdb " << kDefaultAnalogGainMdB
+                << " --fps " << kDefaultCameraFps << std::endl;
       return 2;
     }
   }
@@ -819,7 +858,7 @@ int main(int argc, char** argv) {
   log_line("  图像时间线: " + timeline_path.string());
   log_line("时间戳直接用 SDK：zed_timestamp_ms / zed_imu_timestamp_ns。");
   log_line("曝光设定: " + std::to_string(g_exposure_us) + " us, 模拟增益: " +
-           std::to_string(g_analog_gain_mdb) + " mdB");
+           std::to_string(g_analog_gain_mdb) + " mdB, 帧率: " + std::to_string(g_camera_fps) + " fps");
 
   auto zed = init_zedx();
   if (!zed) {
@@ -845,8 +884,12 @@ int main(int argc, char** argv) {
 
   std::thread grab_th(grab_thread_func, zed.get(), std::ref(image_q),
                       std::ref(zed_imu_q), std::ref(stop_event));
-  std::thread zed_save_th(zed_save_thread_func, std::ref(save_q),
-                          std::ref(timeline), left_dir, right_dir);
+  SaveShared save_shared;
+  std::vector<std::thread> zed_save_ths;
+  for (int k = 0; k < kSaveThreads; ++k) {
+    zed_save_ths.emplace_back(zed_save_thread_func, std::ref(save_q), std::ref(save_shared),
+                              std::ref(timeline), left_dir, right_dir);
+  }
   std::thread csv_save_th(csv_save_thread_func, std::ref(zed_imu_q),
                           zed_imu_csv_path);
 
@@ -894,9 +937,14 @@ int main(int argc, char** argv) {
   save_q.stop();
   image_q.stop();
   zed_imu_q.stop();
-  if (zed_save_th.joinable()) {
-    zed_save_th.join();
+  for (auto& th : zed_save_ths) {
+    if (th.joinable()) {
+      th.join();
+    }
   }
+  log_line("ZED 存图线程结束（" + std::to_string(kSaveThreads) + " 个），共保存 " +
+           std::to_string(save_shared.saved.load()) + " 对，丢弃队列 " +
+           std::to_string(save_q.dropped()) + " 帧");
   if (csv_save_th.joinable()) {
     csv_save_th.join();
   }

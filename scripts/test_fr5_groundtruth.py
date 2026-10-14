@@ -274,7 +274,7 @@ class SyntheticSessionTest(unittest.TestCase):
             axis = np.array([1.0, 0.0, 0.0])                                     # 合成平移主要沿 x
             write_motion_log(d, "record", "right", P0, P0 + 0.3 * axis)
             report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
-            k = gt.TRAVEL_SCALE["right"]
+            k = gt.TRAVEL_SCALE["base"]["right"]
             self.assertEqual(report["travel_scale"]["factor"], k)
             fixed, raw = read_tum(d / "groundtruth_tum.txt"), read_tum(d / "groundtruth_tum_uncorrected.txt")
             np.testing.assert_array_equal(fixed[:, 0], raw[:, 0])
@@ -298,6 +298,32 @@ class SyntheticSessionTest(unittest.TestCase):
             self.assertEqual(report["travel_scale"]["source"], "none")
             self.assertEqual(report["rotation_scale"]["source"], "none")              # 没有转轴
 
+    def test_path_set_lookup(self):
+        """motion_log 里记了路径组（高速录制）：按组查系数；表里没有的方向不缩放并报警，旧录制（没记）按 base。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0))
+            axis = np.array([1.0, 0.0, 0.0])
+            segs = [{"name": "goto_start", "flange": [*(P0 * 1000), 0, 0, 0]},
+                    {"name": "translate", "flange": [*((P0 + 0.3 * axis) * 1000), 0, 0, 0]}]
+            for group, factor, warned in ((None, gt.TRAVEL_SCALE["base"]["right"], False), ("base", gt.TRAVEL_SCALE["base"]["right"], False),
+                                          ("fast1", 1.0, True)):
+                log = {"kind": "record", "direction": "right", "segments": segs}
+                if group:
+                    log["parameters"] = {"PATH_SET": group}
+                (d / "motion_log.json").write_text(json.dumps(log))
+                report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+                ts = report["travel_scale"]
+                self.assertEqual((ts["factor"], ts["path_set"]), (factor, group or "base"))
+                self.assertEqual(ts["source"], "unverified" if warned else "TRAVEL_SCALE")
+                self.assertEqual(any("还没有用标定板验证过行程系数" in w for w in report["warnings"]), warned)
+                if warned:
+                    np.testing.assert_array_equal(read_tum(d / "groundtruth_tum.txt"),
+                                                  read_tum(d / "groundtruth_tum_uncorrected.txt"))
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0, scale_factor=1.002)
+            self.assertEqual((report["travel_scale"]["factor"], report["travel_scale"]["source"]), (1.002, "manual"))
+            self.assertFalse(any("还没有用标定板验证" in w for w in report["warnings"]))
+
     def test_rotation_scale_about_pivot(self):
         """俯仰旋转录制：真值姿态相对起点、绕转轴的转角放大 k 倍，其他方向不变，光心不动。"""
         def rotation_log(direction):
@@ -313,7 +339,7 @@ class SyntheticSessionTest(unittest.TestCase):
             rotation_log("pitch_up")
             report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
             self.assertEqual(report["warnings"], [])
-            k = gt.ROTATION_SCALE["pitch_up"]
+            k = gt.ROTATION_SCALE["base"]["pitch_up"]
             self.assertEqual(report["rotation_scale"]["factor"], k)
             self.assertEqual(report["travel_scale"]["factor"], 1.0)
             fixed, raw = read_tum(d / "groundtruth_tum.txt"), read_tum(d / "groundtruth_tum_uncorrected.txt")
@@ -333,8 +359,20 @@ class SyntheticSessionTest(unittest.TestCase):
             rotation_log("yaw_left")                                                    # 偏航不修正
             report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
             self.assertEqual(report["rotation_scale"]["factor"], 1.0)
+            self.assertEqual(report["warnings"], [])
             fixed = read_tum(d / "groundtruth_tum.txt")
             np.testing.assert_array_equal(fixed, read_tum(d / "groundtruth_tum_uncorrected.txt"))
+
+            # 高速路径组 fast1：俯仰同一条路径，系数相同；偏航 30° 是新路径，不修正并报警
+            for direction, factor, warned in (("pitch_up", gt.ROTATION_SCALE["fast1"]["pitch_up"], False),
+                                              ("yaw_left", 1.0, True)):
+                rotation_log(direction)
+                log = json.loads((d / "motion_log.json").read_text())
+                log["parameters"] = {"PATH_SET": "fast1"}
+                (d / "motion_log.json").write_text(json.dumps(log))
+                report = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+                self.assertEqual(report["rotation_scale"]["factor"], factor)
+                self.assertEqual(any("还没有用标定板验证过转角系数" in w for w in report["warnings"]), warned)
 
     def test_duplicate_timestamp_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:

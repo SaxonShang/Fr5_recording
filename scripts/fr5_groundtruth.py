@@ -60,13 +60,21 @@ MAX_EXPOSURE_SD_MS = 3.0   # 各帧曝光中心偏差的标准差上限
 # 标定板验证（2026-10-12，见 data_recording/实验记录.md）得到的修正
 TIME_CORRECTION_MS = 4.27            # 真值比图像晚的固定量（3 条录制、12 个位置平均，±0.26 ms）
 TIME_CORRECTION_EXPOSURE_US = 10000  # 上面的值是在这个曝光下测的；曝光不同时报警
-# 机械臂实际行程 / 报告行程，按录制方向。只适用于 start_pose.json 起点 ±150 mm 的这 6 段平移
-TRAVEL_SCALE = {"right": 1.0070, "left": 1.0070, "up": 1.0070, "down": 1.0070,
-                "forward": 1.0015, "backward": 1.0015}
-# 机械臂实际转角 / 报告转角，按录制方向（2026-10-13 标定板验证：pitch_up 3 条 +0.39～+0.46%，平均 +0.43%；
-# pitch_down 2 条 +0.50、+0.54%，平均 +0.52%）。只适用于 start_pose.json 起点、俯仰 ±15° 的这两条旋转路径；
-# 偏航、横滚实测在 ±0.03% 以内，不修正
-ROTATION_SCALE = {"pitch_up": 1.0043, "pitch_down": 1.0052}
+# 行程、转角系数按路径组（motion_log.json 里 parameters.PATH_SET；10-12 / 10-13 的录制没有这一项，是 "base"）
+# 和录制方向查。表里没有的方向不缩放、并报警（这条路径还没用标定板验证过）。
+# 机械臂实际行程 / 报告行程。base：start_pose.json 起点 ±150 mm 的 6 段平移（2026-10-10/12 标定板验证）
+TRAVEL_SCALE = {
+    "base": {"right": 1.0070, "left": 1.0070, "up": 1.0070, "down": 1.0070,
+             "forward": 1.0015, "backward": 1.0015},
+    "fast1": {},              # 高速录制的新平移路径，待标定板验证
+}
+# 机械臂实际转角 / 报告转角（2026-10-13 标定板验证：pitch_up 3 条 +0.39～+0.46%，平均 +0.43%；
+# pitch_down 2 条 +0.50、+0.54%，平均 +0.52%；偏航 10°、横滚 30° 在 ±0.03% 以内，不修正）。
+ROTATION_SCALE = {
+    "base": {"pitch_up": 1.0043, "pitch_down": 1.0052, "yaw_left": 1.0, "yaw_right": 1.0,
+             "roll_left": 1.0, "roll_right": 1.0},
+    "fast1": {"pitch_up": 1.0043, "pitch_down": 1.0052},   # 俯仰和 base 同一条路径；偏航 30°、横滚 90° 待验证
+}
 
 ARM_COLUMNS = ["box_realtime_ns", "ctrl_unix_ms", "x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg",
                "robot_state", "main_code", "sub_code", "tool", "user"]
@@ -409,6 +417,22 @@ def camera_pose(p_flange, q_flange, flange_t_cam):
     return t_c, matrix_to_quat(r_c)
 
 
+def path_set(log: dict) -> str:
+    """录制用的路径组（run_session.PATH_SET）；10-12 / 10-13 的录制没有记，是 base。"""
+    return str((log.get("parameters") or {}).get("PATH_SET") or "base")
+
+
+def _lookup(table: dict, log: dict, direction, factor: float | None, source: str) -> dict:
+    """按路径组和方向查系数。factor 给了就用它（manual）；表里没有这个方向时为 1，标出 unverified。"""
+    group = path_set(log)
+    if factor is not None:
+        return {"factor": float(factor), "source": "manual", "path_set": group}
+    known = table.get(group, {})
+    if direction not in known:
+        return {"factor": 1.0, "source": "unverified", "path_set": group}
+    return {"factor": float(known[direction]), "source": source, "path_set": group}
+
+
 def travel_scale(session: Path, factor: float | None = None) -> dict:
     """本条录制的行程放大：方向、路径起点（法兰，m）和系数。factor=None 时按 TRAVEL_SCALE 取。"""
     path = session / "motion_log.json"
@@ -419,8 +443,7 @@ def travel_scale(session: Path, factor: float | None = None) -> dict:
     start = np.array(segs["goto_start"]["flange"][:3], dtype=float) / 1000.0
     end = np.array(segs["translate"]["flange"][:3], dtype=float) / 1000.0
     direction = log.get("direction")
-    return {"factor": float(TRAVEL_SCALE.get(direction, 1.0) if factor is None else factor),
-            "source": "TRAVEL_SCALE" if factor is None else "manual", "direction": direction,
+    return {**_lookup(TRAVEL_SCALE, log, direction, factor, "TRAVEL_SCALE"), "direction": direction,
             "origin_flange_m": start.tolist(), "axis_base": ((end - start) / np.linalg.norm(end - start)).tolist()}
 
 
@@ -442,8 +465,7 @@ def rotation_scale(session: Path, factor: float | None = None) -> dict:
         return {"factor": 1.0, "source": "none", "note": "不是旋转录制（或没有 motion_log.json），不放大转角"}
     direction = log.get("direction")
     axis = np.array(rot["arc_axis"], dtype=float)
-    return {"factor": float(ROTATION_SCALE.get(direction, 1.0) if factor is None else factor),
-            "source": "ROTATION_SCALE" if factor is None else "manual", "direction": direction,
+    return {**_lookup(ROTATION_SCALE, log, direction, factor, "ROTATION_SCALE"), "direction": direction,
             "origin_flange": [float(v) for v in segs["goto_start"]["flange"]],
             "axis_base": (axis / np.linalg.norm(axis)).tolist(), "pivot_m": [float(v) for v in rot["pivot_m"]]}
 
@@ -576,6 +598,9 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
     scale = travel_scale(session, scale_factor)
     pos_c = apply_travel_scale(pos, scale)
     rscale = rotation_scale(session, rotation_factor)
+    for s, what in ((scale, "行程"), (rscale, "转角")):
+        if s["source"] == "unverified":
+            warnings.append(f"路径组 {s['path_set']} 的 {s['direction']} 还没有用标定板验证过{what}系数，没有修正")
     pos_c, quat_c = apply_rotation_scale(pos_c, quat, rscale)
 
     # 4. 真值（t_arm_cam 对齐陀螺仪，t_arm_img 再对齐到图像）

@@ -32,6 +32,11 @@ DIRECTIONS = {               # 平移：方向名 -> (相机系轴名, 符号)�
     "right": ("x", +1), "left": ("x", -1),
     "up": ("up", +1), "down": ("up", -1),
 }
+TRANSLATION_PAIRS = {        # 平移方向 -> 方向对（同一对走同一条路径、方向相反）
+    "forward": "forward_backward", "backward": "forward_backward",
+    "right": "left_right", "left": "left_right",
+    "up": "up_down", "down": "up_down",
+}
 ROTATIONS = {                # 旋转：方向名 -> (轴, 符号)，按右手定则转。轴 up：竖直向上（偏航，正转向左）；
     "yaw_left": ("up", +1), "yaw_right": ("up", -1),          # 轴 x：中心姿态相机的 x 轴（俯仰，正转向上）；
     "pitch_up": ("x", +1), "pitch_down": ("x", -1),           # 轴 z：中心姿态相机的光轴（横滚，正 = 画面顶部
@@ -153,6 +158,8 @@ class Segment:
     via_joints: list | None = None      # check_plan 填
     pivot: np.ndarray | None = None     # 绕光心转的段：旋转中心（光心，基坐标系 m），运动中记录光心偏离
     f_t_c: np.ndarray | None = None     # 有 pivot 时用来由法兰位姿算光心
+    joint_rate: float | None = None     # 路径上关节变化最快处：每 mm（平移）或每 °（以转动为主的段）几度（check_plan 填）
+    joint_rates: list | None = None     # 每个采样间隔 [(间隔中点的进度 0–1, 每 mm / 每 ° 几度)]（check_plan 填）
     log: dict = field(default_factory=dict)
 
 
@@ -175,6 +182,10 @@ class MotionConfig:
     pitch_heading_deg: float = 0.0
     roll_deg: float = 10.0        # 横滚录制的总转角
     roll_heading_deg: float = 0.0
+    # 平移路径：{方向对: ((前, 左, 上) mm, 行程 m)}，方向对见 TRANSLATION_PAIRS；行程中点 = 起点按起点相机的
+    # 前、左方向和竖直向上偏移。None：所有方向都以起点为中点、行程 stroke_m
+    translation_paths: dict | None = None
+    translation_wiggle_side: int = 0  # 平移录制和 sync-test 的同步摆动：0 两边摆；+1 只往左摆；-1 只往右摆
 
 
 @dataclass
@@ -186,6 +197,8 @@ class SpeedModel:
     wiggle_deg_s_per_pct: float | None = None
     ramp_s: float = DEFAULT_RAMP_S
     calibrated: bool = False
+    accel_mm_s2: float | None = None      # speed-test 实测的平移加速度、摆动角加速度（关节速度检查按梯形曲线用）
+    accel_deg_s2: float | None = None
 
 
 def _move(name, camera, f_t_c, speed_mm_s=0.0, rate_deg_s=0.0, recorded=True, fixed_percent=None,
@@ -283,31 +296,44 @@ def plan_movec_test(centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig, te
     return segs
 
 
+def translation_path(direction: str, centre: np.ndarray, cfg: MotionConfig) -> tuple[np.ndarray, float]:
+    """平移录制的行程中点（相机位姿，姿态同起点）和行程 m。centre 是 set-start 的起点。"""
+    if not cfg.translation_paths:
+        return centre, cfg.stroke_m
+    (fwd, left, up), stroke = cfg.translation_paths[TRANSLATION_PAIRS[direction]]
+    mid = centre.copy()
+    mid[:3, 3] += (fwd * centre[:3, 2] - left * centre[:3, 0] + up * WORLD_UP) / 1000.0
+    return mid, float(stroke)
+
+
 def plan_recording(direction: str, centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig) -> list[Segment]:
     if direction in ROTATIONS:
         return plan_rotation(direction, centre, f_t_c, cfg)
+    mid, stroke = translation_path(direction, centre, cfg)
     axis_name, sign = DIRECTIONS[direction]
-    axis = WORLD_UP if axis_name == "up" else centre[:3, {"x": 0, "z": 2}[axis_name]]
-    half = sign * axis * cfg.stroke_m / 2.0
-    start, end = centre.copy(), centre.copy()
+    axis = WORLD_UP if axis_name == "up" else mid[:3, {"x": 0, "z": 2}[axis_name]]
+    half = sign * axis * stroke / 2.0
+    start, end = mid.copy(), mid.copy()
     start[:3, 3] -= half
     end[:3, 3] += half
+    side = cfg.translation_wiggle_side
     return ([_move("goto_start", start, f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
              Segment("hold_start", "hold", duration_s=cfg.hold_start_s)]
-            + _wiggle("wiggle_start", start, f_t_c, cfg)
+            + _wiggle("wiggle_start", start, f_t_c, cfg, side)
             + [Segment("hold_before", "hold", duration_s=cfg.hold_mid_s),
                _move("translate", end, f_t_c, cfg.speed_mps * 1000.0),
                Segment("hold_after", "hold", duration_s=cfg.hold_mid_s)]
-            + _wiggle("wiggle_end", end, f_t_c, cfg)
+            + _wiggle("wiggle_end", end, f_t_c, cfg, side)
             + [Segment("hold_end", "hold", duration_s=cfg.hold_end_s)])
 
 
 def plan_sync_test(centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig) -> list[Segment]:
+    side = cfg.translation_wiggle_side
     return ([_move("goto_start", centre, f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
              Segment("hold_start", "hold", duration_s=cfg.hold_start_s)]
-            + _wiggle("wiggle_start", centre, f_t_c, cfg)
+            + _wiggle("wiggle_start", centre, f_t_c, cfg, side)
             + [Segment("hold_middle", "hold", duration_s=cfg.sync_test_hold_s)]
-            + _wiggle("wiggle_end", centre, f_t_c, cfg)
+            + _wiggle("wiggle_end", centre, f_t_c, cfg, side)
             + [Segment("hold_end", "hold", duration_s=cfg.hold_end_s)])
 
 
@@ -414,6 +440,9 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
                 problems.append(f"{seg.name}: MoveC 的起点不是规划时的姿态（上一段终点不对）")
                 prev = target
                 continue
+        # 每个采样间隔走过的路程（mm）或转角（°），用来把关节变化换算成关节速度
+        per_step = (seg.angle_deg if seg.rate_deg_s > 0 else seg.distance_mm) / n
+        seg.joint_rate, seg.joint_rates = 0.0, []
         for k in range(1, n + 1):
             u = k / n
             returning = not seg.recorded and k < n                    # 移到起点途中可以从范围外往回走
@@ -440,6 +469,9 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
             if step > max_joint_step_deg:
                 problems.append(f"{seg.name}: 路径 {u:.0%} 处关节一步变化 {step:.1f}°，可能跳到另一组逆解")
                 break
+            if per_step > 1e-9:
+                seg.joint_rate = max(seg.joint_rate, step / per_step)
+                seg.joint_rates.append(((k - 0.5) / n, step / per_step))
             ref = q
             if seg.motion == "C" and 2 * k == n:
                 seg.via_joints = q
@@ -448,7 +480,32 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
     return problems
 
 
-# ------------------------------------------------------------------ 玻璃窗是否入画（旋转录制：光心不动）
+def joint_speed_problems(segments: list[Segment], max_deg_s: float, model: SpeedModel | None = None) -> list[str]:
+    """录制段按预计速度走时，关节最快多少 °/s（先 check_plan 和 apply_speed）；超过 max_deg_s 就是问题。
+    model 有实测加速度时按梯形速度曲线算每一处的速度（行程两端在加减速，比匀速慢）；没有时按全程匀速，偏保守。
+    结果也写进每段的 log（max_joint_speed_deg_s）。"""
+    problems = []
+    for seg in segments:
+        if seg.kind != "move" or not seg.recorded or seg.joint_rate is None:
+            continue
+        rot = seg.rate_deg_s > 0
+        speed = seg.expect_deg_s if rot else seg.expect_mm_s
+        if not speed:
+            continue
+        accel = (model.accel_deg_s2 if rot else model.accel_mm_s2) if model else None
+        length = seg.angle_deg if rot else seg.distance_mm
+        if accel and seg.joint_rates and length > 0:
+            w = max(r * min(speed, math.sqrt(2.0 * accel * u * length), math.sqrt(2.0 * accel * (1.0 - u) * length))
+                    for u, r in seg.joint_rates)
+        else:
+            w = seg.joint_rate * speed
+        seg.log["max_joint_speed_deg_s"] = w
+        if w > max_deg_s:
+            problems.append(f"{seg.name}: 预计关节最快 {w:.0f} °/s，超过上限 {max_deg_s:g} °/s")
+    return problems
+
+
+# ------------------------------------------------------------------ 玻璃窗是否入画
 def view_direction(az_deg, el_deg) -> np.ndarray:
     """起点水平相机系（x 右、y 下、z 前）里方位角 az（正 = 向左）、仰角 el（正 = 向上）的单位向量，可广播。"""
     a, e = np.radians(az_deg), np.radians(el_deg)
@@ -488,22 +545,33 @@ def glass_clearance_deg(r_rel: np.ndarray, regions, outlines, normals) -> float:
 
 
 def glass_clearance(segments: list[Segment], start_camera: np.ndarray, f_t_c: np.ndarray, regions,
-                    image=IMAGE_1080, step_deg: float = 0.5) -> tuple[float, str]:
-    """沿各录制段（不录制的移动只看终点）每 step_deg 采样相机姿态，返回 (画面离玻璃区域最近的角距离 °, 在哪一段)。
-    regions：[(方位角起, 方位角止, 仰角下, 仰角上)]（°），以光心为球心、相对 start_camera（水平起点）的朝向。
-    只适用于光心不动的旋转录制。"""
+                    image=IMAGE_1080, step_deg: float = 0.5, distance_m: float | None = None,
+                    step_mm: float = 20.0) -> tuple[float, str]:
+    """沿各录制段（不录制的移动只看终点）每 step_deg / step_mm 采样相机位姿，返回 (画面离玻璃区域最近的角距离 °, 在哪一段)。
+    regions：[(方位角起, 方位角止, 仰角下, 仰角上)]（°），从 start_camera（水平起点）的光心看、相对它的朝向。
+    distance_m=None：只看朝向（光心不动的旋转录制）。给了距离：区域边界当作离起点光心这么远的点，
+    光心移动时按视差重算方向（平移录制）；距离取玻璃可能的最近距离，结果偏保守。"""
     outlines = [region_outline(r) for r in regions]
     normals = frustum_normals(image)
-    r0 = start_camera[:3, :3]
+    r0, c0 = start_camera[:3, :3], start_camera[:3, 3]
     best, where, prev = math.inf, "", None
     for seg in segments:
         if seg.kind != "move":
             continue
         target = fr5_to_matrix(seg.flange)
-        n = math.ceil(rotation_deg(prev, target) / step_deg) if prev is not None and seg.recorded else 0
+        n = 0
+        if prev is not None and seg.recorded:
+            n = math.ceil(rotation_deg(prev, target) / step_deg)
+            if distance_m is not None:
+                n = max(n, math.ceil(np.linalg.norm((target @ f_t_c)[:3, 3] - (prev @ f_t_c)[:3, 3]) * 1000.0 / step_mm))
         for u in [k / n for k in range(1, n)] + [1.0]:
-            flange = target if u == 1.0 else path_flange(seg, prev, target, u, f_t_c)
-            c = glass_clearance_deg(r0.T @ (flange @ f_t_c)[:3, :3], regions, outlines, normals)
+            camera = (target if u == 1.0 else path_flange(seg, prev, target, u, f_t_c)) @ f_t_c
+            pts = outlines
+            if distance_m is not None:                    # 起点相机系里，从当前光心看玻璃边界点的方向
+                shift = r0.T @ (camera[:3, 3] - c0)
+                pts = [o * distance_m - shift for o in outlines]
+                pts = [v / np.linalg.norm(v, axis=1, keepdims=True) for v in pts]
+            c = glass_clearance_deg(r0.T @ camera[:3, :3], regions, pts, normals)
             if c < best:
                 best, where = c, seg.name
         prev = target

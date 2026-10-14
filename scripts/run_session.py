@@ -20,54 +20,64 @@ sync-test 和 record 需要先有 speed-test 的结果；改了 WebApp 速度百
 """
 
 # ================================ 可修改参数 ================================
-SPEED_MPS = 0.05             # 平移速度 m/s
-STROKE_M = 0.30              # 每条录制的行程 m（以 set-start 保存的起点为中心，两边各一半）
-YAW_DEG = 10.0               # 偏航录制的总转角 °（以中心姿态为中心，两边各一半；绕光心，MoveC）。左右两边都有玻璃窗，
-                             # 画面（水平视场 105°）只剩约 12° 可转；同步摆动也是 10°，总转角小于摆动幅度时摆动会从另一头扫出去
-PITCH_DEG = 30.0             # 俯仰录制的总转角 °：俯仰要转 J6（约 俯仰角 × cot|J5|），30° 时 J6 约 ±13°、J4 到 −90° 附近
-ROLL_DEG = 30.0              # 横滚录制的总转角 °（绕光轴，基本只转 J6）：和俯仰一样（用户 10-13 定），J6 约 ±15°
-ROT_DEG_S = 5.0              # 旋转角速度 °/s（模糊和景深无关：曝光 10 ms 时 5 °/s 约 0.64 px）
-YAW_HEADING_DEG = -2.25      # 偏航 / 俯仰 / 横滚录制的中心朝向：起点绕竖直轴转这么多 °（正 = 向左）。
-PITCH_HEADING_DEG = -5.0     # 取在两扇窗中间（左窗 +57.4°、右窗 −60.3°，左半视场 53.3°、右半视场 51.7°），
-ROLL_HEADING_DEG = -2.0      # 由 GLASS_REGIONS 检查；俯仰向右转 J5 离 0° 更远、J6 转得少
-# 画面里不能出现的玻璃（旋转录制全程检查，含同步摆动；平移录制光心在动，不查）。每块是
-# (方位角起, 方位角止, 仰角下, 仰角上)，单位 °，以起点光心为球心、相对起点水平朝向，方位角正 = 向左、仰角正 = 向上。
-# 10-13 用旋转演练的 32 张静止帧拼成全景图量出：左窗玻璃从 +57.4° 往左（再往里到 +55.5° 是窗框），上沿仰角 +27.3°，
-# 下面被压力机挡住，按一直到底处理；右窗玻璃从柱子边缘 −60.3° 往右，在远处，仰角约 −6.5～+4°（上面到天花板的
-# 白条也算进去）；+76° 以左、−87° 以右没拍到，按全是玻璃处理。
+# 高速录制（high-speed 分支，2026-10-14 起）：平移 0.5 m/s、旋转 50 °/s、30 fps、曝光 2.5 ms，只避开右侧落地窗。
+# 10-12 平移、10-13 旋转的低速录制用的是 git 标签 data-v1 的设置（路径组 "base"）。
+PATH_SET = "fast1"           # 这一套路径几何的名字，写进 motion_log；真值的行程、转角系数按它查（fr5_groundtruth）。
+                             # 改了路径几何（起点、行程、转角、中心朝向）就换个名字，免得用错系数
+SPEED_MPS = 0.5              # 平移速度 m/s
+# 平移路径：每对方向一个行程中点和行程 m。中点 = set-start 的起点按起点相机的（前, 左, 上）方向偏移 mm。
+# 10-13 离线逆解算出：现有关节范围内、光心不低于 MIN_CAMERA_Z_M、两端都能往左摆 WIGGLE_DEG、0.5 m/s 时关节 ≤ 150 °/s、
+# 右窗按 WINDOW_DISTANCE_M 算视差也看不到。加速度按 2.5 m/s² 估，匀速段前后 350、左右 430、上下 470 mm（speed-test 后核对）
+TRANSLATION_PATHS = {
+    "forward_backward": ((-5.0, 150.0, -100.0), 0.45),
+    "left_right": ((-50.0, 45.0, 50.0), 0.53),
+    "up_down": ((-100.0, 250.0, 75.0), 0.57),
+}
+TRANSLATION_WIGGLE_SIDE = 1  # 平移录制和 sync-test 的同步摆动：+1 只往左摆（画面右边缘离右窗更远），0 两边摆
+YAW_DEG = 30.0               # 偏航录制的总转角 °（以中心姿态为中心，两边各一半；绕光心，MoveC）：右边到右窗、左边到 J5 限位
+PITCH_DEG = 30.0             # 俯仰录制的总转角 °：J4 两头的限位允许约 ±16.8°
+ROLL_DEG = 90.0              # 横滚录制的总转角 °（绕光轴，基本只转 J6）：90° 时 J6 约 ±46°，在 ±50° 以内
+ROT_DEG_S = 50.0             # 旋转角速度 °/s（50 °/s 时最快的关节：偏航 J5 61、俯仰 J4 96、横滚 J6 51 °/s）
+YAW_HEADING_DEG = 7.75       # 偏航 / 俯仰 / 横滚录制的中心朝向：起点绕竖直轴转这么多 °（正 = 向左）。偏航转到 −7.25～+22.75°；
+PITCH_HEADING_DEG = -5.0     # 俯仰、横滚和低速录制相同（俯仰沿用已标定转角系数的那条路径）
+ROLL_HEADING_DEG = -2.0
+# 画面里不能出现的玻璃：只管右侧落地窗（用户 10-13 定，左窗可以拍）。每块是 (方位角起, 方位角止, 仰角下, 仰角上)，单位 °，
+# 从起点光心看、相对起点水平朝向，方位角正 = 向左、仰角正 = 向上。10-13 全景图量出：右窗玻璃从柱子边缘 −60.3° 往右，
+# 仰角约 −6.5～+4°（上面到天花板的白条也算进去）；−87° 以右没拍到，按全是玻璃处理。
 GLASS_REGIONS = [
-    (57.4, 76.0, -90.0, 27.5),
-    (76.0, 180.0, -90.0, 90.0),
     (-87.0, -60.3, -8.0, 11.0),
     (-180.0, -87.0, -90.0, 90.0),
 ]
 GLASS_MARGIN_DEG = 1.0       # 画面离玻璃至少这么多 °（画面左右边缘 1° 约 35 px）
-EXPOSURE_US = 10000          # 曝光 μs（传给 zed_record）
-ANALOG_GAIN_MDB = 1000       # 模拟增益 mdB（传给 zed_record）；缩短曝光后画面偏暗时调大
-MAX_BLUR_PX = 1.0            # 允许的最大运动模糊（1080p 像素）
+WINDOW_DISTANCE_M = 7.0      # 玻璃离起点光心的最近距离 m（窗底仰角 −6.5°、相机离地至少约 0.8 m 估的下限）；光心移动时按它算视差
+CAMERA_FPS = 30              # 相机帧率（15 / 30 / 60，传给 zed_record）
+EXPOSURE_US = 2500           # 曝光 μs（传给 zed_record）
+ANALOG_GAIN_MDB = 13000      # 模拟增益 mdB（传给 zed_record）：2.5 ms、13 dB 的亮度和 10 ms、1 dB 差不多（10-14 实测）
+MAX_BLUR_PX = 2.0            # 允许的最大运动模糊（1080p 像素）：50 °/s、2.5 ms 时画面中心约 1.6 px
 NEAREST_DEPTH_M = 1.0        # 画面里最近物体的距离 m，用来估算运动模糊
 HOLD_START_S = 5.0           # 开头静止 s（同时用来估陀螺零偏）
 HOLD_MID_S = 3.0             # 同步摆动和平移之间的静止 s
 HOLD_END_S = 5.0             # 结尾静止 s
-WIGGLE_DEG = 10.0            # 同步摆动幅度 °（平移录制和 sync-test 绕相机竖直轴两边摆；旋转录制绕本条的转轴往内侧摆）
+WIGGLE_DEG = 10.0            # 同步摆动幅度 °（平移录制和 sync-test 绕相机竖直轴摆；旋转录制绕本条的转轴往内侧摆）
 WIGGLE_DEG_S = 20.0          # 同步摆动角速度 °/s（真值脚本要求至少 10 °/s）
 WIGGLE_CYCLES = 2            # 同步摆动来回次数
 SYNC_TEST_HOLD_S = 10.0      # sync-test 两次摆动之间的静止 s
 REPOSITION_MPS = 0.05        # 录制前移到起点的速度 m/s
-WEBAPP_SPEED_PCT = 10        # WebApp 里的速度百分比（SDK 读不到，照抄过来）；WebApp 改了这里也要改，并重跑 speed-test
+WEBAPP_SPEED_PCT = 60        # WebApp 里的速度百分比（SDK 读不到，照抄过来）；WebApp 改了这里也要改，并重跑 speed-test。
+                             # 高速录制用 60%（10-14 用户已在 WebApp 改好；0.5 m/s 约需 SDK 83%）
 ACCEL_PCT = 100              # MoveL 加速度百分比（oacc）；实际加速度看 speed-test 结果，起停太猛就调小再重跑 speed-test
 SPEED_TEST_PCT = 5           # speed-test 去程的速度百分比；没标定时最快为控制器默认速度 1000 mm/s 的 5% = 50 mm/s
-SPEED_TEST_MM = 100          # speed-test 在起点竖直上下的行程 mm
 MAX_SPEED_ERROR = 0.10       # 平移实测速度和预计速度相差超过 10% 就警告（speed-test 里也用来检查是否成正比）
 MIN_CAMERA_Z_M = 0.35        # 相机光心最低高度（基坐标系 z，m）；按现场桌面和障碍物修改
 # 允许的关节范围（°）。腕部 J4–J6 限制在这套末端装置已经安全走过的范围内（再往外 Box 可能碰到腕部，
 # 见标定仓库 README 6.4 / 6.7）：10-10、10-12 录制实测 J4 −151～−99、J5 −69.5～−22.1、J6 一直是 0，各留约 3° 余量；
 # 俯仰 30° 要 J4 到 −90°：用户 10-13 确认不会碰撞，按标定走过的范围（J4 −154～−77）放宽到 J4 上限 −87。
 # J6 ±50：用户 10-13 目测在起点姿态下 J6 转 60° 以内不会碰（横滚），按用户要求再保守 10°；起点 J6 ≈ 0。
-# J1–J3 覆盖起点附近 ±150 mm 平移，离肘部奇异（J3=0）至少 15°。
+# J1–J3 覆盖平移路径，离肘部奇异（J3=0）至少 15°。
 JOINT_MIN_DEG = [80.0, -30.0, -130.0, -154.0, -72.0, -50.0]
 JOINT_MAX_DEG = [160.0, 60.0, -15.0, -87.0, -19.0, 50.0]
 MAX_JOINT_STEP_DEG = 5.0     # 路径上每 10 mm / 2° 允许的最大关节变化（超过说明逆解可能跳支）
+MAX_JOINT_SPEED_DEG_S = 150.0  # 录制段按预计速度走时任一关节的最快速度上限 °/s（FR5 额定 180 °/s）
 MAX_SPEED_RIPPLE = 0.05      # 平移巡航段速度波动（标准差/均值）超过它就警告“速度不平稳”
 MIN_FREE_GB = 5.0            # 开始录制前 Box 至少剩余的磁盘空间 GB
 ROBOT_IP = "192.168.58.2"
@@ -80,16 +90,18 @@ MOVEC_TEST = "~/ROBOT/fr5_record/movec_test.json"
 
 # 允许范围 [下限, 上限]，超出就拒绝运行
 RANGES = {
-    "SPEED_MPS": (0.02, 0.10),       # 下限暂定，待平稳性测试确认；上限还受 MAX_BLUR_PX 约束
-    "STROKE_M": (0.05, 0.30),        # ±150 mm 已做离线可达性检查
-    "YAW_DEG": (5.0, 30.0),          # 能不能转满还要看玻璃窗检查和 plan 的关节检查
+    "SPEED_MPS": (0.02, 0.6),        # 上限还受 MAX_BLUR_PX 和关节速度约束
+    "YAW_DEG": (5.0, 35.0),          # 能不能转满还要看玻璃窗检查和 plan 的关节检查
     "PITCH_DEG": (5.0, 30.0),
     "ROLL_DEG": (5.0, 90.0),         # 90° 时 J6 −46.0～+45.8°（10-13 控制器逆解），在 J6 ±50 以内
-    "ROT_DEG_S": (1.0, 10.0),        # 上限还受 MAX_BLUR_PX 约束
+    "ROT_DEG_S": (1.0, 60.0),        # 上限还受 MAX_BLUR_PX 和关节速度约束
     "YAW_HEADING_DEG": (-10.0, 20.0),
     "PITCH_HEADING_DEG": (-10.0, 0.0),   # 向左 J5 接近 0°，J6 要转得更多
     "ROLL_HEADING_DEG": (-10.0, 10.0),
+    "TRANSLATION_WIGGLE_SIDE": (-1, 1),
     "GLASS_MARGIN_DEG": (0.5, 5.0),
+    "WINDOW_DISTANCE_M": (3.0, 50.0),
+    "CAMERA_FPS": (15, 60),          # 只能是 15 / 30 / 60
     "EXPOSURE_US": (1000, 15000),
     "ANALOG_GAIN_MDB": (1000, 16000),
     "MAX_BLUR_PX": (0.3, 2.0),
@@ -105,13 +117,15 @@ RANGES = {
     "WEBAPP_SPEED_PCT": (1, 100),
     "ACCEL_PCT": (1, 100),
     "SPEED_TEST_PCT": (1, 10),
-    "SPEED_TEST_MM": (50, 150),       # 起点向上 150 mm 已做离线可达性检查
     "MAX_SPEED_ERROR": (0.02, 0.3),
     "MIN_CAMERA_Z_M": (0.0, 1.5),
     "MAX_JOINT_STEP_DEG": (1.0, 15.0),
+    "MAX_JOINT_SPEED_DEG_S": (30.0, 170.0),
     "MAX_SPEED_RIPPLE": (0.01, 0.2),
     "MIN_FREE_GB": (1.0, 100.0),
 }
+TRANSLATION_OFFSET_MAX_MM = 300.0   # TRANSLATION_PATHS 的偏移每个分量最多这么多
+TRANSLATION_STROKE_RANGE = (0.05, 0.6)
 # ==========================================================================
 
 import argparse
@@ -133,7 +147,7 @@ import fr5_motion as fm
 from fr5_record import StateRecorder
 from zed_capture import ZedRecord, camera_users
 
-DATA_MB_PER_S = 12.0  # zed_record 双目 JPEG 约 0.8 MB/帧 × 15 fps
+MB_PER_FRAME = 0.8    # zed_record 双目 JPEG 每帧约 0.8 MB
 HANGUP_LOG = Path(tempfile.gettempdir()) / "run_session_hangup.log"  # 有录制目录时改成目录里的 run_session.log
 
 
@@ -155,22 +169,21 @@ def p(path: str) -> Path:
 
 
 def motion_config() -> fm.MotionConfig:
-    return fm.MotionConfig(SPEED_MPS, STROKE_M, HOLD_START_S, HOLD_MID_S, HOLD_END_S,
+    return fm.MotionConfig(SPEED_MPS, 0.0, HOLD_START_S, HOLD_MID_S, HOLD_END_S,
                            WIGGLE_DEG, WIGGLE_DEG_S, int(WIGGLE_CYCLES), REPOSITION_MPS, SYNC_TEST_HOLD_S,
                            YAW_DEG, PITCH_DEG, ROT_DEG_S, YAW_HEADING_DEG, PITCH_HEADING_DEG,
-                           ROLL_DEG, ROLL_HEADING_DEG)
+                           ROLL_DEG, ROLL_HEADING_DEG, translation_paths=TRANSLATION_PATHS,
+                           translation_wiggle_side=int(TRANSLATION_WIGGLE_SIDE))
 
 
 RECORD_NAMES = [*fm.DIRECTIONS, *fm.ROTATIONS]
 
 
 def pose_note(name: str, segs: list[fm.Segment], start_camera: np.ndarray, f_t_c: np.ndarray) -> tuple[str, list[str]]:
-    """旋转录制的全程姿态范围（含同步摆动）和画面离玻璃窗的最近角距离，计划里写明；离得太近就是问题。
-    返回 (说明, 问题列表)；平移录制和 sync-test 光心在动或摆动两边，不查。"""
-    if name not in fm.ROTATIONS:
-        return "", []
+    """全程姿态范围（含同步摆动）和画面离玻璃窗的最近角距离，计划里写明；离得太近就是问题。
+    光心移动时按 WINDOW_DISTANCE_M 算视差。返回 (说明, 问题列表)。"""
     span = fm.pose_span(segs, start_camera, f_t_c)
-    clear, where = fm.glass_clearance(segs, start_camera, f_t_c, GLASS_REGIONS)
+    clear, where = fm.glass_clearance(segs, start_camera, f_t_c, GLASS_REGIONS, distance_m=WINDOW_DISTANCE_M)
     parts = []
     for key, label in (("heading", "朝向"), ("pitch", "俯仰"), ("roll", "横滚")):
         lo, hi = span[key]
@@ -196,8 +209,9 @@ def load_speed_model() -> tuple[fm.SpeedModel | None, str]:
                if cal["settings"].get(k) != globals()[k]]
     if changed:
         return None, "speed-test 之后这些参数改过：" + "，".join(changed) + "，请重跑 speed-test"
-    m = cal["model"]
-    return (fm.SpeedModel(m["mm_s_per_pct"], m["wiggle_deg_s_per_pct"], m["ramp_s"], calibrated=True),
+    m, acc = cal["model"], cal.get("accel") or {}
+    return (fm.SpeedModel(m["mm_s_per_pct"], m["wiggle_deg_s_per_pct"], m["ramp_s"], calibrated=True,
+                          accel_mm_s2=acc.get("test_down_mm_s2"), accel_deg_s2=acc.get("test_yaw_back_deg_s2")),
             f"速度标定（{cal['created']}）：1% = 平移 {m['mm_s_per_pct']:.3f} mm/s，摆动 {m['wiggle_deg_s_per_pct']:.3f} °/s")
 
 
@@ -243,6 +257,26 @@ def parameter_problems() -> list[str]:
                    f"超过 MAX_BLUR_PX={MAX_BLUR_PX}；这个曝光下角速度最高 {w_max:.1f} °/s")
     if any(len(r) != 4 or not (r[0] < r[1] and r[2] < r[3]) for r in GLASS_REGIONS):
         out.append("GLASS_REGIONS 每块必须是 (方位角起, 方位角止, 仰角下, 仰角上)，且起 < 止、下 < 上")
+    if CAMERA_FPS not in (15, 30, 60):
+        out.append(f"CAMERA_FPS = {CAMERA_FPS}，只能是 15、30 或 60")
+    if TRANSLATION_WIGGLE_SIDE not in (-1, 0, 1):
+        out.append(f"TRANSLATION_WIGGLE_SIDE = {TRANSLATION_WIGGLE_SIDE}，只能是 -1、0 或 1")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", str(PATH_SET)):
+        out.append("PATH_SET 只能用字母、数字、_ 和 -，最多 20 个字符")
+    if set(TRANSLATION_PATHS) != set(fm.TRANSLATION_PAIRS.values()):
+        out.append(f"TRANSLATION_PATHS 必须正好有这几对：{sorted(set(fm.TRANSLATION_PAIRS.values()))}")
+    for pair, path in TRANSLATION_PATHS.items():
+        try:
+            (fwd, left, up), stroke = path
+            offsets = [float(fwd), float(left), float(up)]
+        except (TypeError, ValueError):
+            out.append(f"TRANSLATION_PATHS[{pair!r}] 必须是 ((前, 左, 上) mm, 行程 m)")
+            continue
+        if max(abs(v) for v in offsets) > TRANSLATION_OFFSET_MAX_MM:
+            out.append(f"TRANSLATION_PATHS[{pair!r}] 的偏移超过 ±{TRANSLATION_OFFSET_MAX_MM:g} mm")
+        lo, hi = TRANSLATION_STROKE_RANGE
+        if not lo <= stroke <= hi:
+            out.append(f"TRANSLATION_PATHS[{pair!r}] 的行程 {stroke} m 超出 [{lo}, {hi}]")
     return out
 
 
@@ -263,9 +297,10 @@ def current_pose(rec: StateRecorder):
 def check_segments(rec: StateRecorder, rpc, segs: list[fm.Segment], f_t_c, model, scale: float) -> list[str]:
     """从当前位姿出发做逆解检查，并按速度模型换算每段的速度百分比。返回问题列表。"""
     flange, joints, _ = current_pose(rec)
-    return (fm.check_plan(rpc, segs, flange, joints, f_t_c, JOINT_MIN_DEG, JOINT_MAX_DEG,
-                          MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
-            + fm.apply_speed(segs, model, scale))
+    problems = (fm.check_plan(rpc, segs, flange, joints, f_t_c, JOINT_MIN_DEG, JOINT_MAX_DEG,
+                              MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
+                + fm.apply_speed(segs, model, scale))
+    return problems + fm.joint_speed_problems(segs, MAX_JOINT_SPEED_DEG_S, model)
 
 
 def confirm_plan(text: str, assume_yes: bool) -> None:
@@ -306,7 +341,7 @@ def describe(segments: list[fm.Segment], pending: dict | None = None, totals: bo
                      + (f"{word} {rates}，" if rates else "") + dur + tail)
     if totals:
         rec_s = sum(s.duration_s for s in segments if s.recorded)
-        lines.append(f"  录制约 {rec_s:.0f} s，数据约 {rec_s * DATA_MB_PER_S / 1000:.1f} GB")
+        lines.append(f"  录制约 {rec_s:.0f} s，数据约 {rec_s * MB_PER_FRAME * CAMERA_FPS / 1000:.1f} GB")
     return "\n".join(lines)
 
 
@@ -360,6 +395,11 @@ def cmd_plan(args, problems: list[str]) -> int:
     if unknown:
         print(f"不认识的录制名：{unknown}")
         return 2
+    print(f"路径组 {PATH_SET}；相机 {CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB")
+    for pair, ((fwd, left, up), stroke) in TRANSLATION_PATHS.items():
+        mid, _ = fm.translation_path(next(d for d, q in fm.TRANSLATION_PAIRS.items() if q == pair), start["camera"], cfg)
+        print(f"  平移 {pair}：行程 {stroke * 1000:.0f} mm，中点光心 {np.round(mid[:3, 3] * 1000).tolist()} mm"
+              f"（起点 前 {fwd:+.0f}、左 {left:+.0f}、上 {up:+.0f} mm）")
     print(f"模糊估算：{NEAREST_DEPTH_M} m 处 左右/上下平移 {fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px，"
           f"前后平移画面边缘约 {1.3 * fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px；"
           f"旋转 {fm.rotation_blur_px(ROT_DEG_S, EXPOSURE_US):.2f} px（1080p）")
@@ -486,7 +526,7 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
 
     rec = StateRecorder(data_dir, ROBOT_IP)
     rec.start()
-    zed = ZedRecord(p(ZED_RECORD), session_dir, EXPOSURE_US, ANALOG_GAIN_MDB) if session_dir else None
+    zed = ZedRecord(p(ZED_RECORD), session_dir, EXPOSURE_US, ANALOG_GAIN_MDB, CAMERA_FPS) if session_dir else None
     error, ran = None, False
     try:
         rpc = rec.open_rpc()
@@ -499,7 +539,8 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         found = check_segments(rec, rpc, segs, f_t_c, model, args.scale) + found
         if found:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
-        header = (f"{name}：速度比例 {args.scale}" + (f"，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
+        header = (f"{name}：速度比例 {args.scale}，路径组 {PATH_SET}"
+                  + (f"，{CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
                   + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%"
                   + (f"\n{pose}" if pose else ""))
         confirm_plan(header + "\n" + describe(segs, totals=zed is not None), args.yes)
@@ -538,7 +579,8 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
     log = {
         "kind": kind, "direction": direction, "tag": args.tag, "speed_scale": args.scale,
         "error": "；".join(e for e in (error, zed_error) if e) or None,
-        "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG", "GLASS_REGIONS"]},
+        "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG", "GLASS_REGIONS",
+                                                "TRANSLATION_PATHS", "PATH_SET"]},
         "speed_model": dataclasses.asdict(model) if model else None,
         "start_pose": {k: start[k] for k in ("base_T_camera", "flange", "joints", "created")},
         "handeye_sha256": handeye["sha256"],
@@ -589,10 +631,15 @@ def _per_pct(seg: fm.Segment, key: str) -> float | None:
 
 
 def cmd_speed_test(args) -> int:
-    """实测 MoveL 速度百分比和实际速度的换算，保存到 SPEED_CAL。不开相机，机械臂状态也不存盘。"""
+    """实测 MoveL 速度百分比和实际速度的换算，保存到 SPEED_CAL。不开相机，机械臂状态也不存盘。
+    走上下那条平移路径的全程（高速时要有足够长的匀速段），在下端做摆动测试；同时由加减速用时估出加速度。"""
     f_t_c, _ = gt.load_handeye(p(HANDEYE))
     start = load_start()
-    segs = fm.plan_speed_test(start["camera"], f_t_c, motion_config(), SPEED_TEST_MM, SPEED_TEST_PCT)
+    cfg = motion_config()
+    mid, stroke = fm.translation_path("up", start["camera"], cfg)
+    bottom = mid.copy()
+    bottom[:3, 3] -= fm.WORLD_UP * stroke / 2.0
+    segs = fm.plan_speed_test(bottom, f_t_c, cfg, stroke * 1000.0, SPEED_TEST_PCT)
     by = {s.name: s for s in segs}
     error, ran, vmax = None, False, None
     with tempfile.TemporaryDirectory() as tmp:
@@ -652,6 +699,12 @@ def cmd_speed_test(args) -> int:
         return 1
     ramps = [m["ramp_s"] for m in ((by[n].log.get("measured") or {}) for n in ("test_down", "test_yaw_back"))
              if m.get("ramp_s") is not None and (m.get("max_gap_s") or 0.0) <= 0.1]   # 中断过的段用时不准
+    # 梯形速度曲线：总用时 = 路程 / 速度 + 速度 / 加速度，多出来的 ramp_s 就是 v / a
+    accel = {}
+    for n, key, unit in (("test_down", "linear_mm_s", "mm_s2"), ("test_yaw_back", "angular_deg_s", "deg_s2")):
+        m = by[n].log.get("measured") or {}
+        if m.get(key) and m.get("ramp_s") and (m.get("max_gap_s") or 0.0) <= 0.1:
+            accel[f"{n}_{unit}"] = m[key]["mean"] / m["ramp_s"]
     checks = {"translate_ratio_minus_1": kt_b / kt_a - 1.0 if kt_a and kt_b else None,
               "wiggle_ratio_minus_1": kw_b / kw_a - 1.0 if kw_a and kw_b else None,
               "webapp_factor": kt / (vmax / 100.0)}
@@ -663,6 +716,7 @@ def cmd_speed_test(args) -> int:
         "model": {"mm_s_per_pct": kt, "wiggle_deg_s_per_pct": kw,
                   "ramp_s": max(ramps) if ramps else fm.DEFAULT_RAMP_S},
         "checks": checks,
+        "accel": accel,
         "tests": [{"name": s.name, "percent": s.percent, "distance_mm": s.distance_mm, "angle_deg": s.angle_deg,
                    "measured": s.log.get("measured")} for s in segs],
     }
@@ -675,8 +729,16 @@ def cmd_speed_test(args) -> int:
         if r is not None and abs(r) > MAX_SPEED_ERROR:
             print(f"  警告：{label}去程和回程的“速度 / 百分比”相差 {r:+.0%}，速度和百分比不成正比，"
                   "录制时以实测速度为准")
+    a_lin = accel.get("test_down_mm_s2")
+    if a_lin:
+        print(f"  平移加速度约 {a_lin / 1000:.2f} m/s²（{by['test_down'].log['measured']['linear_mm_s']['mean']:.0f} mm/s 时）")
+        for pair, (_, stroke) in TRANSLATION_PATHS.items():
+            cruise = stroke * 1000.0 - (SPEED_MPS * 1000.0) ** 2 / a_lin
+            print(f"    {pair}：{SPEED_MPS} m/s 时匀速段约 {cruise:.0f} mm（行程 {stroke * 1000:.0f} mm）")
+    if accel.get("test_yaw_back_deg_s2"):
+        print(f"  摆动角加速度约 {accel['test_yaw_back_deg_s2']:.0f} °/s²")
     for label, pct in (("平移", SPEED_MPS * 1000.0 / kt), ("移到起点", REPOSITION_MPS * 1000.0 / kt),
-                       ("同步摆动", WIGGLE_DEG_S / kw)):
+                       ("同步摆动", WIGGLE_DEG_S / kw), ("旋转", ROT_DEG_S / kw)):
         print(f"  {label}需要速度 {pct:.2f}%" + ("：超过 100%，调高 WebApp 速度百分比后重跑" if pct > 100 else ""))
     return 0
 
