@@ -10,7 +10,7 @@ ssh $BoxHost "find ~/ROBOT/fr5_record -name __pycache__ -prune -exec rm -rf {} +
 scp "${BoxHost}:ROBOT/fr5_record/*" "$root\scripts\"
 if ($LASTEXITCODE -ne 0) { Write-Error "拷贝 fr5_record 失败"; exit 1 }
 
-ssh $BoxHost "cd ~/ROBOT/zed_imu && diff -u zed_record.cpp.bak-20261010 zed_record.cpp > /tmp/zed_record.patch; true"
+ssh $BoxHost "cd ~/ROBOT/zed_imu && diff -u zed_record.cpp.bak-20261008 zed_record.cpp > /tmp/zed_record.patch; true"
 scp "${BoxHost}:ROBOT/zed_imu/zed_record.cpp" "${BoxHost}:/tmp/zed_record.patch" "$root\zed_record\"
 if ($LASTEXITCODE -ne 0) { Write-Error "拷贝 zed_record 失败"; exit 1 }
 ssh $BoxHost "rm -f /tmp/zed_record.patch"

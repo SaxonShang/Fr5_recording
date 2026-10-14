@@ -44,6 +44,8 @@ ROTATIONS = {                # 旋转：方向名 -> (轴, 符号)，按右手�
 }
 IMAGE_1080 = (1920, 1080, 736.23, 987.72, 555.14)   # 宽、高、f、cx、cy（s003 重标的校正后左目内参），判断玻璃是否入画用
 PATH_STEP_MM = 10.0          # 逆解检查的路径采样间隔
+VIA_TOL_MM = 5.0             # 当前位姿离起点 / 起点轴这么近、姿态和起点差这么少，就不用先回起点（drop_needless_via）
+VIA_TOL_DEG = 1.0
 PATH_STEP_DEG = 2.0
 ARRIVE_POS_MM = 0.5          # 判定到位的位置/姿态误差
 ARRIVE_ROT_DEG = 0.05
@@ -120,6 +122,21 @@ def camera_up(camera: np.ndarray) -> np.ndarray:
 def rotation_deg(a: np.ndarray, b: np.ndarray) -> float:
     qa, qb = gt.matrix_to_quat(a[:3, :3]), gt.matrix_to_quat(b[:3, :3])
     return math.degrees(float(gt.rotation_angle_between(qa, qb)))
+
+
+def start_offsets(start: np.ndarray, point) -> np.ndarray:
+    """点（基坐标系 m）相对起点光心、沿水平起点相机的（前, 左, 上）方向的偏移 mm（和 translation_path 同一约定）。"""
+    d = (np.asarray(point, dtype=float) - start[:3, 3]) * 1000.0
+    return np.array([d @ start[:3, 2], -(d @ start[:3, 0]), d @ WORLD_UP])
+
+
+def orientation_angles(r_rel: np.ndarray) -> tuple[float, float, float]:
+    """相机姿态 r_rel（相机系 → 水平起点相机系的旋转）的光轴方位角、仰角和画面横滚（°；正 = 向左 / 向上 / 顶部向右）。"""
+    z, x = r_rel[:, 2], r_rel[:, 0]
+    horiz = np.cross(z, [0.0, -1.0, 0.0])                     # 光轴的水平右方向（z × 上）
+    horiz /= np.linalg.norm(horiz)
+    roll = math.degrees(math.atan2(np.cross(horiz, x) @ z, horiz @ x))
+    return math.degrees(math.atan2(-z[0], z[2])), math.degrees(math.asin(max(-1.0, min(1.0, -z[1])))), roll
 
 
 def blur_px(speed_mps: float, exposure_us: float, depth_m: float) -> float:
@@ -307,8 +324,11 @@ def translation_path(direction: str, centre: np.ndarray, cfg: MotionConfig) -> t
 
 
 def plan_recording(direction: str, centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig) -> list[Segment]:
+    """一条录制的全部段。centre 是 set-start 的起点。开头先 via_start 回起点、再 goto_start 移到这条的起点：
+    拖动标记只验证过经过起点的轴和起点上的转动，移过去的路也只走这些（用不着时由 drop_needless_via 去掉）。"""
+    via = _move("via_start", centre, f_t_c, cfg.reposition_mps * 1000.0, recorded=False)
     if direction in ROTATIONS:
-        return plan_rotation(direction, centre, f_t_c, cfg)
+        return [via] + plan_rotation(direction, centre, f_t_c, cfg)
     mid, stroke = translation_path(direction, centre, cfg)
     axis_name, sign = DIRECTIONS[direction]
     axis = WORLD_UP if axis_name == "up" else mid[:3, {"x": 0, "z": 2}[axis_name]]
@@ -317,7 +337,7 @@ def plan_recording(direction: str, centre: np.ndarray, f_t_c: np.ndarray, cfg: M
     start[:3, 3] -= half
     end[:3, 3] += half
     side = cfg.translation_wiggle_side
-    return ([_move("goto_start", start, f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
+    return ([via, _move("goto_start", start, f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
              Segment("hold_start", "hold", duration_s=cfg.hold_start_s)]
             + _wiggle("wiggle_start", start, f_t_c, cfg, side)
             + [Segment("hold_before", "hold", duration_s=cfg.hold_mid_s),
@@ -338,17 +358,44 @@ def plan_sync_test(centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig) -> 
 
 
 def plan_speed_test(centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig,
-                    travel_mm: float, test_percent: float) -> list[Segment]:
-    """速度标定：在起点竖直上移 travel_mm 再回来，绕光心竖直轴转 wiggle_deg 再回来。
-    去程用固定百分比 test_percent；回程的百分比由 run_session 按去程实测换算到录制速度 / 摆动角速度。"""
+                    travel_mm: float, test_percent: float, via: np.ndarray | None = None) -> list[Segment]:
+    """速度标定：在 centre 竖直上移 travel_mm 再回来，绕光心竖直轴转 wiggle_deg 再回来。
+    去程用固定百分比 test_percent；回程的百分比由 run_session 按去程实测换算到录制速度 / 摆动角速度。
+    via：先回这个位姿（set-start 的起点）再移到 centre，同 plan_recording。"""
     up = centre.copy()
     up[:3, 3] += WORLD_UP * travel_mm / 1000.0
     yaw = yaw_about_vertical(centre, cfg.wiggle_deg)
-    return [_move("goto_start", centre, f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
+    first = [] if via is None else [_move("via_start", via, f_t_c, cfg.reposition_mps * 1000.0, recorded=False)]
+    return first + [_move("goto_start", centre, f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
             _move("test_up", up, f_t_c, fixed_percent=test_percent),
             _move("test_down", centre, f_t_c, cfg.speed_mps * 1000.0),
             _move("test_yaw", yaw, f_t_c, rate_deg_s=cfg.wiggle_deg_s, fixed_percent=test_percent),
             _move("test_yaw_back", centre, f_t_c, rate_deg_s=cfg.wiggle_deg_s)]
+
+
+def _start_axes(start: np.ndarray, camera: np.ndarray) -> set[int]:
+    """camera 的光心在经过起点光心的哪几根轴（前 0、左 1、上 2）上（离轴 ≤ VIA_TOL_MM）；就在起点时三根都算。"""
+    d = start_offsets(start, camera[:3, 3])
+    return {k for k in range(3) if np.hypot(*np.delete(d, k)) <= VIA_TOL_MM}
+
+
+def drop_needless_via(segments: list[Segment], current_camera: np.ndarray, start: np.ndarray) -> None:
+    """去掉用不着的 via_start（先回起点）：从当前位姿直接移到下一段的目标，如果是在起点原地转动，
+    或者两头都保持起点姿态、在同一根起点轴上（就是沿这根轴平移），就直接过去。"""
+    i = next((k for k, s in enumerate(segments) if s.name == "via_start"), None)
+    if i is None or i + 1 >= len(segments):
+        return
+    target = segments[i + 1].camera
+
+    def at_start(c):
+        return np.linalg.norm(c[:3, 3] - start[:3, 3]) * 1000.0 <= VIA_TOL_MM
+
+    def level(c):
+        return rotation_deg(c, start) <= VIA_TOL_DEG
+
+    if ((at_start(current_camera) and at_start(target))
+            or (level(current_camera) and level(target) and _start_axes(start, current_camera) & _start_axes(start, target))):
+        del segments[i]
 
 
 def fill_geometry(segments: list[Segment], current_flange: np.ndarray) -> None:
@@ -586,12 +633,7 @@ def pose_span(segments: list[Segment], start_camera: np.ndarray, f_t_c: np.ndarr
         if seg.kind != "move" or not (seg.recorded or seg.name == "goto_start"):
             continue
         for flange in [seg.flange] + ([seg.via_flange] if seg.via_flange else []):
-            r = r0.T @ (fr5_to_matrix(flange) @ f_t_c)[:3, :3]
-            z, x = r[:, 2], r[:, 0]
-            horiz = np.cross(z, [0.0, -1.0, 0.0])                 # 光轴的水平右方向（z × 上）
-            horiz /= np.linalg.norm(horiz)
-            roll = math.degrees(math.atan2(np.cross(horiz, x) @ z, horiz @ x))
-            vals.append((math.degrees(math.atan2(-z[0], z[2])), math.degrees(math.asin(-z[1])), roll))
+            vals.append(orientation_angles(r0.T @ (fr5_to_matrix(flange) @ f_t_c)[:3, :3]))
     lo, hi = np.min(vals, axis=0), np.max(vals, axis=0)
     return {k: (float(lo[i]), float(hi[i])) for i, k in enumerate(("heading", "pitch", "roll"))}
 
