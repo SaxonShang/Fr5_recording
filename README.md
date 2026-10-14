@@ -14,7 +14,7 @@
 | 平移（2026-10-12） | 相机水平朝前，沿一个方向平移 300 mm，0.05 m/s：前进、后退、右移、左移、上升、下降 | 6 |
 | 旋转（2026-10-13） | 绕左目光心单轴旋转，5 °/s：偏航 10°、俯仰 30°、横滚 30°，正反方向各一条 | 6 |
 
-- **相机真值**：`base_T_camera(t) = base_T_flange(t) · flange_T_left_camera`。手眼外参来自标定仓库[fr5-zedx-handeye-calibration](https://github.com/SaxonShang/fr5-zedx-handeye-calibration)**** s003 的结果（`scripts/handeye_s003_result.json`），前提是相机安装之后没有动过。
+- **相机真值**：`base_T_camera(t) = base_T_flange(t) · flange_T_left_camera`。手眼外参来自标定仓库[fr5-zedx-handeye-calibration](https://github.com/SaxonShang/fr5-zedx-handeye-calibration) s003 的结果（`scripts/handeye_s003_result.json`），前提是相机安装之后没有动过。
 - 正式录制前验证了时间同步和真值（用固定的标定板，只在验证录制中出现）；画面里没有人走动，也没有拍到玻璃窗。
 
 ## 2. 硬件、网络与软件版本
