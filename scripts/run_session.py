@@ -3,59 +3,45 @@
 所有可改参数都在本文件开头，其他模块不放可调参数。
 
 在 Box 自己的终端里运行（人在机械臂旁边，手边有急停）：
-    python3 run_session.py set-start        读当前位姿，算出相机水平的起点并保存（不动机械臂）
-    python3 run_session.py mark forward     手动拖到某个方向的极限位姿后，记下当前位姿（不动机械臂）；
-                                            名字和录制名相同（forward … down、yaw_left … roll_right）
-    python3 run_session.py limits           按拖动标记给出行程、转角和关节范围的建议（不连机械臂）
-    python3 run_session.py plan             空跑：检查全部录制（6 条平移、6 条旋转）和 sync-test 的路径（不动机械臂）
-    python3 run_session.py goto-start       低速移到水平起点（会先确认）
-    python3 run_session.py speed-test       速度标定：实测速度百分比对应的 mm/s 和 °/s（会先确认，不开相机）
+    python3 run_session.py set-start        读当前位姿，算出相机水平的参考起点并保存（不动机械臂；10-10 已做，一般不用再做）
+    python3 run_session.py mark up          手动拖到某个方向的极限位姿后，记下当前位姿（不动机械臂）；
+                                            平移 forward/backward/left/right/up/down，旋转 yaw_left … roll_right
+    python3 run_session.py limits           按拖动标记列出每条录制的路径（不连机械臂）
+    python3 run_session.py plan             空跑：按标记定路径、用控制器逆解收两端，检查 6 条录制和 sync-test（不动机械臂）
+    python3 run_session.py goto-start       低速移到参考起点（会先确认；sync-test、movec-test 在这里做）
+    python3 run_session.py speed-test       速度标定：在上下那条路径上实测速度百分比对应的 mm/s 和 °/s（会先确认，不开相机）
     python3 run_session.py sync-test        时间同步验证：只做同步摆动的录制（会先确认）
-    python3 run_session.py movec-test       MoveC 探测：在起点用 MoveC 和 MoveL 各绕光心竖直轴转 ±10°，对照光心偏离（会先确认，不开相机）
-    python3 run_session.py record forward   正式录制一条（会先确认）
-                                            平移：forward/backward/right/left/up/down
-                                            旋转（绕光心）：yaw_left/yaw_right/pitch_up/pitch_down/roll_left/roll_right
-选项：--scale 0.25  首次运行按比例降速；--yes  跳过确认（只在你已经看过计划时用）；
+    python3 run_session.py movec-test       MoveC 探测：在参考起点用 MoveC 和 MoveL 各绕光心竖直轴转 ±10°，对照光心偏离
+    python3 run_session.py record up        正式录制一条（会先确认）。每对标记录一条，共 6 条：
+                                            平移 up（最下到最上）、right（最左到最右）、forward（最后到最前）；
+                                            旋转 yaw_left（偏航，右到左）、pitch_up（俯仰，下到上）、roll_right（横滚，左到右）。
+                                            反方向（down、left、backward、yaw_right、pitch_down、roll_left）也能录
+选项：--scale 0.25  按比例降速（路径不变）；--yes  跳过确认（只在你已经看过计划时用）；
       --tag board  加在录制目录名后面（区分验证录制和正式录制）
 
 每条录制单独一个目录 SESSIONS_DIR/时间_名称/，相机和机械臂数据都在其中的 save_data/ 里。
-有拖动标记时，plan 和 record 检查录制两端离标记至少 LIMIT_MARGIN_MM / LIMIT_MARGIN_DEG；
-移到录制起点时先回 set-start 的起点（只走经过起点的轴），已经在同一根轴上时直接过去。
+录制的路径由这一对拖动标记定（fr5_limits）：标记只是大概的极限，两端先收进 LIMIT_MARGIN_MM / LIMIT_MARGIN_DEG，
+再按逆解、关节速度、右窗和同步摆动往里收。不回参考起点：开头从机械臂当前位姿直接移到录制起点。
 sync-test 和 record 需要先有 speed-test 的结果；改了 WebApp 速度百分比要重跑 speed-test。
 """
 
 # ================================ 可修改参数 ================================
 # 高速录制（high-speed 分支，2026-10-14 起）：平移 0.5 m/s、旋转 50 °/s、30 fps、曝光 2.5 ms，只避开右侧落地窗。
 # 10-12 平移、10-13 旋转的低速录制用的是 git 标签 data-v1 的设置（路径组 "base"）。
-PATH_SET = "fast1"           # 这一套路径几何的名字，写进 motion_log；真值的行程、转角系数按它查（fr5_groundtruth）。
-                             # 改了路径几何（起点、行程、转角、中心朝向）就换个名字，免得用错系数
+PATH_SET = "fast2"           # 这一套路径几何的名字，写进 motion_log；真值的行程、转角系数按它查（fr5_groundtruth）。
+                             # fast2 = 10-14 起按拖动标记定的路径；重新拖动标记、路径变了就换个名字，免得用错系数
 SPEED_MPS = 0.5              # 平移速度 m/s
-# 平移路径：每对方向一个行程中点和行程 m。中点 = set-start 的起点按起点相机的（前, 左, 上）方向偏移 mm。
-# 10-14 离线逆解算出：关节在 JOINT_MIN/MAX_DEG 内（J2 ≤ 34°）、光心不低于 MIN_CAMERA_Z_M、两端都能往左摆 WIGGLE_DEG、
-# 0.5 m/s 时关节 ≤ 150 °/s、右窗按 WINDOW_DISTANCE_M 算视差也看不到。加速度按 2.5 m/s² 估，匀速段前后 340、左右 430、
-# 上下 340 mm（speed-test 后核对）。上下那条比原起点偏左 300 mm、光心高 0.47–0.91 m
-TRANSLATION_PATHS = {
-    "forward_backward": ((-20.0, 100.0, -50.0), 0.44),
-    "left_right": ((-50.0, 45.0, 50.0), 0.53),
-    "up_down": ((-50.0, 300.0, 130.0), 0.44),
-}
 TRANSLATION_WIGGLE_SIDE = 1  # 平移录制和 sync-test 的同步摆动：+1 只往左摆（画面右边缘离右窗更远），0 两边摆
-YAW_DEG = 30.0               # 偏航录制的总转角 °（以中心姿态为中心，两边各一半；绕光心，MoveC）：右边到右窗、左边到 J5 限位
-PITCH_DEG = 30.0             # 俯仰录制的总转角 °：J4 两头的限位允许约 ±16.8°
-ROLL_DEG = 90.0              # 横滚录制的总转角 °（绕光轴，基本只转 J6）：90° 时 J6 约 ±46°，在 ±50° 以内
-ROT_DEG_S = 50.0             # 旋转角速度 °/s（50 °/s 时最快的关节：偏航 J5 61、俯仰 J4 96、横滚 J6 51 °/s）
-YAW_HEADING_DEG = 7.75       # 偏航 / 俯仰 / 横滚录制的中心朝向：起点绕竖直轴转这么多 °（正 = 向左）。偏航转到 −7.25～+22.75°；
-PITCH_HEADING_DEG = -5.0     # 俯仰、横滚和低速录制相同（俯仰沿用已标定转角系数的那条路径）
-ROLL_HEADING_DEG = -2.0
+ROT_DEG_S = 50.0             # 旋转角速度 °/s
 # 画面里不能出现的玻璃：只管右侧落地窗（用户 10-13 定，左窗可以拍）。每块是 (方位角起, 方位角止, 仰角下, 仰角上)，单位 °，
-# 从起点光心看、相对起点水平朝向，方位角正 = 向左、仰角正 = 向上。10-13 全景图量出：右窗玻璃从柱子边缘 −60.3° 往右，
+# 从参考起点（set-start）的光心看、相对它的水平朝向，方位角正 = 向左、仰角正 = 向上。10-13 全景图量出：右窗玻璃从柱子边缘 −60.3° 往右，
 # 仰角约 −6.5～+4°（上面到天花板的白条也算进去）；−87° 以右没拍到，按全是玻璃处理。
 GLASS_REGIONS = [
     (-87.0, -60.3, -8.0, 11.0),
     (-180.0, -87.0, -90.0, 90.0),
 ]
 GLASS_MARGIN_DEG = 1.0       # 画面离玻璃至少这么多 °（画面左右边缘 1° 约 35 px）
-WINDOW_DISTANCE_M = 7.0      # 玻璃离起点光心的最近距离 m（窗底仰角 −6.5°、相机离地至少约 0.8 m 估的下限）；光心移动时按它算视差
+WINDOW_DISTANCE_M = 7.0      # 玻璃离参考起点光心的最近距离 m（窗底仰角 −6.5°、相机离地至少约 0.8 m 估的下限）；光心移动时按它算视差
 CAMERA_FPS = 30              # 相机帧率（15 / 30 / 60，传给 zed_record）
 EXPOSURE_US = 2500           # 曝光 μs（传给 zed_record）
 ANALOG_GAIN_MDB = 13000      # 模拟增益 mdB（传给 zed_record）：2.5 ms、13 dB 的亮度和 10 ms、1 dB 差不多（10-14 实测）
@@ -68,23 +54,29 @@ WIGGLE_DEG = 10.0            # 同步摆动幅度 °（平移录制和 sync-test
 WIGGLE_DEG_S = 20.0          # 同步摆动角速度 °/s（真值脚本要求至少 10 °/s）
 WIGGLE_CYCLES = 2            # 同步摆动来回次数
 SYNC_TEST_HOLD_S = 10.0      # sync-test 两次摆动之间的静止 s
-REPOSITION_MPS = 0.05        # 录制前移到起点的速度 m/s
+REPOSITION_MPS = 0.05        # 录制前从当前位姿移到录制起点的速度 m/s
 WEBAPP_SPEED_PCT = 60        # WebApp 里的速度百分比（SDK 读不到，照抄过来）；WebApp 改了这里也要改，并重跑 speed-test。
                              # 高速录制用 60%（10-14 用户已在 WebApp 改好；0.5 m/s 约需 SDK 83%）
 ACCEL_PCT = 100              # MoveL 加速度百分比（oacc）；实际加速度看 speed-test 结果，起停太猛就调小再重跑 speed-test
 SPEED_TEST_PCT = 5           # speed-test 去程的速度百分比；没标定时最快为控制器默认速度 1000 mm/s 的 5% = 50 mm/s
 MAX_SPEED_ERROR = 0.10       # 平移实测速度和预计速度相差超过 10% 就警告（speed-test 里也用来检查是否成正比）
 MIN_CAMERA_Z_M = 0.35        # 相机光心最低高度（基坐标系 z，m）；按现场桌面和障碍物修改
-# 拖动标记（mark）：用户手动把机械臂拖到各方向能接受的极限位姿记下来。录制两端离标记至少留这么多余量
-# （到行程端点时同步摆动还要转 10°，法兰会横着摆出约 25 mm；高速时路径跟随也有误差）。
-LIMIT_MARGIN_MM = 30.0       # 平移：行程两端离 forward/backward/… 标记至少这么多 mm（沿运动方向）
-LIMIT_MARGIN_DEG = 3.0       # 旋转：转动范围两端离 yaw_left/yaw_right/… 标记至少这么多 °
+# 拖动标记（mark）：用户手动把机械臂拖到各方向能接受的极限位姿记下来，每对标记定一条录制（fr5_limits）。
+# 录制两端先离标记收进这么多（到行程端点时同步摆动还要转 10°，法兰会横着摆出约 25 mm；高速时路径跟随也有误差），
+# 再按逆解、关节速度、右窗、同步摆动往里收
+LIMIT_MARGIN_MM = 30.0       # 平移：行程两端离标记至少这么多 mm（沿运动方向）
+LIMIT_MARGIN_DEG = 3.0       # 旋转：转动范围两端离标记至少这么多 °
+MIN_STROKE_M = 0.15          # 平移行程收完后至少这么长，不够就不录（拖得再开一点，或者看 plan 说两端为什么收）
+MAX_STROKE_M = 1.0           # 平移行程上限
+MIN_ROTATION_DEG = 15.0      # 旋转转角下限（不小于 WIGGLE_DEG：同步摆动在转动范围以内）
+MAX_ROTATION_DEG = 180.0     # 旋转转角上限
 # 允许的关节范围（°）。腕部 J4–J6 限制在这套末端装置已经安全走过的范围内（再往外 Box 可能碰到腕部，
 # 见标定仓库 README 6.4 / 6.7）：10-10、10-12 录制实测 J4 −151～−99、J5 −69.5～−22.1、J6 一直是 0，各留约 3° 余量；
 # 俯仰 30° 要 J4 到 −90°：用户 10-13 确认不会碰撞，按标定走过的范围（J4 −154～−77）放宽到 J4 上限 −87。
 # J6 ±50：用户 10-13 目测在起点姿态下 J6 转 60° 以内不会碰（横滚），按用户要求再保守 10°；起点 J6 ≈ 0。
 # J1–J3 覆盖平移路径，离肘部奇异（J3=0）至少 15°。J2 ≤ 34°（低速录制走过的最大值 33.6°）：J2 再大时大臂往下倾、
 # 肘部低于底座安装面伸到机柜边上（10-14 移到起点时 J2 49.7° 控制器报警，实验记录）。
+# 每条录制再用它那一对拖动标记的关节角（外扩 2°）放宽：标记是用户拖过、确认安全的位姿。
 JOINT_MIN_DEG = [80.0, -30.0, -130.0, -154.0, -72.0, -50.0]
 JOINT_MAX_DEG = [160.0, 34.0, -15.0, -87.0, -19.0, 50.0]
 MAX_JOINT_STEP_DEG = 5.0     # 路径上每 10 mm / 2° 允许的最大关节变化（超过说明逆解可能跳支）
@@ -98,18 +90,12 @@ HANDEYE = "~/ROBOT/fr5_record/handeye_s003_result.json"
 START_POSE = "~/ROBOT/fr5_record/start_pose.json"
 SPEED_CAL = "~/ROBOT/fr5_record/speed_calibration.json"
 MOVEC_TEST = "~/ROBOT/fr5_record/movec_test.json"
-LIMIT_POSES = "~/ROBOT/fr5_record/limit_poses.json"
+LIMIT_POSES = "~/ROBOT/fr5_record/limit_poses.json"   # mark 记下的拖动标记
 
 # 允许范围 [下限, 上限]，超出就拒绝运行
 RANGES = {
     "SPEED_MPS": (0.02, 0.6),        # 上限还受 MAX_BLUR_PX 和关节速度约束
-    "YAW_DEG": (5.0, 35.0),          # 能不能转满还要看玻璃窗检查和 plan 的关节检查
-    "PITCH_DEG": (5.0, 30.0),
-    "ROLL_DEG": (5.0, 90.0),         # 90° 时 J6 −46.0～+45.8°（10-13 控制器逆解），在 J6 ±50 以内
     "ROT_DEG_S": (1.0, 60.0),        # 上限还受 MAX_BLUR_PX 和关节速度约束
-    "YAW_HEADING_DEG": (-10.0, 20.0),
-    "PITCH_HEADING_DEG": (-10.0, 0.0),   # 向左 J5 接近 0°，J6 要转得更多
-    "ROLL_HEADING_DEG": (-10.0, 10.0),
     "TRANSLATION_WIGGLE_SIDE": (-1, 1),
     "GLASS_MARGIN_DEG": (0.5, 5.0),
     "WINDOW_DISTANCE_M": (3.0, 50.0),
@@ -133,13 +119,15 @@ RANGES = {
     "MIN_CAMERA_Z_M": (0.0, 1.5),
     "LIMIT_MARGIN_MM": (10.0, 100.0),
     "LIMIT_MARGIN_DEG": (1.0, 10.0),
+    "MIN_STROKE_M": (0.05, 0.5),
+    "MAX_STROKE_M": (0.2, 1.2),
+    "MIN_ROTATION_DEG": (5.0, 60.0),
+    "MAX_ROTATION_DEG": (20.0, 180.0),
     "MAX_JOINT_STEP_DEG": (1.0, 15.0),
     "MAX_JOINT_SPEED_DEG_S": (30.0, 170.0),
     "MAX_SPEED_RIPPLE": (0.01, 0.2),
     "MIN_FREE_GB": (1.0, 100.0),
 }
-TRANSLATION_OFFSET_MAX_MM = 300.0   # TRANSLATION_PATHS 的偏移每个分量最多这么多
-TRANSLATION_STROKE_RANGE = (0.05, 0.6)
 # ==========================================================================
 
 import argparse
@@ -185,14 +173,12 @@ def p(path: str) -> Path:
 
 
 def motion_config() -> fm.MotionConfig:
-    return fm.MotionConfig(SPEED_MPS, 0.0, HOLD_START_S, HOLD_MID_S, HOLD_END_S,
+    return fm.MotionConfig(SPEED_MPS, HOLD_START_S, HOLD_MID_S, HOLD_END_S,
                            WIGGLE_DEG, WIGGLE_DEG_S, int(WIGGLE_CYCLES), REPOSITION_MPS, SYNC_TEST_HOLD_S,
-                           YAW_DEG, PITCH_DEG, ROT_DEG_S, YAW_HEADING_DEG, PITCH_HEADING_DEG,
-                           ROLL_DEG, ROLL_HEADING_DEG, translation_paths=TRANSLATION_PATHS,
-                           translation_wiggle_side=int(TRANSLATION_WIGGLE_SIDE))
+                           rot_deg_s=ROT_DEG_S, translation_wiggle_side=int(TRANSLATION_WIGGLE_SIDE))
 
 
-RECORD_NAMES = [*fm.DIRECTIONS, *fm.ROTATIONS]
+RECORD_NAMES = list(fl.RECORD_PAIR)          # 12 个方向都能录；每对标记录一条，默认的 6 条见 fl.RECORDINGS
 
 
 def pose_note(name: str, segs: list[fm.Segment], start_camera: np.ndarray, f_t_c: np.ndarray) -> tuple[str, list[str]]:
@@ -210,28 +196,6 @@ def pose_note(name: str, segs: list[fm.Segment], start_camera: np.ndarray, f_t_c
     if clear >= GLASS_MARGIN_DEG:
         return note, []
     return note, [f"画面离玻璃窗最近只有 {clear:.2f}°（{where} 段），少于 GLASS_MARGIN_DEG={GLASS_MARGIN_DEG}°"]
-
-
-def load_marks(start: dict, f_t_c: np.ndarray) -> tuple[dict, dict]:
-    """拖动标记：({名字: 相对起点的分解}, limit_poses.json 原文)；没有文件时都为空。
-    相机位姿按记下的法兰位姿和现在的手眼外参重算。"""
-    path = p(LIMIT_POSES)
-    if not path.exists():
-        return {}, {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return ({n: fl.relative(start["camera"], fm.fr5_to_matrix(m["flange"]) @ f_t_c) for n, m in data["marks"].items()},
-            data)
-
-
-def limit_note(name: str, segs: list[fm.Segment], start: dict, f_t_c: np.ndarray) -> tuple[str, list[str]]:
-    """录制是否在拖动标记以内（收进 LIMIT_MARGIN_MM / LIMIT_MARGIN_DEG）。返回 (说明, 问题列表)。"""
-    if name not in RECORD_NAMES and name != "speed-test":
-        return "", []
-    marks, _ = load_marks(start, f_t_c)
-    if not marks:
-        return f"还没有拖动标记（{p(LIMIT_POSES).name}），没有按拖动极限检查", []
-    return fl.limit_check("up" if name == "speed-test" else name, segs, start["camera"], f_t_c, marks,
-                          LIMIT_MARGIN_MM, LIMIT_MARGIN_DEG)
 
 
 CAL_KEYS = ("WEBAPP_SPEED_PCT", "ACCEL_PCT", "WIGGLE_DEG")  # 这些改了，speed-test 的结果就不能用了
@@ -301,20 +265,12 @@ def parameter_problems() -> list[str]:
         out.append(f"TRANSLATION_WIGGLE_SIDE = {TRANSLATION_WIGGLE_SIDE}，只能是 -1、0 或 1")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", str(PATH_SET)):
         out.append("PATH_SET 只能用字母、数字、_ 和 -，最多 20 个字符")
-    if set(TRANSLATION_PATHS) != set(fm.TRANSLATION_PAIRS.values()):
-        out.append(f"TRANSLATION_PATHS 必须正好有这几对：{sorted(set(fm.TRANSLATION_PAIRS.values()))}")
-    for pair, path in TRANSLATION_PATHS.items():
-        try:
-            (fwd, left, up), stroke = path
-            offsets = [float(fwd), float(left), float(up)]
-        except (TypeError, ValueError):
-            out.append(f"TRANSLATION_PATHS[{pair!r}] 必须是 ((前, 左, 上) mm, 行程 m)")
-            continue
-        if max(abs(v) for v in offsets) > TRANSLATION_OFFSET_MAX_MM:
-            out.append(f"TRANSLATION_PATHS[{pair!r}] 的偏移超过 ±{TRANSLATION_OFFSET_MAX_MM:g} mm")
-        lo, hi = TRANSLATION_STROKE_RANGE
-        if not lo <= stroke <= hi:
-            out.append(f"TRANSLATION_PATHS[{pair!r}] 的行程 {stroke} m 超出 [{lo}, {hi}]")
+    if MIN_STROKE_M >= MAX_STROKE_M:
+        out.append(f"MIN_STROKE_M = {MIN_STROKE_M} 必须小于 MAX_STROKE_M = {MAX_STROKE_M}")
+    if MIN_ROTATION_DEG >= MAX_ROTATION_DEG:
+        out.append(f"MIN_ROTATION_DEG = {MIN_ROTATION_DEG} 必须小于 MAX_ROTATION_DEG = {MAX_ROTATION_DEG}")
+    if MIN_ROTATION_DEG < WIGGLE_DEG:
+        out.append(f"MIN_ROTATION_DEG = {MIN_ROTATION_DEG} 小于 WIGGLE_DEG = {WIGGLE_DEG}：旋转录制的同步摆动会超出转动范围")
     return out
 
 
@@ -333,15 +289,84 @@ def current_pose(rec: StateRecorder):
 
 
 def check_segments(rec: StateRecorder, rpc, segs: list[fm.Segment], f_t_c, model, scale: float,
-                   start_camera: np.ndarray) -> list[str]:
+                   joint_limits: tuple[list, list] | None = None) -> list[str]:
     """从当前位姿出发做逆解检查，并按速度模型换算每段的速度百分比。返回问题列表。
-    已经在起点或同一根起点轴上时，先去掉用不着的 via_start（会改 segs）。"""
+    joint_limits：(下限, 上限)，默认 JOINT_MIN_DEG / JOINT_MAX_DEG（录制时用这对标记放宽过的范围）。"""
     flange, joints, _ = current_pose(rec)
-    fm.drop_needless_via(segs, flange @ f_t_c, start_camera)
-    problems = (fm.check_plan(rpc, segs, flange, joints, f_t_c, JOINT_MIN_DEG, JOINT_MAX_DEG,
-                              MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
+    lo, hi = joint_limits or (JOINT_MIN_DEG, JOINT_MAX_DEG)
+    problems = (fm.check_plan(rpc, segs, flange, joints, f_t_c, lo, hi, MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
                 + fm.apply_speed(segs, model, scale))
     return problems + fm.joint_speed_problems(segs, MAX_JOINT_SPEED_DEG_S, model)
+
+
+# ------------------------------------------------------------------ 拖动标记 → 路径
+def load_marks(f_t_c: np.ndarray) -> dict:
+    """拖动标记 {名字: limit_poses.json 里的记录 + "camera"（按记下的法兰位姿和现在的手眼外参算的相机位姿）}。"""
+    path = p(LIMIT_POSES)
+    if not path.exists():
+        return {}
+    marks = json.loads(path.read_text(encoding="utf-8"))["marks"]
+    return {n: {**m, "camera": fm.fr5_to_matrix(m["flange"]) @ f_t_c} for n, m in marks.items()}
+
+
+def pair_path(pair: str, marks: dict, start: dict) -> tuple[fl.MarkPath | None, str]:
+    """一对标记定出的路径（不连机械臂）；缺标记时为 (None, 说明)。"""
+    neg, pos = fl.PAIRS[pair]
+    missing = [n for n in (neg, pos) if n not in marks]
+    if missing:
+        return None, f"缺拖动标记 {'、'.join(missing)}（python3 run_session.py mark {missing[0]}）"
+    return fl.derive_path(pair, marks[neg]["camera"], marks[pos]["camera"], start["camera"],
+                          LIMIT_MARGIN_MM, LIMIT_MARGIN_DEG), ""
+
+
+def pair_limits(pair: str, marks: dict) -> tuple[list, list]:
+    neg, pos = fl.PAIRS[pair]
+    return fl.pair_joint_limits(JOINT_MIN_DEG, JOINT_MAX_DEG, [marks[neg]["joints"], marks[pos]["joints"]])
+
+
+def fit_pair(rpc, pair: str, marks: dict, start: dict, f_t_c: np.ndarray, model: fm.SpeedModel | None):
+    """按标记定路径，再用控制器逆解收两端。返回 (路径或 None, Fit 或 None, 关节范围, 问题列表)。
+    关节速度按满速算（不乘 --scale：降速演练和正式录制走同一条路径），有 speed-test 的加速度时按梯形速度曲线。"""
+    path, missing = pair_path(pair, marks, start)
+    if path is None:
+        return None, None, (JOINT_MIN_DEG, JOINT_MAX_DEG), [missing]
+    limits = pair_limits(pair, marks)
+    translate = path.kind == "translate"
+    accel = (model.accel_mm_s2 if translate else model.accel_deg_s2) if model else None
+    lim = fl.FitLimits(
+        joint_min=limits[0], joint_max=limits[1], reference_joints=start["joints"],
+        max_joint_step_deg=MAX_JOINT_STEP_DEG, min_camera_z_m=MIN_CAMERA_Z_M,
+        max_joint_speed_deg_s=MAX_JOINT_SPEED_DEG_S,
+        speed=SPEED_MPS * 1000.0 if translate else ROT_DEG_S, accel=accel,
+        min_length=MIN_STROKE_M * 1000.0 if translate else MIN_ROTATION_DEG,
+        max_length=MAX_STROKE_M * 1000.0 if translate else MAX_ROTATION_DEG,
+        glass=fm.GlassCheck(start["camera"], GLASS_REGIONS, distance_m=WINDOW_DISTANCE_M),
+        glass_margin_deg=GLASS_MARGIN_DEG,
+        wiggle_deg=WIGGLE_DEG if translate else 0.0, wiggle_side=int(TRANSLATION_WIGGLE_SIDE))
+    fit = fl.fit_path(rpc, path, f_t_c, marks[fl.PAIRS[pair][0]]["joints"], lim)
+    return path, fit, limits, list(fit.problems)
+
+
+def build_recording(rpc, direction: str, marks: dict, start: dict, f_t_c: np.ndarray, model):
+    """录制 direction 的全部段。返回 (段或 None, 路径说明, 写进 motion_log 的路径记录, 关节范围, 问题列表)。"""
+    pair = fl.RECORD_PAIR[direction][0]
+    path, fit, limits, problems = fit_pair(rpc, pair, marks, start, f_t_c, model)
+    if path is None:
+        return None, "", None, limits, problems
+    note = fl.describe_path(path, fit)
+    if path.warnings:
+        note += "\n" + "\n".join(f"  注意：{w}" for w in path.warnings)
+    if problems:
+        return None, note, None, limits, problems
+    segs = fl.recording_segments(direction, path, fit, f_t_c, motion_config())
+    neg, pos = fl.PAIRS[pair]
+    record = {"pair": pair, "kind": path.kind,
+              "marks": {n: {k: v for k, v in marks[n].items() if k != "camera"} for n in (neg, pos)},
+              "base_T_camera": path.base.tolist(), "axis": path.axis.tolist(), "heading_deg": path.heading_deg,
+              "marks_s": list(path.marks_s), "margin_range": [path.lo, path.hi], "range": [fit.a, fit.b],
+              "unit": path.unit, "ends": fit.ends, "fit_max_joint_speed_deg_s": fit.max_joint_speed_deg_s,
+              "joint_min": limits[0], "joint_max": limits[1], "warnings": path.warnings}
+    return segs, note, record, limits, []
 
 
 def confirm_plan(text: str, assume_yes: bool) -> None:
@@ -425,11 +450,27 @@ def cmd_set_start(args) -> int:
     return 0
 
 
-def describe_mark(name: str, rel: dict) -> str:
-    o, a = rel["offset_mm"], rel["angles_deg"]
-    unit = "mm" if name in fl.TRANSLATION_MARKS else "°"
-    return (f"到 {fl.reach(name, rel):+.1f} {unit}；光心相对起点 前 {o[0]:+.0f}、左 {o[1]:+.0f}、上 {o[2]:+.0f} mm，"
-            f"姿态 方位角 {a[0]:+.1f}°、俯仰 {a[1]:+.1f}°、横滚 {a[2]:+.1f}°")
+def describe_mark(rel: dict) -> str:
+    fwd, left, up = (fl.signed(v, 0) for v in rel["offset_mm"])
+    head, pitch, roll = (fl.signed(v) for v in rel["angles_deg"])
+    return f"光心相对参考起点 前 {fwd}、左 {left}、上 {up} mm，姿态 方位角 {head}°、俯仰 {pitch}°、横滚 {roll}°"
+
+
+def mark_pair(name: str) -> str:
+    return next(pair for pair, ends in fl.PAIRS.items() if name in ends)
+
+
+def print_pair(pair: str, marks: dict, start: dict, indent: str = "  ") -> None:
+    """一对标记定出的路径（还没按逆解收两端）、提醒和问题。"""
+    path, missing = pair_path(pair, marks, start)
+    if path is None:
+        print(f"{indent}{fl.PAIR_LABEL[pair]}：{missing}")
+        return
+    print(indent + fl.describe_path(path).replace("\n", "\n" + indent))
+    for w in path.warnings:
+        print(f"{indent}  注意：{w}")
+    for m in path.problems:
+        print(f"{indent}  问题：{m}")
 
 
 def cmd_mark(args) -> int:
@@ -451,10 +492,10 @@ def cmd_mark(args) -> int:
         return 1
     branch = fl.branch_problem(joints, start["joints"])
     if branch:
-        print(f"没有记：{branch}。\n  关节 {np.round(joints, 1).tolist()}，起点 {np.round(start['joints'], 1).tolist()}；"
-              "录制时机械臂保持起点的构型，到不了这个位姿。先拖回起点的构型，再沿一个方向拖")
+        print(f"没有记：{branch}。\n  关节 {np.round(joints, 1).tolist()}，常用构型（参考起点）"
+              f"{np.round(start['joints'], 1).tolist()}；录制用直线运动，到不了另一种构型。先拖回常用构型再拖到极限")
         return 1
-    rel = fl.relative(start["camera"], flange @ f_t_c)
+    camera = flange @ f_t_c
     path = p(LIMIT_POSES)
     data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"marks": {}}
     old = data["marks"].get(args.direction)
@@ -462,127 +503,57 @@ def cmd_mark(args) -> int:
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "flange": fm.matrix_to_fr5(flange),
         "joints": list(map(float, joints)),
-        "base_T_camera": (flange @ f_t_c).tolist(),
-        "start_created": start["created"],
+        "base_T_camera": camera.tolist(),
         "handeye_sha256": handeye["sha256"],
         "main_code": int(pkg.main_code), "sub_code": int(pkg.sub_code),
     }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"已记下 {args.direction}（{path}）")
-    print(f"  {describe_mark(args.direction, rel)}")
+    print(f"  {describe_mark(fl.relative(start['camera'], camera))}")
     print(f"  关节 {np.round(joints, 1).tolist()}")
     if old is not None:
-        before = fl.relative(start["camera"], fm.fr5_to_matrix(old["flange"]) @ f_t_c)
-        print(f"  替换了 {old['created']} 的标记（{describe_mark(args.direction, before)}）")
-    for w in fl.mark_warnings(args.direction, rel):
-        print(f"  注意：{w}")
-    missing = [n for n in RECORD_NAMES if n not in data["marks"]]
-    print("  还没记：" + "、".join(missing) if missing else "  12 个方向都记了：运行 python3 run_session.py limits 看建议")
+        before = fm.fr5_to_matrix(old["flange"]) @ f_t_c
+        print(f"  替换了 {old['created']} 的标记（光心差 {np.linalg.norm(before[:3, 3] - camera[:3, 3]) * 1000:.0f} mm、"
+              f"姿态差 {fm.rotation_deg(before, camera):.1f}°）")
+    print_pair(mark_pair(args.direction), load_marks(f_t_c), start)
+    missing = [n for n in fl.MARK_NAMES if n not in data["marks"]]
+    print("还没记：" + "、".join(missing) if missing
+          else "12 个标记都记了：python3 run_session.py plan 按逆解收两端、检查全部录制")
     return 0
 
 
 def cmd_limits(args) -> int:
-    """按拖动标记和起点给出行程、转角、关节范围的建议（不连机械臂）。"""
+    """按拖动标记列出每条录制的路径（还没按逆解收两端；不连机械臂）。"""
     f_t_c, _ = gt.load_handeye(p(HANDEYE))
     start = load_start()
-    marks, data = load_marks(start, f_t_c)
+    marks = load_marks(f_t_c)
     if not marks:
         print(f"还没有拖动标记（{p(LIMIT_POSES)}）：手动拖到极限位姿后运行 python3 run_session.py mark <方向>")
         return 1
-    print(f"起点光心 {np.round(start['camera'][:3, 3] * 1000).tolist()} mm（{start['created']}）；"
-          f"余量：平移 {LIMIT_MARGIN_MM:g} mm、旋转 {LIMIT_MARGIN_DEG:g}°")
-    if any(m.get("start_created") != start["created"] for m in data["marks"].values()):
-        print("注意：有的标记是在另一个起点下记的（按记下的位姿相对现在的起点重新分解）")
+    print(f"余量：平移 {LIMIT_MARGIN_MM:g} mm、旋转 {LIMIT_MARGIN_DEG:g}°；角度相对参考起点（{start['created']}），"
+          "方位角正 = 向左、俯仰正 = 向上、横滚正 = 画面顶部向右")
     print("\n拖动标记：")
-    for name in RECORD_NAMES:
+    for name in fl.MARK_NAMES:
         if name not in marks:
             print(f"  {name:<11} （没有）")
             continue
-        print(f"  {name:<11} {describe_mark(name, marks[name])}")
-        print(f"  {'':<11} 关节 {np.round(data['marks'][name]['joints'], 1).tolist()}（{data['marks'][name]['created']}）")
-        branch = fl.branch_problem(data["marks"][name]["joints"], start["joints"])
-        for w in fl.mark_warnings(name, marks[name]) + ([branch] if branch else []):
-            print(f"  {'':<11} 注意：{w}")
-
-    model, _ = load_speed_model()
-    accel = model.accel_mm_s2 if model else None
-    v = SPEED_MPS * 1000.0
-    print("\n平移（行程在经过起点的轴上，两端离标记各 " + f"{LIMIT_MARGIN_MM:g} mm）：")
-    paths = {}
-    for pair, s in fl.suggest_translation(marks, LIMIT_MARGIN_MM, TRANSLATION_STROKE_RANGE[1] * 1000.0).items():
-        pos, neg = fl.TRANSLATION_PAIRS[pair]
-        k = fl.TRANSLATION_MARKS[pos][0]
-        (cur_off, cur_stroke), axis = TRANSLATION_PATHS[pair], fl.AXIS_LABEL[k]
-        now = f"现在 {cur_stroke * 1000:.0f} mm、中点偏移 {tuple(cur_off)}"
-        if s is None:
-            print(f"  {pair}：缺 {pos} 或 {neg} 的标记；{now}")
-            continue
-        if s["mid_mm"] is None:
-            print(f"  {pair}：两端收进余量后没有空间（{axis} {s['lo']:+.0f}～{s['hi']:+.0f} mm）；{now}")
-            continue
-        off = [0.0, 0.0, 0.0]
-        off[k] = float(s["mid_mm"])
-        paths[pair] = (tuple(off), s["stroke_mm"] / 1000.0)
-        cruise = (f"，{SPEED_MPS} m/s 时匀速段约 {s['stroke_mm'] - v * v / accel:.0f} mm" if accel
-                  else "（speed-test 后才能算匀速段）")
-        cap = (f"（可用 {s['hi'] - s['lo']:.0f} mm，行程上限 {TRANSLATION_STROKE_RANGE[1] * 1000:.0f}）"
-               if s["hi"] - s["lo"] >= s["stroke_mm"] + 10.0 else "")
-        print(f"  {pair}：{axis} {s['lo']:+.0f}～{s['hi']:+.0f} mm → 行程 {s['stroke_mm']:.0f} mm{cap}，"
-              f"中点 {axis} {s['mid_mm']:+.0f} mm{cruise}；{now}")
-
-    glass_right, _ = fl.glass_heading_limits(GLASS_REGIONS, GLASS_MARGIN_DEG)
-    caps = {"yaw": RANGES["YAW_DEG"][1], "pitch": RANGES["PITCH_DEG"][1], "roll": RANGES["ROLL_DEG"][1]}
-    rot = fl.suggest_rotation(marks, LIMIT_MARGIN_DEG, caps, glass_right)
-    print(f"\n旋转（绕起点光心，两端离标记各 {LIMIT_MARGIN_DEG:g}°）：")
-    now = {"yaw": f"现在 {YAW_DEG:g}°、中心朝向 {YAW_HEADING_DEG:+g}°", "pitch": f"现在 {PITCH_DEG:g}°",
-           "roll": f"现在 {ROLL_DEG:g}°"}
-    label = {"yaw": "偏航", "pitch": "俯仰", "roll": "横滚"}
-    for kind, s in rot.items():
-        pos, neg = fl.ROTATION_PAIRS[kind]
-        if s is None:
-            print(f"  {label[kind]}：缺 {pos} 或 {neg} 的标记；{now[kind]}")
-            continue
-        if kind == "yaw":
-            glass = f"，右窗要求 ≥ {glass_right:+.1f}°" if glass_right is not None else ""
-            avail = s["hi"] - s["lo"]
-            body = (f"{s['deg']:g}°，中心朝向 {s['heading']:+.2f}°（{s['heading'] - s['deg'] / 2:+.2f}～"
-                    f"{s['heading'] + s['deg'] / 2:+.2f}°）" if s["heading"] is not None else "没有空间")
-        else:
-            glass, avail = "", 2.0 * min(s["hi"], -s["lo"])
-            body = f"以{'水平' if kind == 'pitch' else '不横滚'}为中心 {s['deg']:g}°（±{s['deg'] / 2:g}°）"
-        cap = f"（标记允许 {avail:.1f}°，上限 {caps[kind]:g}°）" if avail > caps[kind] + 0.5 else ""
-        print(f"  {label[kind]}：标记收进余量 {s['lo']:+.1f}～{s['hi']:+.1f}°{glass} → {body}{cap}；{now[kind]}")
-
-    joint_sets = {"起点": start["joints"], **{n: data["marks"][n]["joints"] for n in marks}}
-    lo, hi, lo_from, hi_from = fl.joint_envelope(joint_sets)
-    # 标记是用户确认过的位姿，只用来放宽现有范围；收窄由上面的位移 / 转角检查负责（行程端点的同步摆动要转腕部，
-    # 按标记的包络卡关节会把它拦住）
-    new_min = [min(a, b) for a, b in zip(JOINT_MIN_DEG, lo)]
-    new_max = [max(a, b) for a, b in zip(JOINT_MAX_DEG, hi)]
-    print(f"\n关节（起点和全部标记的包络，外扩 {fl.JOINT_TOL_DEG:g}°；只用来放宽现有范围）：")
-    for j in range(6):
-        wider = "".join(f"，{label}放宽到 {v:+.0f}" for label, v, old in (("下限", new_min[j], JOINT_MIN_DEG[j]),
-                                                                         ("上限", new_max[j], JOINT_MAX_DEG[j]))
-                        if v != old)
-        print(f"  J{j + 1}：{lo[j]:+.0f}（{lo_from[j]}）～{hi[j]:+.0f}（{hi_from[j]}）；"
-              f"现在 {JOINT_MIN_DEG[j]:+.0f}～{JOINT_MAX_DEG[j]:+.0f}{wider}")
-
-    print("\n建议参数（改之前先用 plan 检查逆解、关节速度和右窗；speed-test 之后再定）：")
-    if paths:
-        print("TRANSLATION_PATHS = {")
-        for pair in TRANSLATION_PATHS:
-            off, stroke = paths.get(pair, TRANSLATION_PATHS[pair])
-            print(f"    \"{pair}\": (({off[0]:.1f}, {off[1]:.1f}, {off[2]:.1f}), {stroke:.2f}),"
-                  + ("" if pair in paths else "   # 缺标记，未改"))
-        print("}")
-    if rot["yaw"] and rot["yaw"]["heading"] is not None:
-        print(f"YAW_DEG = {rot['yaw']['deg']:.1f}\nYAW_HEADING_DEG = {rot['yaw']['heading']:.2f}")
-    if rot["pitch"] and rot["pitch"]["deg"] > 0:
-        print(f"PITCH_DEG = {rot['pitch']['deg']:.1f}")
-    if rot["roll"] and rot["roll"]["deg"] > 0:
-        print(f"ROLL_DEG = {rot['roll']['deg']:.1f}")
-    if new_min != list(JOINT_MIN_DEG) or new_max != list(JOINT_MAX_DEG):
-        print(f"JOINT_MIN_DEG = {new_min}\nJOINT_MAX_DEG = {new_max}")
+        m = marks[name]
+        print(f"  {name:<11} {describe_mark(fl.relative(start['camera'], m['camera']))}")
+        print(f"  {'':<11} 关节 {np.round(m['joints'], 1).tolist()}（{m['created']}）")
+        branch = fl.branch_problem(m["joints"], start["joints"])
+        if branch:
+            print(f"  {'':<11} 问题：{branch}")
+    print("\n录制路径（plan 再按逆解、关节速度、右窗和同步摆动收两端）：")
+    for pair in fl.PAIRS:
+        names = [n for n in fl.RECORDINGS if fl.RECORD_PAIR[n][0] == pair]
+        print(f"\n  [{' / '.join(names)}]")
+        print_pair(pair, marks, start, "  ")
+        if all(n in marks for n in fl.PAIRS[pair]):
+            lo, hi = pair_limits(pair, marks)
+            wider = [f"J{j + 1} {lo[j]:+.0f}～{hi[j]:+.0f}" for j in range(6)
+                     if (lo[j], hi[j]) != (JOINT_MIN_DEG[j], JOINT_MAX_DEG[j])]
+            if wider:
+                print("    关节范围按这对标记放宽：" + "，".join(wider))
     return 0
 
 
@@ -592,43 +563,45 @@ def cmd_plan(args, problems: list[str]) -> int:
     f_t_c, _ = gt.load_handeye(p(HANDEYE))
     start = load_start()
     cfg = motion_config()
-    names = args.names or [*RECORD_NAMES, "sync-test"]
+    names = args.names or [*fl.RECORDINGS, "sync-test"]
     unknown = [n for n in names if n not in RECORD_NAMES and n != "sync-test"]
     if unknown:
         print(f"不认识的录制名：{unknown}")
         return 2
+    marks = load_marks(f_t_c)
     print(f"路径组 {PATH_SET}；相机 {CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB")
-    for pair, ((fwd, left, up), stroke) in TRANSLATION_PATHS.items():
-        mid, _ = fm.translation_path(next(d for d, q in fm.TRANSLATION_PAIRS.items() if q == pair), start["camera"], cfg)
-        print(f"  平移 {pair}：行程 {stroke * 1000:.0f} mm，中点光心 {np.round(mid[:3, 3] * 1000).tolist()} mm"
-              f"（起点 前 {fwd:+.0f}、左 {left:+.0f}、上 {up:+.0f} mm）")
     print(f"模糊估算：{NEAREST_DEPTH_M} m 处 左右/上下平移 {fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px，"
           f"前后平移画面边缘约 {1.3 * fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px；"
           f"旋转 {fm.rotation_blur_px(ROT_DEG_S, EXPOSURE_US):.2f} px（1080p）")
     model, note = load_speed_model()
-    print(note if model else f"注意：{note}；下面没有速度百分比，时长按设计速度估算")
+    print(note if model else f"注意：{note}；下面没有速度百分比，时长按设计速度估算，关节速度按全程匀速（偏保守）")
     with tempfile.TemporaryDirectory() as tmp:
         rec = StateRecorder(tmp, ROBOT_IP)
         rec.start()
         try:
             rpc = rec.open_rpc()
             for name in names:
-                segs = (fm.plan_sync_test(start["camera"], f_t_c, cfg) if name == "sync-test"
-                        else fm.plan_recording(name, start["camera"], f_t_c, cfg))
-                note, found = pose_note(name, segs, start["camera"], f_t_c)
-                lnote, lfound = limit_note(name, segs, start, f_t_c)
-                found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, start["camera"]) + found + lfound
+                if name == "sync-test":
+                    segs, path_note, found, limits = fm.plan_sync_test(start["camera"], f_t_c, cfg), "", [], None
+                else:
+                    segs, path_note, _, limits, found = build_recording(rpc, name, marks, start, f_t_c, model)
+                if segs is not None:
+                    note, glass = pose_note(name, segs, start["camera"], f_t_c)
+                    found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits) + glass
                 print(f"\n=== {name}：{'通过' if not found else '有问题'}")
-                for text in (note, lnote):
+                for text in (path_note, note if segs is not None else ""):
                     if text:
-                        print(f"  {text}")
-                print(describe(segs))
+                        print("  " + text.replace("\n", "\n  "))
+                if segs is not None:
+                    print(describe(segs))
                 for m in found:
                     print(f"  问题：{m}")
                 problems += found
         finally:
             rec.stop(write=False)
     print("\n空跑检查" + ("全部通过（机械臂没有动）" if not problems else f"发现 {len(problems)} 个问题（机械臂没有动）"))
+    if any(m.startswith("goto_start") for m in problems):
+        print("goto_start 的问题是从机械臂现在的位姿直接移过去走不通：先手动拖到那条录制的起点附近（同一种构型）再试")
     return 0 if not problems else 1
 
 
@@ -721,17 +694,10 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
     else:
         data_dir = Path(tempfile.mkdtemp(prefix="fr5_goto_"))
 
-    if kind == "record":
-        segs = fm.plan_recording(direction, start["camera"], f_t_c, cfg)
-    elif kind == "sync-test":
-        segs = fm.plan_sync_test(start["camera"], f_t_c, cfg)
-    else:
-        segs = fm.plan_sync_test(start["camera"], f_t_c, cfg)[:1]  # 只移到起点
-
     rec = StateRecorder(data_dir, ROBOT_IP)
     rec.start()
     zed = ZedRecord(p(ZED_RECORD), session_dir, EXPOSURE_US, ANALOG_GAIN_MDB, CAMERA_FPS) if session_dir else None
-    error, ran = None, False
+    error, ran, segs, mark_path = None, False, [], None
     try:
         rpc = rec.open_rpc()
         runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
@@ -739,27 +705,37 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         if model is None:                        # 只有 goto-start 允许没标定
             model = conservative_model(rpc)
             note = "还没有速度标定，按保守假设换算（实际只会更慢）"
+        path_note, limits = "", None
+        if kind == "record":                     # 按这一对拖动标记定路径，用逆解收两端
+            built, path_note, mark_path, limits, found = build_recording(rpc, direction, load_marks(f_t_c), start,
+                                                                         f_t_c, model)
+            if built is None:
+                raise fm.MotionAborted("路径没定下来，没有运动：\n" + (path_note + "\n" if path_note else "")
+                                       + "\n".join(f"  {m}" for m in found))
+            segs = built
+        elif kind == "sync-test":
+            segs = fm.plan_sync_test(start["camera"], f_t_c, cfg)
+        else:
+            segs = fm.plan_sync_test(start["camera"], f_t_c, cfg)[:1]  # 只移到参考起点
         pose, found = pose_note(name, segs, start["camera"], f_t_c)
-        lnote, lfound = limit_note(name, segs, start, f_t_c)
-        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, start["camera"]) + found + lfound
-        pose = "\n".join(text for text in (pose, lnote) if text)
+        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits) + found
         if found:
-            raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
+            raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found)
+                                   + ("\n（goto_start 走不通时，先手动拖到这条录制的起点附近再试）"
+                                      if any(m.startswith("goto_start") for m in found) else ""))
         header = (f"{name}：速度比例 {args.scale}，路径组 {PATH_SET}"
                   + (f"，{CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
                   + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%"
+                  + (f"\n{path_note}" if path_note else "")
                   + (f"\n{pose}" if pose else ""))
         confirm_plan(header + "\n" + describe(segs, totals=zed is not None), args.yes)
         ran = True
-        lead = 0                                 # 开头不录制的移动：先回起点、移到这条的起点（相机还没开始录）
-        while lead < len(segs) and segs[lead].kind == "move" and not segs[lead].recorded:
-            runner.run(segs[lead])
-            report_move(segs[lead])
-            lead += 1
+        runner.run(segs[0])                      # 从当前位姿移到录制起点（相机还没开始录）
+        report_move(segs[0])
         if zed:
             zed.start()
             zed.wait_grabbing(30.0)
-            for seg in segs[lead:]:
+            for seg in segs[1:]:
                 print(f"[{seg.name}]", flush=True)
                 runner.run(seg)
                 if seg.kind == "move":
@@ -781,15 +757,15 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         return 1
     if session_dir is None:
         shutil.rmtree(data_dir, ignore_errors=True)
-        print("已到起点" if error is None else "")
+        print("已到参考起点" if error is None else "")
         return 0 if error is None else 1
 
     zed_error = zed_failure(zed.info if zed else None, data_dir)
     log = {
         "kind": kind, "direction": direction, "tag": args.tag, "speed_scale": args.scale,
         "error": "；".join(e for e in (error, zed_error) if e) or None,
-        "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG", "GLASS_REGIONS",
-                                                "TRANSLATION_PATHS", "PATH_SET"]},
+        "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG", "GLASS_REGIONS", "PATH_SET"]},
+        "mark_path": mark_path,                  # 这条录制的拖动标记、定出的路径和收两端的结果（fr5_limits）
         "speed_model": dataclasses.asdict(model) if model else None,
         "start_pose": {k: start[k] for k in ("base_T_camera", "flange", "joints", "created")},
         "handeye_sha256": handeye["sha256"],
@@ -841,15 +817,13 @@ def _per_pct(seg: fm.Segment, key: str) -> float | None:
 
 def cmd_speed_test(args) -> int:
     """实测 MoveL 速度百分比和实际速度的换算，保存到 SPEED_CAL。不开相机，机械臂状态也不存盘。
-    走上下那条平移路径的全程（高速时要有足够长的匀速段），在下端做摆动测试；同时由加减速用时估出加速度。"""
+    走上下那条录制路径的全程（down / up 两个拖动标记定的，高速时要有足够长的匀速段），在下端做摆动测试；
+    同时由加减速用时估出加速度。路径按全程匀速收两端（还没有加速度），比之后 plan 收得多一点。"""
     f_t_c, _ = gt.load_handeye(p(HANDEYE))
     start = load_start()
     cfg = motion_config()
-    mid, stroke = fm.translation_path("up", start["camera"], cfg)
-    bottom = mid.copy()
-    bottom[:3, 3] -= fm.WORLD_UP * stroke / 2.0
-    segs = fm.plan_speed_test(bottom, f_t_c, cfg, stroke * 1000.0, SPEED_TEST_PCT, via=start["camera"])
-    by = {s.name: s for s in segs}
+    marks = load_marks(f_t_c)
+    segs, by, travel = [], {}, None
     error, ran, vmax = None, False, None
     with tempfile.TemporaryDirectory() as tmp:
         rec = StateRecorder(tmp, ROBOT_IP)
@@ -860,8 +834,13 @@ def cmd_speed_test(args) -> int:
             runner.precheck()
             model = conservative_model(rpc)
             vmax = model.mm_s_per_pct * 100.0
-            lnote, lfound = limit_note("speed-test", segs, start, f_t_c)
-            found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, start["camera"]) + lfound
+            path, fit, limits, found = fit_pair(rpc, "up_down", marks, start, f_t_c, None)
+            if found:
+                raise fm.MotionAborted("上下那条路径没定下来，没有运动：\n  " + "\n  ".join(found))
+            travel = fit.length
+            segs = fm.plan_speed_test(path.pose(fit.a), f_t_c, cfg, travel, SPEED_TEST_PCT)
+            by = {s.name: s for s in segs}
+            found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits)
             if found:
                 raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
             pending = {"test_down": f"速度按 test_up 实测换算，目标 {SPEED_MPS * 1000 * args.scale:.1f} mm/s",
@@ -869,7 +848,7 @@ def cmd_speed_test(args) -> int:
             confirm_plan(f"speed-test：速度比例 {args.scale}；控制器默认速度 {vmax:.0f} mm/s，"
                          f"WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%，加速度百分比 {ACCEL_PCT}%\n"
                          "只录机械臂状态，不开相机。“最快”是没标定时的上限，实际可能慢很多\n"
-                         + (lnote + "\n" if lnote else "")
+                         + fl.describe_path(path, fit) + "\n"
                          + describe(segs, pending, totals=False), args.yes)
             ran = True
             for seg in segs:
@@ -942,10 +921,10 @@ def cmd_speed_test(args) -> int:
                   "录制时以实测速度为准")
     a_lin = accel.get("test_down_mm_s2")
     if a_lin:
-        print(f"  平移加速度约 {a_lin / 1000:.2f} m/s²（{by['test_down'].log['measured']['linear_mm_s']['mean']:.0f} mm/s 时）")
-        for pair, (_, stroke) in TRANSLATION_PATHS.items():
-            cruise = stroke * 1000.0 - (SPEED_MPS * 1000.0) ** 2 / a_lin
-            print(f"    {pair}：{SPEED_MPS} m/s 时匀速段约 {cruise:.0f} mm（行程 {stroke * 1000:.0f} mm）")
+        print(f"  平移加速度约 {a_lin / 1000:.2f} m/s²（{by['test_down'].log['measured']['linear_mm_s']['mean']:.0f} mm/s 时）；"
+              f"{SPEED_MPS} m/s 时加减速共走约 {(SPEED_MPS * 1000.0) ** 2 / a_lin:.0f} mm，"
+              f"上下这条 {travel:.0f} mm 的匀速段约 {travel - (SPEED_MPS * 1000.0) ** 2 / a_lin:.0f} mm")
+        print("  有了加速度，关节速度按梯形速度曲线算，plan 收两端会比现在少：重跑 plan 看每条录制的最终路径")
     if accel.get("test_yaw_back_deg_s2"):
         print(f"  摆动角加速度约 {accel['test_yaw_back_deg_s2']:.0f} °/s²")
     for label, pct in (("平移", SPEED_MPS * 1000.0 / kt), ("移到起点", REPOSITION_MPS * 1000.0 / kt),
@@ -973,7 +952,7 @@ def cmd_movec_test(args) -> int:
         rpc = rec.open_rpc()
         runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
         runner.precheck()
-        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, start["camera"])
+        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
         if found:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
         confirm_plan(f"movec-test：圆弧（MoveC）和直线（MoveL）各转 +{WIGGLE_DEG:g}°、-{2 * WIGGLE_DEG:g}°、+{WIGGLE_DEG:g}°，"
@@ -1030,10 +1009,10 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("set-start")
     mark = sub.add_parser("mark")
-    mark.add_argument("direction", choices=RECORD_NAMES, help="拖到的是哪个方向的极限")
+    mark.add_argument("direction", choices=fl.MARK_NAMES, help="拖到的是哪个方向的极限")
     sub.add_parser("limits")
     plan = sub.add_parser("plan")
-    plan.add_argument("names", nargs="*", help="要检查的录制，默认全部：6 条平移、6 条旋转和 sync-test")
+    plan.add_argument("names", nargs="*", help="要检查的录制，默认 " + " ".join(fl.RECORDINGS) + " 和 sync-test")
     for name in ("goto-start", "speed-test", "sync-test"):
         sub.add_parser(name)
     sub.add_parser("movec-test")

@@ -22,13 +22,36 @@ F_T_C = np.array([[0.999660953447201, 0.0007843776424874251, 0.02602619650942236
                   [-0.026027018125954093, 0.001056131064239924, 0.999660681888933, 0.09927925870705787],
                   [0.0, 0.0, 0.0, 1.0]])
 NOW = fm.fr5_to_matrix([484.963, -506.674, 490.858, -90.545, 0.0, -105.264]) @ F_T_C  # 10-10 的相机位姿
-CFG = fm.MotionConfig(speed_mps=0.05, stroke_m=0.30, hold_start_s=5, hold_mid_s=3, hold_end_s=5,
+CFG = fm.MotionConfig(speed_mps=0.05, hold_start_s=5, hold_mid_s=3, hold_end_s=5,
                       wiggle_deg=10, wiggle_deg_s=20, wiggle_cycles=2, reposition_mps=0.05, sync_test_hold_s=10)
 MODEL = fm.SpeedModel(mm_s_per_pct=1.0, wiggle_deg_s_per_pct=0.5, ramp_s=0.3, calibrated=True)
 
 
 def _wrap(a):
     return (np.asarray(a) + 180) % 360 - 180
+
+
+def _shift(camera, vec_m):
+    out = camera.copy()
+    out[:3, 3] += vec_m
+    return out
+
+
+def _line(centre, axis, stroke_m=0.30, cfg=CFG):
+    """以 centre 为中点、沿 axis 的平移录制（同以前 stroke_m 的约定）。"""
+    axis = np.asarray(axis, dtype=float)
+    return fm.plan_translation(_shift(centre, -axis * stroke_m / 2), _shift(centre, axis * stroke_m / 2), F_T_C, cfg)
+
+
+ROT_AXIS = {"yaw_left": ("up", +1), "yaw_right": ("up", -1), "pitch_up": ("x", +1), "pitch_down": ("x", -1),
+            "roll_right": ("z", +1), "roll_left": ("z", -1)}   # 方向名 -> (转轴, 符号)：右手定则下的正方向
+
+
+def _turn(centre, name, deg, cfg=CFG):
+    """以 centre 为中心姿态、两边各转 deg/2 的旋转录制：偏航绕竖直轴，俯仰绕 centre 的 x 轴，横滚绕它的光轴。返回 (段, 转轴)。"""
+    key, sign = ROT_AXIS[name]
+    axis = sign * {"up": np.array([0, 0, 1.0]), "x": centre[:3, 0], "z": centre[:3, 2]}[key]
+    return fm.plan_rotation(fm.rotate_about(centre, axis, -deg / 2), axis, deg, F_T_C, cfg), axis
 
 
 class GeometryTest(unittest.TestCase):
@@ -87,10 +110,10 @@ class PlanTest(unittest.TestCase):
                     "right": self.centre[:3, 0], "left": -self.centre[:3, 0],
                     "up": np.array([0, 0, 1.0]), "down": np.array([0, 0, -1.0])}
         for name, axis in expected.items():
-            segs = fm.plan_recording(name, self.centre, F_T_C, CFG)
+            segs = _line(self.centre, axis)
             by = {s.name: s for s in segs}
             start, end = by["goto_start"].camera, by["translate"].camera
-            np.testing.assert_allclose(end[:3, 3] - start[:3, 3], axis * CFG.stroke_m, atol=1e-12)
+            np.testing.assert_allclose(end[:3, 3] - start[:3, 3], axis * 0.30, atol=1e-12)
             np.testing.assert_allclose((start[:3, 3] + end[:3, 3]) / 2, self.centre[:3, 3], atol=1e-12)
             self.assertLess(fm.rotation_deg(start, self.centre), 1e-9)   # 平移段姿态不变
             self.assertLess(fm.rotation_deg(end, self.centre), 1e-9)
@@ -118,7 +141,7 @@ class PlanTest(unittest.TestCase):
         self.assertAlmostEqual(segs[0].distance_mm, 0.0, places=9)  # goto_start 原地
         self.assertAlmostEqual(segs[0].duration_s, 0.3)
 
-        rec = fm.plan_recording("right", self.centre, F_T_C, CFG)
+        rec = _line(self.centre, self.centre[:3, 0])
         fm.fill_geometry(rec, flange0)
         self.assertEqual(fm.apply_speed(rec, MODEL, 1.0), [])
         tr = next(s for s in rec if s.name == "translate")
@@ -129,7 +152,7 @@ class PlanTest(unittest.TestCase):
 
     def test_speed_percent_limits_and_unknown_model(self):
         flange0 = self.centre @ np.linalg.inv(F_T_C)
-        rec = fm.plan_recording("up", self.centre, F_T_C, CFG)
+        rec = _line(self.centre, [0, 0, 1.0])
         fm.fill_geometry(rec, flange0)
         slow = fm.SpeedModel(0.1, 0.05, calibrated=True)        # 50 mm/s 要 500%
         problems = fm.apply_speed(rec, slow, 1.0)
@@ -162,16 +185,13 @@ class PlanTest(unittest.TestCase):
         sign_check = {"yaw_left": lambda r: r[:, 2] @ c[:3, 0] < 0, "yaw_right": lambda r: r[:, 2] @ c[:3, 0] > 0,
                       "pitch_up": lambda r: r[2, 2] > 0, "pitch_down": lambda r: r[2, 2] < 0,      # 光轴抬起 / 低下
                       "roll_right": lambda r: r[2, 0] < 0, "roll_left": lambda r: r[2, 0] > 0}     # 相机 x 轴右端向下 / 向上
-        self.assertEqual(set(sign_check), set(fm.ROTATIONS))
-        expect_axis = {"up": np.array([0, 0, 1.0]), "x": c[:3, 0], "z": c[:3, 2]}
-        expect_deg = {"up": CFG.yaw_deg, "x": CFG.pitch_deg, "z": CFG.roll_deg}
+        self.assertEqual(set(sign_check), set(ROT_AXIS))
+        deg = 20.0
         for name, check in sign_check.items():
-            segs = fm.plan_recording(name, c, F_T_C, CFG)
+            segs, axis = _turn(c, name, deg)
             by = {s.name: s for s in segs}
             self.assertNotIn("translate", by)
             start, rot = by["goto_start"].camera, by["rotate"]
-            deg = fm.rotation_angle(name, CFG)
-            self.assertEqual(deg, expect_deg[fm.ROTATIONS[name][0]])
             self.assertFalse(by["goto_start"].recorded)
             for cam in (start, rot.camera):
                 np.testing.assert_allclose(cam[:3, 3], c[:3, 3], atol=1e-12)        # 光心不动
@@ -179,12 +199,10 @@ class PlanTest(unittest.TestCase):
             self.assertAlmostEqual(fm.rotation_deg(start, rot.camera), deg, places=9)
             self.assertTrue(check(rot.camera[:3, :3]), name)
             self.assertEqual((rot.motion, rot.arc_deg, rot.rate_deg_s), ("C", deg, CFG.rot_deg_s))
+            np.testing.assert_allclose(rot.arc_axis, axis, atol=1e-12)
             np.testing.assert_allclose(rot.pivot, c[:3, 3], atol=1e-12)
-            # 中间点就是起点姿态（转了一半）
+            # 中间点就是中心姿态（转了一半）
             np.testing.assert_allclose(fm.fr5_to_matrix(rot.via_flange), c @ np.linalg.inv(F_T_C), atol=1e-9)
-            # 偏航绕竖直轴，俯仰绕中心姿态的 x 轴，横滚绕中心姿态的光轴
-            axis = fm.rotation_axis(name, c)
-            self.assertAlmostEqual(abs(axis @ expect_axis[fm.ROTATIONS[name][0]]), 1.0, places=12)
             # 同步摆动绕同一根转轴、单侧摆，结束时回到原姿态，光心不动
             for prefix, home in (("wiggle_start", start), ("wiggle_end", rot.camera)):
                 wig = [s for s in segs if s.name.startswith(prefix)]
@@ -200,39 +218,15 @@ class PlanTest(unittest.TestCase):
     def test_inward_wiggle_keeps_rotation_range(self):
         """同步摆动往旋转范围内侧摆：全程姿态范围就是旋转本身的范围；摆动幅度大于总转角时从另一头多出来。"""
         c = self.centre
-        cfg = dataclasses.replace(CFG, yaw_deg=20.0, pitch_deg=20.0, roll_deg=20.0,
-                                  yaw_heading_deg=5.0, pitch_heading_deg=-8.0, roll_heading_deg=-2.0)
-        expect = {"yaw_left": ("heading", (-5.0, 15.0)), "yaw_right": ("heading", (-5.0, 15.0)),
-                  "pitch_up": ("pitch", (-10.0, 10.0)), "pitch_down": ("pitch", (-10.0, 10.0)),
-                  "roll_left": ("roll", (-10.0, 10.0)), "roll_right": ("roll", (-10.0, 10.0))}
-        heading = {"heading": None, "pitch": -8.0, "roll": -2.0}
-        for name, (key, (lo, hi)) in expect.items():
-            span = fm.pose_span(fm.plan_recording(name, c, F_T_C, cfg), c, F_T_C)
-            np.testing.assert_allclose(span[key], (lo, hi), atol=1e-6, err_msg=name)
+        expect = {"yaw_left": "heading", "yaw_right": "heading", "pitch_up": "pitch", "pitch_down": "pitch",
+                  "roll_left": "roll", "roll_right": "roll"}
+        for name, key in expect.items():
+            span = fm.pose_span(_turn(c, name, 20.0)[0], c, F_T_C)
+            np.testing.assert_allclose(span[key], (-10.0, 10.0), atol=1e-6, err_msg=name)
             for other in {"heading", "pitch", "roll"} - {key}:
-                h = heading[key] if other == "heading" else 0.0
-                np.testing.assert_allclose(span[other], (h, h), atol=1e-6, err_msg=f"{name} {other}")
-        span = fm.pose_span(fm.plan_recording("yaw_left", c, F_T_C, dataclasses.replace(cfg, yaw_deg=6.0)), c, F_T_C)
-        np.testing.assert_allclose(span["heading"], (-2.0, 12.0), atol=1e-6)
-
-    def test_pitch_heading(self):
-        """俯仰的中心姿态是起点绕竖直轴转 pitch_heading_deg（仍水平、光心不动），转轴是它的 x 轴；偏航不受影响。"""
-        c = self.centre
-        cfg = dataclasses.replace(CFG, pitch_heading_deg=-35.0)
-        for name in ("pitch_up", "pitch_down"):
-            mid = fm.rotation_centre(name, c, cfg)
-            np.testing.assert_allclose(mid, fm.yaw_about_vertical(c, -35.0), atol=1e-12)
-            self.assertGreater(mid[:3, 2] @ c[:3, 0], 0.0)                      # 负 = 光轴转向右（起点 x 方向）
-            rot = next(s for s in fm.plan_recording(name, c, F_T_C, cfg) if s.name == "rotate")
-            np.testing.assert_allclose(fm.fr5_to_matrix(rot.via_flange), mid @ np.linalg.inv(F_T_C), atol=1e-9)
-            np.testing.assert_allclose(rot.pivot, c[:3, 3], atol=1e-12)
-            self.assertAlmostEqual(abs(rot.arc_axis @ mid[:3, 0]), 1.0, places=12)
-            self.assertAlmostEqual(rot.arc_axis[2], 0.0, places=12)               # 水平轴
-        for name in ("yaw_left", "yaw_right"):
-            self.assertIs(fm.rotation_centre(name, c, cfg), c)
-            a = [s.flange for s in fm.plan_recording(name, c, F_T_C, cfg)]
-            b = [s.flange for s in fm.plan_recording(name, c, F_T_C, CFG)]
-            self.assertEqual(a, b)
+                np.testing.assert_allclose(span[other], (0.0, 0.0), atol=1e-6, err_msg=f"{name} {other}")
+        span = fm.pose_span(_turn(c, "yaw_left", 6.0)[0], c, F_T_C)     # −3 → +3：开头摆到 −3+10，结尾摆到 +3−10
+        np.testing.assert_allclose(span["heading"], (-7.0, 7.0), atol=1e-6)
 
     def test_level_wiggle_unchanged(self):
         """相机水平时，绕相机竖直轴摆动和原来绕基坐标竖直轴摆动是一回事（平移录制不受影响）。"""
@@ -242,7 +236,7 @@ class PlanTest(unittest.TestCase):
 
     def test_rotation_speed_and_arc_length(self):
         flange0 = self.centre @ np.linalg.inv(F_T_C)
-        segs = fm.plan_recording("pitch_up", self.centre, F_T_C, dataclasses.replace(CFG, pitch_deg=30.0))
+        segs, _ = _turn(self.centre, "pitch_up", 30.0)
         fm.fill_geometry(segs, flange0)
         self.assertEqual(fm.apply_speed(segs, MODEL, 1.0), [])
         rot = next(s for s in segs if s.name == "rotate")
@@ -258,7 +252,7 @@ class PlanTest(unittest.TestCase):
         self.assertGreater(rot.distance_mm, 50.0)                  # 法兰离光心约 0.12 m，转 30° 走约 65 mm
 
     def test_arc_path_keeps_centre(self):
-        segs = fm.plan_recording("yaw_right", self.centre, F_T_C, dataclasses.replace(CFG, yaw_deg=30.0))
+        segs, _ = _turn(self.centre, "yaw_right", 30.0)
         by = {s.name: s for s in segs}
         rot = by["rotate"]
         prev = fm.fr5_to_matrix([s for s in segs if s.name.startswith("wiggle_start")][-1].flange)
@@ -282,14 +276,14 @@ class PlanTest(unittest.TestCase):
         flange0 = self.centre @ np.linalg.inv(F_T_C)
         wide = ([-1e4] * 6, [1e4] * 6)
         for name in ("yaw_left", "pitch_down"):
-            segs = fm.plan_recording(name, self.centre, F_T_C, CFG)
+            segs, _ = _turn(self.centre, name, 20.0)
             problems = fm.check_plan(FakeIK(), segs, flange0, [0.0] * 6, F_T_C, *wide, 100.0, 0.0)
             self.assertEqual(problems, [])
             rot = next(s for s in segs if s.name == "rotate")
             np.testing.assert_allclose(rot.via_joints, np.array(rot.via_flange) / 10.0, atol=1e-9)
             np.testing.assert_allclose(rot.joints, np.array(rot.flange) / 10.0, atol=1e-9)
         # MoveC 的起点和规划不一致时拒绝
-        segs = fm.plan_recording("yaw_left", self.centre, F_T_C, CFG)
+        segs, _ = _turn(self.centre, "yaw_left", 20.0)
         rot_only = [s for s in segs if s.name == "rotate"]
         problems = fm.check_plan(FakeIK(), rot_only, flange0, [0.0] * 6, F_T_C, *wide, 100.0, 0.0)
         self.assertTrue(any("MoveC 的起点" in m for m in problems), problems)
@@ -318,37 +312,25 @@ class PlanTest(unittest.TestCase):
         far[:3, 3] += [0.05, 0.0, 0.0]                                          # 终点仍在范围外
         self.assertTrue(any("100%" in m for m in run(away, far, recorded=False)))
 
-    def test_translation_paths_and_one_sided_wiggle(self):
-        """每对方向的行程中点按（前, 左, 上）偏移、各自的行程；同步摆动只往左转（朝向在 0～+10°），最后回到原朝向。"""
-        paths = {"forward_backward": ((-5.0, 150.0, -100.0), 0.45), "left_right": ((-50.0, 45.0, 50.0), 0.53),
-                 "up_down": ((-100.0, 250.0, 75.0), 0.57)}
-        cfg = dataclasses.replace(CFG, translation_paths=paths, translation_wiggle_side=1)
+    def test_one_sided_wiggle(self):
+        """translation_wiggle_side=1：同步摆动只往左转（朝向在 0～+10°），光心不动，最后回到原朝向；sync-test 也一样。"""
+        cfg = dataclasses.replace(CFG, translation_wiggle_side=1)
         c = self.centre
-        fwd, left, up = c[:3, 2], -c[:3, 0], np.array([0, 0, 1.0])
-        for name in fm.DIRECTIONS:
-            (df, dl, du), stroke = paths[fm.TRANSLATION_PAIRS[name]]
-            by = {s.name: s for s in fm.plan_recording(name, c, F_T_C, cfg)}
+        for axis in (c[:3, 2], c[:3, 0], np.array([0, 0, 1.0])):
+            by = {s.name: s for s in _line(c, axis, 0.45, cfg)}
             start, end = by["goto_start"].camera, by["translate"].camera
-            mid = (start[:3, 3] + end[:3, 3]) / 2
-            np.testing.assert_allclose(mid, c[:3, 3] + (df * fwd + dl * left + du * up) / 1000.0, atol=1e-12)
-            self.assertAlmostEqual(np.linalg.norm(end[:3, 3] - start[:3, 3]), stroke, places=12)
-            self.assertLess(fm.rotation_deg(end, c), 1e-9)
             for prefix, base in (("wiggle_start", start), ("wiggle_end", end)):
                 wig = [s for s in by.values() if s.name.startswith(prefix)]
                 self.assertEqual(len(wig), 2 * cfg.wiggle_cycles)
                 for s in wig:
                     z = base[:3, :3].T @ s.camera[:3, 2]                 # 光轴在本段起点相机系里
                     heading = np.degrees(np.arctan2(-z[0], z[2]))         # 正 = 向左
-                    self.assertTrue(-1e-9 <= heading <= cfg.wiggle_deg + 1e-9, (name, s.name, heading))
+                    self.assertTrue(-1e-9 <= heading <= cfg.wiggle_deg + 1e-9, (s.name, heading))
                     np.testing.assert_allclose(s.camera[:3, 3], base[:3, 3], atol=1e-12)
                 self.assertLess(fm.rotation_deg(wig[-1].camera, base), 1e-9)
-        # sync-test 也只往左摆
         sync = [s for s in fm.plan_sync_test(c, F_T_C, cfg) if s.name.startswith("wiggle")]
         self.assertTrue(all(np.degrees(np.arctan2(-(c[:3, :3].T @ s.camera[:3, 2])[0], (c[:3, :3].T @ s.camera[:3, 2])[2]))
                             >= -1e-9 for s in sync))
-        # 不给路径时和以前一样：以起点为中点、行程 stroke_m、两边摆
-        by = {s.name: s for s in fm.plan_recording("right", c, F_T_C, CFG)}
-        np.testing.assert_allclose((by["goto_start"].camera[:3, 3] + by["translate"].camera[:3, 3]) / 2, c[:3, 3], atol=1e-12)
 
     def test_joint_speed_check(self):
         """假逆解：关节 = 法兰位姿 / 10。按预计速度算出的关节速度和上限比较；只查录制段。"""
@@ -357,7 +339,7 @@ class PlanTest(unittest.TestCase):
                 return 0, [v / 10.0 for v in pose]
         flange0 = self.centre @ np.linalg.inv(F_T_C)
         wide = ([-1e4] * 6, [1e4] * 6)
-        segs = fm.plan_recording("right", self.centre, F_T_C, CFG)
+        segs = _line(self.centre, self.centre[:3, 0])
         self.assertEqual(fm.check_plan(FakeIK(), segs, flange0, [0.0] * 6, F_T_C, *wide, 100.0, 0.0), [])
         self.assertEqual(fm.apply_speed(segs, MODEL, 1.0), [])
         by = {s.name: s for s in segs}
@@ -638,11 +620,9 @@ class RunnerTest(unittest.TestCase):
                 fm.MotionRunner(arm, arm, accel_percent=100).run(seg)
         self.assertEqual(arm.calls, [])
 
-    def _rotation(self, name="yaw_left", deg=None):
-        """规划好的旋转段（从起点姿态开始），关节角用假的（假机械臂不看关节）。deg：改转角（偏航、俯仰都用它）。"""
-        centre = fm.level_camera(NOW)
-        cfg = CFG if deg is None else dataclasses.replace(CFG, yaw_deg=deg, pitch_deg=deg)
-        segs = fm.plan_recording(name, centre, F_T_C, cfg)
+    def _rotation(self, name="yaw_left", deg=20.0):
+        """规划好的旋转段（从起点姿态开始），关节角用假的（假机械臂不看关节）。"""
+        segs, _ = _turn(fm.level_camera(NOW), name, deg)
         by = {s.name: s for s in segs}
         start6 = by["goto_start"].flange
         rot = by["rotate"]
@@ -763,13 +743,9 @@ class ParametersTest(unittest.TestCase):
         self.assertTrue(any("CAMERA_FPS" in m for m in problems_with(CAMERA_FPS=25)))
         self.assertTrue(any("TRANSLATION_WIGGLE_SIDE" in m for m in problems_with(TRANSLATION_WIGGLE_SIDE=0.5)))
         self.assertTrue(any("PATH_SET" in m for m in problems_with(PATH_SET="fast 1")))
-        paths = dict(rs.TRANSLATION_PATHS)
-        del paths["up_down"]
-        self.assertTrue(any("正好有这几对" in m for m in problems_with(TRANSLATION_PATHS=paths)))
-        paths = {**rs.TRANSLATION_PATHS, "up_down": ((0.0, 400.0, 0.0), 0.3)}
-        self.assertTrue(any("偏移超过" in m for m in problems_with(TRANSLATION_PATHS=paths)))
-        paths = {**rs.TRANSLATION_PATHS, "up_down": ((0.0, 0.0, 0.0), 0.8)}
-        self.assertTrue(any("行程 0.8 m 超出" in m for m in problems_with(TRANSLATION_PATHS=paths)))
+        self.assertTrue(any("MIN_STROKE_M" in m for m in problems_with(MIN_STROKE_M=0.4, MAX_STROKE_M=0.3)))
+        self.assertTrue(any("同步摆动会超出" in m for m in problems_with(MIN_ROTATION_DEG=8.0)))
+        self.assertEqual(list(rs.fl.RECORDINGS), ["up", "right", "forward", "yaw_left", "pitch_up", "roll_right"])
 
     def test_joint_limits_cover_traversed_range(self):
         try:
@@ -790,8 +766,8 @@ class ParametersTest(unittest.TestCase):
             self.assertIn(name, rs.RECORD_NAMES)
 
     def test_glass_clearance_defaults(self):
-        """真实起点和手眼外参下，默认参数的全部录制（平移按 WINDOW_DISTANCE_M 算视差）画面离右窗都 ≥ GLASS_MARGIN_DEG；
-        左窗可以拍（用户 10-13 定）：偏航往左转到 +22.75° 也通过；中心朝向往右挪到 −5° 时右端碰到右窗，被拒绝。"""
+        """真实参考起点和手眼外参下：sync-test 离右窗 ≥ GLASS_MARGIN_DEG；左窗可以拍（用户 10-13 定）：
+        偏航往左转到 +25° 也通过，往右转到 −10° 碰到右窗（−7.5° 以右不行），被拒绝。"""
         try:
             import run_session as rs
         except ImportError as exc:
@@ -801,21 +777,13 @@ class ParametersTest(unittest.TestCase):
         f_t_c, _ = gt.load_handeye(here / "handeye_s003_result.json")
         start = np.array(json.loads((here / "start_pose.json").read_text(encoding="utf-8"))["base_T_camera"])
         cfg = rs.motion_config()
-        for name in [*rs.RECORD_NAMES, "sync-test"]:
-            segs = (fm.plan_sync_test(start, f_t_c, cfg) if name == "sync-test"
-                    else fm.plan_recording(name, start, f_t_c, cfg))
-            note, found = rs.pose_note(name, segs, start, f_t_c)
-            self.assertEqual(found, [], name)
-            self.assertIn("玻璃窗最近", note)
-        segs = fm.plan_recording("yaw_left", start, f_t_c, cfg)
-        self.assertGreater(fm.pose_span(segs, start, f_t_c)["heading"][1], 22.0)
-        old = rs.YAW_HEADING_DEG
-        try:
-            rs.YAW_HEADING_DEG = -5.0
-            segs = fm.plan_recording("yaw_right", start, f_t_c, rs.motion_config())
-            self.assertTrue(rs.pose_note("yaw_right", segs, start, f_t_c)[1])
-        finally:
-            rs.YAW_HEADING_DEG = old
+        note, found = rs.pose_note("sync-test", fm.plan_sync_test(start, f_t_c, cfg), start, f_t_c)
+        self.assertEqual(found, [])
+        self.assertIn("玻璃窗最近", note)
+        up = np.array([0, 0, 1.0])
+        for right, ok in ((-7.0, True), (-10.0, False)):
+            segs = fm.plan_rotation(fm.yaw_about_vertical(start, right), up, 25.0 - right, f_t_c, cfg)
+            self.assertEqual(not rs.pose_note("yaw_left", segs, start, f_t_c)[1], ok, right)
 
 
 class GlassTest(unittest.TestCase):
@@ -860,8 +828,8 @@ class GlassTest(unittest.TestCase):
         region = [(57.4, 180.0, -90.0, 90.0)]
         near = []
         for heading in (-2.0, 0.0, 2.0):
-            cfg = dataclasses.replace(CFG, yaw_deg=10.0, yaw_heading_deg=heading)
-            clear, where = fm.glass_clearance(fm.plan_recording("yaw_left", c, F_T_C, cfg), c, F_T_C, region)
+            segs = fm.plan_rotation(fm.yaw_about_vertical(c, heading - 5.0), [0, 0, 1.0], 10.0, F_T_C, CFG)
+            clear, where = fm.glass_clearance(segs, c, F_T_C, region)
             near.append(clear)
             self.assertIn(where, ("wiggle_start_1", "wiggle_start_3", "rotate", "wiggle_end_2", "wiggle_end_4"))
         self.assertGreater(near[0], 0.0)                                  # 左端 +3°：差约 1.1°，没拍到

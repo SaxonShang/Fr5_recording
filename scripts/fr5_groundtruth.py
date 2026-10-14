@@ -66,7 +66,8 @@ TIME_CORRECTION_EXPOSURE_US = 10000  # 上面的值是在这个曝光下测的�
 TRAVEL_SCALE = {
     "base": {"right": 1.0070, "left": 1.0070, "up": 1.0070, "down": 1.0070,
              "forward": 1.0015, "backward": 1.0015},
-    "fast1": {},              # 高速录制的新平移路径，待标定板验证
+    "fast1": {},              # 高速录制的新平移路径（10-14 上午的设计，没有录过）
+    "fast2": {},              # 高速录制：按拖动标记定的路径（10-14 起），待标定板验证
 }
 # 机械臂实际转角 / 报告转角（2026-10-13 标定板验证：pitch_up 3 条 +0.39～+0.46%，平均 +0.43%；
 # pitch_down 2 条 +0.50、+0.54%，平均 +0.52%；偏航 10°、横滚 30° 在 ±0.03% 以内，不修正）。
@@ -74,6 +75,7 @@ ROTATION_SCALE = {
     "base": {"pitch_up": 1.0043, "pitch_down": 1.0052, "yaw_left": 1.0, "yaw_right": 1.0,
              "roll_left": 1.0, "roll_right": 1.0},
     "fast1": {"pitch_up": 1.0043, "pitch_down": 1.0052},   # 俯仰和 base 同一条路径；偏航 30°、横滚 90° 待验证
+    "fast2": {},              # 按拖动标记定的转动中心和转角，俯仰也不再是 base 那条路径，全部待验证
 }
 
 ARM_COLUMNS = ["box_realtime_ns", "ctrl_unix_ms", "x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg",
