@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 from typing import Callable
@@ -152,8 +153,9 @@ class MarkPath:
 
 
 def derive_path(pair: str, cam_neg: np.ndarray, cam_pos: np.ndarray, reference: np.ndarray,
-                margin_mm: float, margin_deg: float) -> MarkPath:
-    """由负端、正端标记的相机位姿定出路径（不连机械臂）。reference 是参考起点（水平）。"""
+                margin_mm: float, margin_deg: float, up_down_facing=None) -> MarkPath:
+    """由负端、正端标记的相机位姿定出路径（不连机械臂）。reference 是参考起点（水平）。
+    up_down_facing：上下录制时相机光轴的水平方向（基坐标系向量）；None 时取两个标记朝向的平均。"""
     neg, pos = PAIRS[pair]
     ref = fm.level_camera(reference)
     c0, c1 = cam_neg[:3, 3], cam_pos[:3, 3]
@@ -162,7 +164,8 @@ def derive_path(pair: str, cam_neg: np.ndarray, cam_pos: np.ndarray, reference: 
     if pair in TRANSLATION_PAIRS:
         if pair == "up_down":
             axis = fm.WORLD_UP.copy()
-            heading = mean_heading([angles(ref, cam_neg)[0], angles(ref, cam_pos)[0]])
+            heading = (mean_heading([angles(ref, cam_neg)[0], angles(ref, cam_pos)[0]]) if up_down_facing is None
+                       else heading_of(ref, up_down_facing))
             off = float(np.hypot(*(c1 - c0)[:2]) * 1000.0)
             if off > OFF_LINE_WARN_MM:
                 warnings.append(f"{neg}、{pos} 两个标记水平相距 {off:.0f} mm：路径取两者中间的竖直线")
@@ -246,6 +249,7 @@ class Fit:
     max_joint_speed_deg_s: float | None
     problems: list = field(default_factory=list)
     seed: str = ""                  # 按哪个标记的构型（fit_best 填）
+    wiggle_side: int | None = None  # 平移两端的同步摆动往哪边（+1 左、-1 右；fit_wiggle_sides 填）
     joints_a: list | None = None    # 两端的关节角（逆解）
     joints_b: list | None = None
     notes: list = field(default_factory=list)
@@ -428,6 +432,30 @@ def fit_best(rpc, path: MarkPath, f_t_c: np.ndarray, neg_joints, pos_joints, lim
     return best
 
 
+def fit_wiggle_sides(rpc, path: MarkPath, f_t_c: np.ndarray, neg_joints, pos_joints, lim: FitLimits,
+                     sides=(+1, -1)) -> Fit:
+    """平移：两端的同步摆动只往左（+1）或只往右（-1）各收一次，取没问题、行程长的（一样长取前一个），写进
+    fit.wiggle_side。摆动方向会挡住哪一端因位置而异（往一侧摆时腕部可能靠近奇异位形或关节限位）。旋转不用。"""
+    if path.kind != "translate" or len(sides) == 1:
+        lim = dataclasses.replace(lim, wiggle_side=sides[0]) if path.kind == "translate" else lim
+        fit = fit_best(rpc, path, f_t_c, neg_joints, pos_joints, lim)
+        fit.wiggle_side = sides[0] if path.kind == "translate" else None
+        return fit
+    tries = []
+    for side in sides:
+        f = fit_best(rpc, path, f_t_c, neg_joints, pos_joints, dataclasses.replace(lim, wiggle_side=side))
+        f.wiggle_side = side
+        tries.append(f)
+    best = max(tries, key=lambda f: (not f.problems, round(f.length, 6)))
+    other = next(f for f in tries if f is not best)
+    if round(other.length, 6) != round(best.length, 6) or other.problems != best.problems:
+        label = {+1: "往左", -1: "往右"}
+        best.notes.append(f"同步摆动只{label[best.wiggle_side]}摆：{label[other.wiggle_side]}摆时"
+                          + (f"只能走 {other.length:.1f} {path.unit}" if not other.problems else "走不了")
+                          + f"（{'；'.join(e for e in other.ends if e) or '—'}）")
+    return best
+
+
 def start_joints(direction: str, fit: Fit) -> list | None:
     """录制 direction 起点的关节角（逆解）。"""
     return fit.joints_a if RECORD_PAIR[direction][1] > 0 else fit.joints_b
@@ -478,6 +506,8 @@ def describe_path(path: MarkPath, fit: Fit | None = None) -> str:
             lines.append(f"  {name} 端停在这里：{fit.ends[side] or '—'}")
         if fit.seed and fit.joints_a is not None:
             lines.append(f"  构型：和 {fit.seed} 标记相同（{describe_config(fit.joints_a)}）")
+        if fit.wiggle_side in (+1, -1):
+            lines.append(f"  同步摆动：只往{'左' if fit.wiggle_side > 0 else '右'}摆")
     if fit is not None:
         lines += [f"  注意：{m}" for m in fit.notes]
     return "\n".join(lines)

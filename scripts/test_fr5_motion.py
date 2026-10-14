@@ -747,6 +747,30 @@ class ParametersTest(unittest.TestCase):
         self.assertTrue(any("同步摆动会超出" in m for m in problems_with(MIN_ROTATION_DEG=8.0)))
         self.assertEqual(list(rs.fl.RECORDINGS), ["up", "right", "forward", "yaw_left", "pitch_up", "roll_right"])
 
+    def test_reduced_speed_accel_not_used(self):
+        """降速 speed-test 测的加速度不用（控制器的加速度随速度变）；全速的才用。"""
+        try:
+            import run_session as rs
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cal.json"
+            old = rs.SPEED_CAL
+            rs.SPEED_CAL = str(path)
+            try:
+                for scale, used in ((0.2, False), (1.0, True)):
+                    path.write_text(json.dumps({
+                        "created": "test", "speed_scale": scale, "settings": {k: getattr(rs, k) for k in rs.CAL_KEYS},
+                        "model": {"mm_s_per_pct": 6.0, "wiggle_deg_s_per_pct": 2.16, "ramp_s": 0.19},
+                        "accel": {"test_down_mm_s2": 533.0, "test_yaw_back_deg_s2": 55.0}}), encoding="utf-8")
+                    model, note = rs.load_speed_model()
+                    self.assertAlmostEqual(model.mm_s_per_pct, 6.0)
+                    self.assertEqual(model.accel_mm_s2 is not None, used, note)
+                    self.assertEqual(model.accel_deg_s2 is not None, used, note)
+                    self.assertEqual("降速" in note, not used, note)
+            finally:
+                rs.SPEED_CAL = old
+
     def test_joint_limits(self):
         """高速录制不再另设保守的关节范围（用户 10-14 定）：JOINT_MIN/MAX 是 FR5 的关节范围，运行时和控制器软限位取交集。"""
         try:

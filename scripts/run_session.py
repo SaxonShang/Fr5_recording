@@ -31,7 +31,13 @@ sync-test 和 record 需要先有 speed-test 的结果；改了 WebApp 速度百
 PATH_SET = "fast2"           # 这一套路径几何的名字，写进 motion_log；真值的行程、转角系数按它查（fr5_groundtruth）。
                              # fast2 = 10-14 起按拖动标记定的路径；重新拖动标记、路径变了就换个名字，免得用错系数
 SPEED_MPS = 0.5              # 平移速度 m/s
-TRANSLATION_WIGGLE_SIDE = 1  # 平移录制和 sync-test 的同步摆动：+1 只往左摆（画面右边缘离右窗更远），0 两边摆
+TRANSLATION_WIGGLE_SIDE = 1  # sync-test 的同步摆动（平移录制也用它，除非 TRANSLATION_WIGGLE_AUTO）：+1 只往左摆
+                             # （画面右边缘离右窗更远），-1 只往右，0 两边摆
+TRANSLATION_WIGGLE_AUTO = True  # 平移录制的同步摆动往左还是往右由 plan 按行程选：两种各收一次两端，取长的
+                                # （一样长取往左）。10-14：左右往右摆 758 mm、往左 509 mm；前后往左 516、往右 228
+UP_DOWN_HEADING_BASE_DEG = 0.0  # 上下录制的相机朝向：基坐标系里从 +X 往 +Y 转的角度 °（0 = 朝 +X）；None 时取
+                                # 两个标记朝向的平均。用户 10-14 定三条平移都朝 +X（左右、前后由标记连线定，本来就是 +X），
+                                # 一块标定板三条都能用；上下的行程不受朝向影响（两端停在最低高度和标记余量）
 ROT_DEG_S = 50.0             # 旋转角速度 °/s
 # 画面里不能出现的玻璃：只管右侧落地窗（用户 10-13 定，左窗可以拍）。每块是 (方位角起, 方位角止, 仰角下, 仰角上)，单位 °，
 # 从参考起点（set-start）的光心看、相对它的水平朝向，方位角正 = 向左、仰角正 = 向上。10-13 全景图量出：右窗玻璃从柱子边缘 −60.3° 往右，
@@ -60,7 +66,8 @@ WEBAPP_SPEED_PCT = 60        # WebApp 里的速度百分比（SDK 读不到，�
 ACCEL_PCT = 100              # MoveL 加速度百分比（oacc）；实际加速度看 speed-test 结果，起停太猛就调小再重跑 speed-test
 SPEED_TEST_PCT = 5           # speed-test 去程的速度百分比；没标定时最快为控制器默认速度 1000 mm/s 的 5% = 50 mm/s
 MAX_SPEED_ERROR = 0.10       # 平移实测速度和预计速度相差超过 10% 就警告（speed-test 里也用来检查是否成正比）
-MIN_CAMERA_Z_M = 0.35        # 相机光心最低高度（基坐标系 z，m）；按现场桌面和障碍物修改
+MIN_CAMERA_Z_M = 0.18        # 相机光心最低高度（基坐标系 z，m，从底座安装面算）：只是兜底，录制的上下限由拖动标记定。
+                             # 10-14 用户拖的 down 标记在 0.197 m，按用户要求从 0.35 改为 0.18
 # 拖动标记（mark）：用户手动把机械臂拖到各方向能接受的极限位姿记下来，每对标记定一条录制（fr5_limits）。
 # 录制两端先离标记收进这么多（到行程端点时同步摆动还要转 10°，法兰会横着摆出约 25 mm；高速时路径跟随也有误差），
 # 再按逆解、关节速度、右窗、同步摆动往里收
@@ -199,6 +206,7 @@ def pose_note(name: str, segs: list[fm.Segment], start_camera: np.ndarray, f_t_c
     return note, [f"画面离玻璃窗最近只有 {clear:.2f}°（{where} 段），少于 GLASS_MARGIN_DEG={GLASS_MARGIN_DEG}°"]
 
 
+FULL_SPEED_SCALE = 0.95      # speed-test 的 --scale 不小于这个，测的加速度才用于 plan / record
 CAL_KEYS = ("WEBAPP_SPEED_PCT", "ACCEL_PCT", "WIGGLE_DEG")  # 这些改了，speed-test 的结果就不能用了
 
 
@@ -213,9 +221,15 @@ def load_speed_model() -> tuple[fm.SpeedModel | None, str]:
     if changed:
         return None, "speed-test 之后这些参数改过：" + "，".join(changed) + "，请重跑 speed-test"
     m, acc = cal["model"], cal.get("accel") or {}
+    # 加速度只用全速 speed-test 测的：控制器的加速度随速度变（10-14 实测 30 mm/s 时约 1.25 m/s²、100 mm/s 时 0.53 m/s²），
+    # 降速测的不能外推到录制速度；不用时关节速度按全程匀速估（偏保守）
+    full = cal.get("speed_scale", 1.0) >= FULL_SPEED_SCALE
+    note = f"速度标定（{cal['created']}）：1% = 平移 {m['mm_s_per_pct']:.3f} mm/s，摆动 {m['wiggle_deg_s_per_pct']:.3f} °/s"
+    if acc and not full:
+        note += f"；加速度是降速（--scale {cal['speed_scale']}）测的，不用，关节速度按全程匀速估：全速跑一次 speed-test"
     return (fm.SpeedModel(m["mm_s_per_pct"], m["wiggle_deg_s_per_pct"], m["ramp_s"], calibrated=True,
-                          accel_mm_s2=acc.get("test_down_mm_s2"), accel_deg_s2=acc.get("test_yaw_back_deg_s2")),
-            f"速度标定（{cal['created']}）：1% = 平移 {m['mm_s_per_pct']:.3f} mm/s，摆动 {m['wiggle_deg_s_per_pct']:.3f} °/s")
+                          accel_mm_s2=acc.get("test_down_mm_s2") if full else None,
+                          accel_deg_s2=acc.get("test_yaw_back_deg_s2") if full else None), note)
 
 
 def conservative_model(rpc) -> fm.SpeedModel:
@@ -262,6 +276,11 @@ def parameter_problems() -> list[str]:
         out.append("GLASS_REGIONS 每块必须是 (方位角起, 方位角止, 仰角下, 仰角上)，且起 < 止、下 < 上")
     if CAMERA_FPS not in (15, 30, 60):
         out.append(f"CAMERA_FPS = {CAMERA_FPS}，只能是 15、30 或 60")
+    if UP_DOWN_HEADING_BASE_DEG is not None and not (isinstance(UP_DOWN_HEADING_BASE_DEG, (int, float))
+                                                     and -180.0 <= UP_DOWN_HEADING_BASE_DEG <= 180.0):
+        out.append(f"UP_DOWN_HEADING_BASE_DEG = {UP_DOWN_HEADING_BASE_DEG}，只能是 None 或 −180～180 的数")
+    if not isinstance(TRANSLATION_WIGGLE_AUTO, bool):
+        out.append("TRANSLATION_WIGGLE_AUTO 只能是 True 或 False")
     if TRANSLATION_WIGGLE_SIDE not in (-1, 0, 1):
         out.append(f"TRANSLATION_WIGGLE_SIDE = {TRANSLATION_WIGGLE_SIDE}，只能是 -1、0 或 1")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", str(PATH_SET)):
@@ -346,8 +365,10 @@ def pair_path(pair: str, marks: dict, start: dict) -> tuple[fl.MarkPath | None, 
     missing = [n for n in (neg, pos) if n not in marks]
     if missing:
         return None, f"缺拖动标记 {'、'.join(missing)}（python3 run_session.py mark {missing[0]}）"
+    facing = (None if UP_DOWN_HEADING_BASE_DEG is None else
+              np.array([np.cos(np.radians(UP_DOWN_HEADING_BASE_DEG)), np.sin(np.radians(UP_DOWN_HEADING_BASE_DEG)), 0.0]))
     return fl.derive_path(pair, marks[neg]["camera"], marks[pos]["camera"], start["camera"],
-                          LIMIT_MARGIN_MM, LIMIT_MARGIN_DEG), ""
+                          LIMIT_MARGIN_MM, LIMIT_MARGIN_DEG, up_down_facing=facing), ""
 
 
 def fit_pair(rpc, pair: str, marks: dict, start: dict, f_t_c: np.ndarray, model: fm.SpeedModel | None,
@@ -372,7 +393,8 @@ def fit_pair(rpc, pair: str, marks: dict, start: dict, f_t_c: np.ndarray, model:
         wiggle_deg=WIGGLE_DEG if translate else 0.0, wiggle_side=int(TRANSLATION_WIGGLE_SIDE),
         singular_margin_deg=SINGULAR_MARGIN_DEG)
     neg, pos = fl.PAIRS[pair]
-    fit = fl.fit_best(rpc, path, f_t_c, marks[neg]["joints"], marks[pos]["joints"], lim)
+    sides = (+1, -1) if TRANSLATION_WIGGLE_AUTO else (int(TRANSLATION_WIGGLE_SIDE),)
+    fit = fl.fit_wiggle_sides(rpc, path, f_t_c, marks[neg]["joints"], marks[pos]["joints"], lim, sides)
     return path, fit, list(fit.problems)
 
 
@@ -387,7 +409,10 @@ def build_recording(rpc, direction: str, marks: dict, start: dict, f_t_c: np.nda
         note += "\n" + "\n".join(f"  注意：{w}" for w in path.warnings)
     if problems:
         return None, note, None, None, problems
-    segs = fl.recording_segments(direction, path, fit, f_t_c, motion_config())
+    cfg = motion_config()
+    if fit.wiggle_side is not None:                      # 平移：按收两端时选的摆动方向
+        cfg = dataclasses.replace(cfg, translation_wiggle_side=fit.wiggle_side)
+    segs = fl.recording_segments(direction, path, fit, f_t_c, cfg)
     neg, pos = fl.PAIRS[pair]
     record = {"pair": pair, "kind": path.kind,
               "marks": {n: {k: v for k, v in marks[n].items() if k != "camera"} for n in (neg, pos)},
@@ -395,6 +420,7 @@ def build_recording(rpc, direction: str, marks: dict, start: dict, f_t_c: np.nda
               "marks_s": list(path.marks_s), "margin_range": [path.lo, path.hi], "range": [fit.a, fit.b],
               "unit": path.unit, "ends": fit.ends, "fit_max_joint_speed_deg_s": fit.max_joint_speed_deg_s,
               "config_from": fit.seed, "joints_ends": [fit.joints_a, fit.joints_b], "notes": fit.notes,
+              "wiggle_side": fit.wiggle_side,
               "joint_min": limits[0], "joint_max": limits[1], "warnings": path.warnings}
     return segs, note, record, fl.start_joints(direction, fit), []
 
@@ -953,7 +979,10 @@ def cmd_speed_test(args) -> int:
             print(f"  警告：{label}去程和回程的“速度 / 百分比”相差 {r:+.0%}，速度和百分比不成正比，"
                   "录制时以实测速度为准")
     a_lin = accel.get("test_down_mm_s2")
-    if a_lin:
+    if a_lin and args.scale < FULL_SPEED_SCALE:
+        print(f"  平移加速度约 {a_lin / 1000:.2f} m/s²（{by['test_down'].log['measured']['linear_mm_s']['mean']:.0f} mm/s 时）："
+              "这是降速测的，控制器的加速度随速度变，不能推到录制速度，plan / record 不用它；全速跑一次 speed-test")
+    elif a_lin:
         print(f"  平移加速度约 {a_lin / 1000:.2f} m/s²（{by['test_down'].log['measured']['linear_mm_s']['mean']:.0f} mm/s 时）；"
               f"{SPEED_MPS} m/s 时加减速共走约 {(SPEED_MPS * 1000.0) ** 2 / a_lin:.0f} mm，"
               f"上下这条 {travel:.0f} mm 的匀速段约 {travel - (SPEED_MPS * 1000.0) ** 2 / a_lin:.0f} mm")

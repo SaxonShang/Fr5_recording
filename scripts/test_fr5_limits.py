@@ -5,6 +5,7 @@
 
 import argparse
 import contextlib
+import dataclasses
 import io
 import json
 import math
@@ -102,6 +103,17 @@ class DeriveTest(unittest.TestCase):
         bad = fl.derive_path("up_down", down, tilted(shifted(up, left=60.0), "pitch", -7.0), REF, 30.0, 3.0)
         self.assertEqual(len(bad.warnings), 2, bad.warnings)
         self.assertEqual(bad.problems, [])
+
+    def test_up_down_fixed_facing(self):
+        """上下录制的朝向可以固定（UP_DOWN_HEADING_BASE_DEG）：给了方向就按它，不取两个标记的平均。"""
+        down = heading(shifted(REF, left=300.0, up=-200.0), 4.0)
+        up = heading(shifted(REF, left=300.0, up=250.0), 2.0)
+        plus_x = np.array([1.0, 0.0, 0.0])
+        path = fl.derive_path("up_down", down, up, REF, 30.0, 3.0, up_down_facing=plus_x)
+        self.assertAlmostEqual(path.heading_deg, fl.heading_of(REF, plus_x), places=9)
+        np.testing.assert_allclose(path.base[:3, 2], plus_x, atol=1e-12)          # 光轴朝 +X、水平
+        np.testing.assert_allclose(path.base[:3, 3], (down[:3, 3] + up[:3, 3]) / 2, atol=1e-12)   # 位置不变
+        self.assertAlmostEqual(fl.derive_path("up_down", down, up, REF, 30.0, 3.0).heading_deg, 3.0, places=6)   # 不给：取平均
 
     def test_forward_backward_follows_drag_direction(self):
         """前后：方向取两个标记连线的水平分量，光轴沿这个方向；路径水平地经过两个标记，高度取平均。"""
@@ -255,6 +267,29 @@ class FitTest(unittest.TestCase):
         self.assertGreater(fit.b, 70.0)
         self.assertIn("同步摆动", fit.ends[1])
         self.assertAlmostEqual(fit.a, self.path.lo)
+
+    def test_wiggle_side_auto(self):
+        """往左摆在顶上一截摆不过去（逆解失败），往右摆没问题：选往右，行程更长，并写明。两边都一样时取往左。"""
+        top = self.path.pose(80.0)[2, 3]
+        base_h = fl.angles(REF, self.path.base)[0]
+
+        def fail(c):
+            return fl.angles(REF, c)[0] > base_h + 5.0 and c[2, 3] > top + 1e-9       # 往左转、在 80 mm 以上
+        ik = FakeIK(fail=fail)
+        q0, q1 = joints_at(self.down), joints_at(self.up)
+        fit = fl.fit_wiggle_sides(ik, self.path, F_T_C, q0, q1, limits(wiggle_deg=10.0))
+        self.assertEqual(fit.wiggle_side, -1)
+        self.assertAlmostEqual(fit.b, self.path.hi)
+        self.assertTrue(any("只往右摆" in m and "往左摆时只能走" in m for m in fit.notes), fit.notes)
+        self.assertIn("同步摆动：只往右摆", fl.describe_path(self.path, fit))
+        same = fl.fit_wiggle_sides(FakeIK(), self.path, F_T_C, q0, q1, limits(wiggle_deg=10.0))
+        self.assertEqual((same.wiggle_side, same.notes), (+1, []))
+        only_left = fl.fit_wiggle_sides(ik, self.path, F_T_C, q0, q1, limits(wiggle_deg=10.0), sides=(+1,))
+        self.assertEqual(only_left.wiggle_side, +1)
+        self.assertLessEqual(only_left.b, 80.0 + 1e-6)
+        segs = fl.recording_segments("up", self.path, fit, F_T_C, dataclasses.replace(CFG, translation_wiggle_side=-1))
+        w = next(s for s in segs if s.name == "wiggle_start_1")
+        self.assertLess(fl.angles(REF, w.camera)[0], base_h)                     # 录制里确实往右摆
 
     def test_length_limits(self):
         fit = self.fit(max_length=300.0)
