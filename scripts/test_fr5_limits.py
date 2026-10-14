@@ -65,7 +65,7 @@ class FakeIK:
 
 
 def limits(**kw):
-    base = dict(joint_min=[-1e4] * 6, joint_max=[1e4] * 6, reference_joints=REF_Q, max_joint_step_deg=5.0,
+    base = dict(joint_min=[-1e4] * 6, joint_max=[1e4] * 6, max_joint_step_deg=5.0,
                 min_camera_z_m=0.0, max_joint_speed_deg_s=150.0, speed=500.0, accel=None,
                 min_length=100.0, max_length=1000.0)
     base.update(kw)
@@ -174,15 +174,15 @@ class DeriveTest(unittest.TestCase):
         same = fl.derive_path("left_right", down, shifted(down, up=100.0), REF, 30.0, 3.0)
         self.assertTrue(any("定不出方向" in m for m in same.problems), same.problems)
 
-    def test_branch_and_joint_limits(self):
-        self.assertIsNone(fl.branch_problem([138.8, 30.0, -60.0, -150.0, -30.0, 40.0], REF_Q))
-        found = fl.branch_problem([138.8, -58.6, 113.5, -235.4, -84.8, 15.0], REF_Q)   # 10-14 拖到的另一种构型
-        self.assertIn("肘部翻到了另一边", found)
-        self.assertIn("J4", found)
-        lo, hi = fl.pair_joint_limits([80.0, -30.0, -130.0, -154.0, -72.0, -50.0], [160.0, 34.0, -15.0, -87.0, -19.0, 50.0],
-                                      [[100.0, 36.5, -80.0, -100.0, -40.0, 55.2], [120.0, 10.0, -60.0, -84.6, -44.0, -20.0]])
-        self.assertEqual(lo, [80.0, -30.0, -130.0, -154.0, -72.0, -50.0])
-        self.assertEqual(hi, [160.0, 39.0, -15.0, -82.0, -19.0, 58.0])                # 只放宽，不收窄
+    def test_config(self):
+        flipped = [138.8, -58.6, 113.5, -235.4, -84.8, 15.0]                       # 10-14 拖到的另一种构型
+        self.assertEqual(fl.config_of(REF_Q), (-1, -1))
+        self.assertEqual(fl.config_of(flipped), (1, -1))
+        self.assertEqual(fl.config_of([138.8, 30.0, -60.0, -250.0, -30.0, 140.0]), (-1, -1))   # J4、J6 转多少都不算
+        self.assertEqual(fl.describe_config(flipped), "肘部 J3 +113.5°、腕部 J5 -84.8°")
+        self.assertIsNone(fl.singular_problem(REF_Q, 5.0))
+        self.assertIn("肘部", fl.singular_problem([0, 0, -3.0, 0, -40.0, 0], 5.0))
+        self.assertIn("腕部", fl.singular_problem([0, 0, -40.0, 0, 4.9, 0], 5.0))
 
 
 class FitTest(unittest.TestCase):
@@ -264,7 +264,7 @@ class FitTest(unittest.TestCase):
         bad = fl.derive_path("up_down", self.up, self.down, REF, 30.0, 3.0)
         self.assertTrue(fl.fit_path(FakeIK(), bad, F_T_C, self.ref, limits()).problems)
 
-    def test_yaw_fit_and_reference_branch(self):
+    def test_yaw_fit_and_config_change(self):
         """偏航：右边到右窗为止（这里假设方位角 < −7.5° 拍到）；关节换了构型的地方不能走。"""
         path = fl.derive_path("yaw", heading(REF, -20.0), heading(REF, 40.0), REF, 30.0, 3.0)
         ref = joints_at(path.pose(path.lo))
@@ -278,6 +278,44 @@ class FitTest(unittest.TestCase):
         fit = fl.fit_path(flipped, path, F_T_C, ref, limits(min_length=15.0, max_length=180.0, speed=50.0))
         self.assertLessEqual(fit.b, 30.0 + 1e-6)
         self.assertIn("构型", fit.ends[1])
+
+    def test_singular_margin(self):
+        """往左转时 J5 往 0 走（腕部奇异位形）：J5 离 0 不到 5° 的地方不能走。"""
+        path = fl.derive_path("yaw", heading(REF, -5.0), heading(REF, 40.0), REF, 30.0, 3.0)
+        to_zero = FakeIK(warp=lambda q, c: q + np.r_[0, 0, 0, 0, 44.8 * max(0.0, fl.angles(REF, c)[0]) / 37.0, 0])
+        fit = fl.fit_path(to_zero, path, F_T_C, joints_at(path.pose(path.lo)),
+                          limits(min_length=15.0, max_length=180.0, speed=1.0))
+        self.assertIn("腕部奇异", fit.ends[1])
+        self.assertTrue(30.0 < fit.b < 34.0, fit.b)                               # J5 ≈ −44.8 + 44.8·s/37 = −5 → s ≈ 33（采样每 1°）
+
+    def test_two_configs_try_both(self):
+        """down、up 两个标记构型不同（肘部翻了）：直线换不了构型。下面的构型只能到 −50 mm 处（再往上逆解失败），
+        上面的构型能从顶上走到 −150 mm 处：两种都试，取上面的，并写明。"""
+        z = lambda s: self.path.pose(s)[2, 3]                                     # noqa: E731
+
+        class TwoBranches(FakeIK):
+            def GetInverseKinRef(self, typ, pose, ref):
+                elbow_up = ref[2] > 0                                             # 参考关节角在哪个构型，就解哪个
+                camera = fm.fr5_to_matrix(pose) @ F_T_C
+                if (camera[2, 3] > z(-50.0) + 1e-9) if not elbow_up else (camera[2, 3] < z(-150.0) - 1e-9):
+                    return 112, None
+                err, q = super().GetInverseKinRef(typ, pose, ref)
+                return err, [q[0], q[1], -q[2] if elbow_up else q[2], *q[3:]]
+        neg_q = joints_at(self.down)
+        pos_q = list(joints_at(self.up))
+        pos_q[2] = -pos_q[2]
+        fit = fl.fit_best(TwoBranches(), self.path, F_T_C, neg_q, pos_q, limits())
+        self.assertEqual(fit.seed, "up")
+        self.assertAlmostEqual(fit.b, self.path.hi)
+        self.assertTrue(-150.0 - 1e-6 <= fit.a <= -140.0, fit.a)
+        self.assertGreater(fit.joints_a[2], 0)                                     # 整条都在 up 的构型里
+        self.assertEqual(len(fit.notes), 1)
+        self.assertIn("按 down 的构型能走", fit.notes[0])
+        self.assertIn("取 up 的", fit.notes[0])
+        same = fl.fit_best(TwoBranches(), self.path, F_T_C, neg_q, neg_q, limits(min_length=50.0))
+        self.assertEqual((same.seed, same.notes), ("down", []))                   # 构型相同：只试一次
+        self.assertLessEqual(same.b, -50.0 + 1e-6)
+        self.assertIn("构型：和 up 标记相同", fl.describe_path(self.path, fit))
 
 
 class RecordingTest(unittest.TestCase):
@@ -426,11 +464,14 @@ class RunSessionTest(unittest.TestCase):
                 self.assertEqual(code, 0, text)
             self.assertIn("12 个标记都记了", text)
             self.assertIn("横滚：绕光心", text)                                   # 记完一对就列出这一对的路径
-            # 另一种构型（10-14 拖到的那种）不记
+            # 另一种构型（10-14 拖到的那种）也记（用户 10-14 定）；这一对构型不同时会提醒
             _FakeRecorder.ARM["joints"] = [138.8, -58.6, 113.5, -235.4, -84.8, 15.0]
             code, text = mark("up")
-            self.assertEqual(code, 1)
-            self.assertIn("肘部翻到了另一边", text)
+            self.assertEqual(code, 0, text)
+            self.assertIn("肘部 J3 +113.5°", text)
+            self.assertIn("两个标记构型不同", text)
+            self.park(self.marks["up"])                                       # 再按常用构型记一次，后面的 plan 用它
+            self.assertEqual(mark("up")[0], 0)
         data = json.loads(Path(rs.LIMIT_POSES).read_text(encoding="utf-8"))
         self.assertEqual(sorted(data["marks"]), sorted(fl.MARK_NAMES))
 
@@ -445,6 +486,14 @@ class RunSessionTest(unittest.TestCase):
         self.assertIn("全部通过", text)
         for name in fl.RECORDINGS:
             self.assertIn(f"=== {name}：通过", text)
+        # 机械臂在另一种构型（10-14 拖到的那种）：录制和去参考起点（sync-test）都要先手动拖回去
+        flipped = [138.8, -58.6, 113.5, -235.4, -84.8, 15.0]
+        saved_joints, _FakeRecorder.ARM["joints"] = _FakeRecorder.ARM["joints"], flipped
+        code2, text2 = self.run_cmd(rs.cmd_plan, argparse.Namespace(names=["up", "sync-test"], scale=1.0), [])
+        self.assertEqual(code2, 1)
+        self.assertIn("这条录制的起点是肘部 J3", text2)
+        self.assertIn("参考起点（set-start 时的构型）是肘部 J3 -74.3°", text2)
+        _FakeRecorder.ARM["joints"] = saved_joints
         self.assertNotIn("via_start", text)
         # 偏航：右边被右窗挡住（拖到 −6°、收进 3° 是 −3°，没到右窗），左边收进 3°
         self.assertIn("方位角 -3.0 → +27.0°", text)

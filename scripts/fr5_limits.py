@@ -10,10 +10,12 @@
 - 旋转：绕两个标记光心的中点转。偏航绕竖直轴，相机水平；俯仰绕水平相机的 x 轴、横滚绕水平相机的光轴，
   朝向取两个标记的平均。转角范围就是两个标记在这个角上的读数。
 - 两端先各收进一个余量（LIMIT_MARGIN_MM / LIMIT_MARGIN_DEG），再沿路径用控制器逆解采样（fit_path），往里收到：
-  关节在允许范围内（配置的范围，用这对标记的关节角放宽）、构型和参考起点相同且不跳支、光心不低于下限、
+  关节在允许范围内（FR5 关节范围和控制器软限位）、构型不变且不跳支、离奇异位形至少一个余量、光心不低于下限、
   画面看不到右窗、两端能做同步摆动、按录制速度走时关节速度不超上限（有 speed-test 的加速度时按梯形速度曲线）。
+- 构型（肘部 J3、腕部 J5 的正负）由这一对标记自己定，标记可以是任何构型（用户 10-14 定：拖的时候人会确认腕部、
+  线缆等没问题）。一条直线 / 圆弧换不了构型（要经过奇异位形），两个标记构型不同时两种构型各试一次，取能走得长的（fit_best）。
 
-角度都相对 set-start 的水平起点（参考位姿：只用来定玻璃窗的方向和常用构型，录制不回这里）：
+角度都相对 set-start 的水平起点（参考位姿：只用来定玻璃窗的方向，录制不回这里）：
 方位角正 = 向左、俯仰正 = 向上、横滚正 = 画面顶部向右（和 fr5_motion.pose_span 相同）。
 """
 
@@ -54,8 +56,6 @@ ANGLE_LABEL = ("方位角", "俯仰", "横滚")
 OFF_LINE_WARN_MM = 30.0    # 平移：两个标记偏离路径（前后、左右的高差，上下的水平距离）超过这么多就提醒
 POSE_WARN_DEG = 5.0        # 标记的相机姿态和录制时的姿态（平移）、或另外两个角（旋转）差这么多就提醒
 CENTRE_WARN_MM = 50.0      # 旋转：两个标记的光心相距超过这么多就提醒（绕两者中点转）
-JOINT_TOL_DEG = 2.0        # 用标记的关节角放宽允许范围时，再外扩这么多
-BRANCH_SWING_DEG = 100.0   # J1、J4、J6 离参考起点超过这么多，也当作换了构型（转过了半圈）
 FIT_STEP_MM = 10.0         # fit_path 沿路径的采样间隔（和 check_plan 的 PATH_STEP_MM 相同）
 FIT_STEP_DEG = 1.0
 FIT_SPEED_FRACTION = 0.98  # fit_path 把关节速度收到上限的这么多：之后 check_plan 换一组采样点再查，结果会差一点
@@ -101,15 +101,26 @@ def signed(value: float, digits: int = 1) -> str:
     return f"{v + 0.0 if v != 0 else 0.0:+.{digits}f}"
 
 
-def branch_problem(joints, reference_joints) -> str | None:
-    """关节角和参考起点是不是同一种构型（逆解分支）：肘部（J3 正负）、腕部（J5 正负）相同，
-    J1、J4、J6 离参考起点不超过 BRANCH_SWING_DEG。不同就返回说明：录制用直线运动，到不了另一种构型。"""
-    q, q0 = np.asarray(joints, dtype=float), np.asarray(reference_joints, dtype=float)
-    out = [f"J{j + 1} {q[j]:+.1f}°（常用构型 {q0[j]:+.1f}°，{what}）"
-           for j, what in ((2, "肘部翻到了另一边"), (4, "腕部翻到了另一边")) if q[j] * q0[j] < 0]
-    out += [f"J{j + 1} {q[j]:+.1f}°（常用构型 {q0[j]:+.1f}°，差 {abs(q[j] - q0[j]):.0f}°）"
-            for j in (0, 3, 5) if abs(q[j] - q0[j]) > BRANCH_SWING_DEG]
-    return "构型和参考起点不同：" + "，".join(out) if out else None
+def config_of(joints) -> tuple[int, int]:
+    """构型（逆解分支）：肘部 J3、腕部 J5 的正负。直线 / 圆弧运动中途要变号就得经过奇异位形
+    （J3 = 0 手臂伸直；J5 = 0 腕部 J4、J6 两根轴共线），控制器走不过去，所以一条录制只能在一种构型里。"""
+    q = np.asarray(joints, dtype=float)
+    return int(np.sign(q[2])), int(np.sign(q[4]))
+
+
+def describe_config(joints) -> str:
+    q = np.asarray(joints, dtype=float)
+    return f"肘部 J3 {signed(q[2])}°、腕部 J5 {signed(q[4])}°"
+
+
+def singular_problem(joints, margin_deg: float) -> str | None:
+    """离奇异位形太近：J3 或 J5 离 0 不到 margin_deg。"""
+    q = np.asarray(joints, dtype=float)
+    if abs(q[2]) < margin_deg:
+        return f"离肘部奇异位形太近（J3 {signed(q[2])}°，手臂快伸直）"
+    if abs(q[4]) < margin_deg:
+        return f"离腕部奇异位形太近（J5 {signed(q[4])}°）"
+    return None
 
 
 # ------------------------------------------------------------------ 一对标记 → 路径
@@ -208,20 +219,11 @@ def derive_path(pair: str, cam_neg: np.ndarray, cam_pos: np.ndarray, reference: 
     return MarkPath(pair, kind, base, axis, heading, marks_s, lo, hi, warnings, problems)
 
 
-def pair_joint_limits(joint_min, joint_max, mark_joints, tol_deg: float = JOINT_TOL_DEG) -> tuple[list, list]:
-    """允许的关节范围：配置的范围，再用这对标记的关节角（外扩 tol_deg，取整）放宽。标记是用户拖过、确认安全的位姿。"""
-    q = np.asarray(mark_joints, dtype=float)
-    lo = [min(float(joint_min[j]), float(math.floor(q[:, j].min() - tol_deg))) for j in range(6)]
-    hi = [max(float(joint_max[j]), float(math.ceil(q[:, j].max() + tol_deg))) for j in range(6)]
-    return lo, hi
-
-
 # ------------------------------------------------------------------ 用逆解收两端
 @dataclass
 class FitLimits:
     joint_min: list
     joint_max: list
-    reference_joints: list          # 常用构型（参考起点的关节角），见 branch_problem
     max_joint_step_deg: float       # 每 10 mm / 2° 允许的关节变化（同 check_plan）
     min_camera_z_m: float
     max_joint_speed_deg_s: float
@@ -233,6 +235,7 @@ class FitLimits:
     glass_margin_deg: float = 1.0
     wiggle_deg: float = 0.0         # 平移两端的同步摆动（绕相机竖直轴）；旋转的同步摆动在转动范围以内，不另查
     wiggle_side: int = 0
+    singular_margin_deg: float = 5.0  # J3、J5 离 0（奇异位形）至少这么多
 
 
 @dataclass
@@ -242,6 +245,10 @@ class Fit:
     ends: list                      # [负端为什么停在这里, 正端为什么停在这里]
     max_joint_speed_deg_s: float | None
     problems: list = field(default_factory=list)
+    seed: str = ""                  # 按哪个标记的构型（fit_best 填）
+    joints_a: list | None = None    # 两端的关节角（逆解）
+    joints_b: list | None = None
+    notes: list = field(default_factory=list)
 
     @property
     def length(self) -> float:
@@ -255,9 +262,10 @@ def _speed_at(s: float, a: float, b: float, v: float, accel: float | None) -> fl
     return min(v, math.sqrt(2.0 * accel * max(0.0, s - a)), math.sqrt(2.0 * accel * max(0.0, b - s)))
 
 
-def fit_path(rpc, path: MarkPath, f_t_c: np.ndarray, ref_joints, lim: FitLimits) -> Fit:
+def fit_path(rpc, path: MarkPath, f_t_c: np.ndarray, seed_joints, lim: FitLimits, from_pos_end: bool = False) -> Fit:
     """沿路径在 [lo, hi] 上采样逆解，取能走的最长一段，再收到关节速度和两端的同步摆动都满足。
-    ref_joints：逆解的初始参考（负端标记的关节角）。不动机械臂，只调控制器逆解。"""
+    seed_joints：逆解的初始参考（一个标记的关节角），路径只走这个构型；from_pos_end：从正端往负端逐点推
+    （种子是正端标记时），否则从负端往正端。不动机械臂，只调控制器逆解。"""
     translate = path.kind == "translate"
     step = FIT_STEP_MM if translate else FIT_STEP_DEG
     step_tol = lim.max_joint_step_deg * step / (fm.PATH_STEP_MM if translate else fm.PATH_STEP_DEG)
@@ -268,30 +276,31 @@ def fit_path(rpc, path: MarkPath, f_t_c: np.ndarray, ref_joints, lim: FitLimits)
     inv = np.linalg.inv(f_t_c)
     qs: list = [None] * (n + 1)
     bad = [""] * (n + 1)                 # 这个采样点为什么不能走（空 = 能走）
-    linked = [False] * (n + 1)           # 和前一个采样点之间关节连续
-    ref = list(map(float, ref_joints))
-    for k, s in enumerate(ss):
-        cam = path.pose(float(s))
+    seed_config = config_of(seed_joints)
+    ref = list(map(float, seed_joints))
+    for k in (range(n, -1, -1) if from_pos_end else range(n + 1)):
+        cam = path.pose(float(ss[k]))
         err, q = fm.inverse_kin(rpc, cam @ inv, ref)
         if q is None:
             bad[k] = f"逆解失败（错误码 {err}）"
             continue
-        if k > 0 and qs[k - 1] is not None:
-            jump = max(abs(x - y) for x, y in zip(q, qs[k - 1]))
-            linked[k] = jump <= step_tol
         qs[k], ref = q, q
         out = [j + 1 for j in range(6) if not lim.joint_min[j] - 1e-6 <= q[j] <= lim.joint_max[j] + 1e-6]
-        branch = branch_problem(q, lim.reference_joints)
+        singular = singular_problem(q, lim.singular_margin_deg)
         z = float(cam[2, 3])
         clear = lim.glass(cam) if lim.glass else math.inf
         if out:
             bad[k] = f"关节 J{out} 超出允许范围（{np.round(q, 1).tolist()}）"
-        elif branch:
-            bad[k] = branch
+        elif config_of(q) != seed_config:
+            bad[k] = f"构型变了（{describe_config(q)}）"
+        elif singular:
+            bad[k] = singular
         elif z < lim.min_camera_z_m:
             bad[k] = f"光心高度 {z:.3f} m 低于下限 {lim.min_camera_z_m} m"
         elif clear < lim.glass_margin_deg:
             bad[k] = f"画面离右窗只有 {clear:.2f}°"
+    linked = [False] + [qs[k] is not None and qs[k - 1] is not None                 # 和前一个采样点之间关节连续
+                        and max(abs(x - y) for x, y in zip(qs[k], qs[k - 1])) <= step_tol for k in range(1, n + 1)]
 
     # 能走的最长一段（中间关节连续）
     runs, i = [], None
@@ -346,8 +355,10 @@ def fit_path(rpc, path: MarkPath, f_t_c: np.ndarray, ref_joints, lim: FitLimits)
                         found = "同步摆动时关节跳了一大步"
                     elif any(not lim.joint_min[jj] - 1e-6 <= q[jj] <= lim.joint_max[jj] + 1e-6 for jj in range(6)):
                         found = f"同步摆动时关节超出允许范围（{np.round(q, 1).tolist()}）"
-                    elif branch_problem(q, lim.reference_joints):
+                    elif config_of(q) != seed_config:
                         found = "同步摆动时换了构型"
+                    elif singular_problem(q, lim.singular_margin_deg):
+                        found = "同步摆动时" + singular_problem(q, lim.singular_margin_deg)
                     elif lim.glass and lim.glass(cam) < lim.glass_margin_deg:
                         found = f"同步摆动时画面离右窗只有 {lim.glass(cam):.2f}°"
                     if found:
@@ -387,11 +398,39 @@ def fit_path(rpc, path: MarkPath, f_t_c: np.ndarray, ref_joints, lim: FitLimits)
                 break
         if not moved:
             break
-    fit = Fit(float(ss[i]), float(ss[j]), ends, worst_speed)
+    fit = Fit(float(ss[i]), float(ss[j]), ends, worst_speed, joints_a=qs[i], joints_b=qs[j])
     if fit.length < lim.min_length - 1e-9:
         fit.problems.append(f"能走的只有 {max(fit.length, 0.0):.1f} {path.unit}，少于下限 {lim.min_length:g} {path.unit}"
                             f"（负端：{ends[0]}；正端：{ends[1]}）")
     return fit
+
+
+def fit_best(rpc, path: MarkPath, f_t_c: np.ndarray, neg_joints, pos_joints, lim: FitLimits) -> Fit:
+    """按标记的构型收两端。两个标记构型相同：从负端标记的关节角起逆解。不同：一条直线 / 圆弧换不了构型，
+    两种构型各试一次（从负端标记起往正端推、从正端标记起往负端推），取没问题、能走得长的那个，并在 notes 里写明。"""
+    neg, pos = PAIRS[path.pair]
+    if config_of(neg_joints) == config_of(pos_joints):
+        fit = fit_path(rpc, path, f_t_c, neg_joints, lim)
+        fit.seed = neg
+        return fit
+    tries = []
+    for name, q, from_pos in ((neg, neg_joints, False), (pos, pos_joints, True)):
+        f = fit_path(rpc, path, f_t_c, q, lim, from_pos_end=from_pos)
+        f.seed = name
+        tries.append(f)
+    best = max(tries, key=lambda f: (not f.problems, f.length))
+    other = pos if best.seed == neg else neg
+    got = "；".join(f"按 {f.seed} 的构型" + (f"能走 {f.length:.1f} {path.unit}" if f.length > 0 else "走不了")
+                   for f in tries)
+    best.notes.append(f"{neg}、{pos} 两个标记构型不同（{neg}：{describe_config(neg_joints)}；"
+                      f"{pos}：{describe_config(pos_joints)}），一条录制换不了构型：{got}，取 {best.seed} 的。"
+                      f"靠近 {other} 那一端时机械臂的姿势和你拖的不一样，第一次低速演练时盯住")
+    return best
+
+
+def start_joints(direction: str, fit: Fit) -> list | None:
+    """录制 direction 起点的关节角（逆解）。"""
+    return fit.joints_a if RECORD_PAIR[direction][1] > 0 else fit.joints_b
 
 
 def record_ends(direction: str, path: MarkPath, fit: Fit) -> tuple[np.ndarray, np.ndarray, float]:
@@ -437,4 +476,8 @@ def describe_path(path: MarkPath, fit: Fit | None = None) -> str:
         lines.append(f"  实际 {signed(fit.a)}～{signed(fit.b)} {u}，共 {fit.length:.1f} {u}（{where}）{speed}")
         for side, name in ((0, neg), (1, pos)):
             lines.append(f"  {name} 端停在这里：{fit.ends[side] or '—'}")
+        if fit.seed and fit.joints_a is not None:
+            lines.append(f"  构型：和 {fit.seed} 标记相同（{describe_config(fit.joints_a)}）")
+    if fit is not None:
+        lines += [f"  注意：{m}" for m in fit.notes]
     return "\n".join(lines)

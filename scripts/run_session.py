@@ -70,15 +70,14 @@ MIN_STROKE_M = 0.15          # 平移行程收完后至少这么长，不够就�
 MAX_STROKE_M = 1.0           # 平移行程上限
 MIN_ROTATION_DEG = 15.0      # 旋转转角下限（不小于 WIGGLE_DEG：同步摆动在转动范围以内）
 MAX_ROTATION_DEG = 180.0     # 旋转转角上限
-# 允许的关节范围（°）。腕部 J4–J6 限制在这套末端装置已经安全走过的范围内（再往外 Box 可能碰到腕部，
-# 见标定仓库 README 6.4 / 6.7）：10-10、10-12 录制实测 J4 −151～−99、J5 −69.5～−22.1、J6 一直是 0，各留约 3° 余量；
-# 俯仰 30° 要 J4 到 −90°：用户 10-13 确认不会碰撞，按标定走过的范围（J4 −154～−77）放宽到 J4 上限 −87。
-# J6 ±50：用户 10-13 目测在起点姿态下 J6 转 60° 以内不会碰（横滚），按用户要求再保守 10°；起点 J6 ≈ 0。
-# J1–J3 覆盖平移路径，离肘部奇异（J3=0）至少 15°。J2 ≤ 34°（低速录制走过的最大值 33.6°）：J2 再大时大臂往下倾、
-# 肘部低于底座安装面伸到机柜边上（10-14 移到起点时 J2 49.7° 控制器报警，实验记录）。
-# 每条录制再用它那一对拖动标记的关节角（外扩 2°）放宽：标记是用户拖过、确认安全的位姿。
-JOINT_MIN_DEG = [80.0, -30.0, -130.0, -154.0, -72.0, -50.0]
-JOINT_MAX_DEG = [160.0, 34.0, -15.0, -87.0, -19.0, 50.0]
+# 允许的关节范围（°）：FR5 的关节范围，运行时再和控制器读到的关节软限位取交集（各收进 SOFT_LIMIT_MARGIN_DEG）。
+# 高速录制不再另设保守范围（用户 10-14 定）：腕部 J4、J5、线缆（J6）、机柜等由拖动标记保证，拖的时候人会确认；
+# 路径只在两个标记之间，并且不换构型、离奇异位形至少 SINGULAR_MARGIN_DEG。
+# 低速录制（data-v1）用的是保守范围 [80, −30, −130, −154, −72, −50]～[160, 34, −15, −87, −19, 50]。
+JOINT_MIN_DEG = [-175.0, -265.0, -160.0, -265.0, -175.0, -175.0]
+JOINT_MAX_DEG = [175.0, 85.0, 160.0, 85.0, 175.0, 175.0]
+SOFT_LIMIT_MARGIN_DEG = 2.0  # 离控制器关节软限位至少这么多 °
+SINGULAR_MARGIN_DEG = 5.0    # 录制路径上 J3（手臂伸直）、J5（腕部两根轴共线）离 0 至少这么多 °
 MAX_JOINT_STEP_DEG = 5.0     # 路径上每 10 mm / 2° 允许的最大关节变化（超过说明逆解可能跳支）
 MAX_JOINT_SPEED_DEG_S = 150.0  # 录制段按预计速度走时任一关节的最快速度上限 °/s（FR5 额定 180 °/s）
 MAX_SPEED_RIPPLE = 0.05      # 平移巡航段速度波动（标准差/均值）超过它就警告“速度不平稳”
@@ -124,6 +123,8 @@ RANGES = {
     "MIN_ROTATION_DEG": (5.0, 60.0),
     "MAX_ROTATION_DEG": (20.0, 180.0),
     "MAX_JOINT_STEP_DEG": (1.0, 15.0),
+    "SOFT_LIMIT_MARGIN_DEG": (0.0, 10.0),
+    "SINGULAR_MARGIN_DEG": (2.0, 20.0),
     "MAX_JOINT_SPEED_DEG_S": (30.0, 170.0),
     "MAX_SPEED_RIPPLE": (0.01, 0.2),
     "MIN_FREE_GB": (1.0, 100.0),
@@ -299,6 +300,36 @@ def check_segments(rec: StateRecorder, rpc, segs: list[fm.Segment], f_t_c, model
     return problems + fm.joint_speed_problems(segs, MAX_JOINT_SPEED_DEG_S, model)
 
 
+def joint_limits(rpc) -> tuple[list, list, str]:
+    """允许的关节范围：JOINT_MIN/MAX_DEG 和控制器关节软限位（收进 SOFT_LIMIT_MARGIN_DEG）取交集。
+    返回 (下限, 上限, 说明)；读不到软限位时只用 JOINT_MIN/MAX_DEG。"""
+    lo, hi = [float(v) for v in JOINT_MIN_DEG], [float(v) for v in JOINT_MAX_DEG]
+    try:
+        err, values = rpc.GetJointSoftLimitDeg()
+    except Exception as exc:  # noqa: BLE001 - 读不到就只用 JOINT_MIN/MAX_DEG
+        err, values = f"{type(exc).__name__}: {exc}", None
+    if err != 0 or not values or len(values) != 12:
+        return lo, hi, f"没读到控制器的关节软限位（{err}），只按 JOINT_MIN/MAX_DEG"
+    soft = [(float(values[2 * j]), float(values[2 * j + 1])) for j in range(6)]   # [J1 下, J1 上, J2 下, …]
+    if not all(a < b for a, b in soft):
+        return lo, hi, f"控制器关节软限位的格式和预期不同（{values}），只按 JOINT_MIN/MAX_DEG"
+    lo = [max(a, s + SOFT_LIMIT_MARGIN_DEG) for a, (s, _) in zip(lo, soft)]
+    hi = [min(b, e - SOFT_LIMIT_MARGIN_DEG) for b, (_, e) in zip(hi, soft)]
+    return lo, hi, "控制器关节软限位：" + "，".join(f"J{j + 1} {s:+.0f}～{e:+.0f}" for j, (s, e) in enumerate(soft))
+
+
+def config_problem(current_joints, start_q, target: str = "这条录制的起点") -> str | None:
+    """机械臂现在的构型和要去的位姿不同：直线移不过去（要经过奇异位形），要先手动拖过去。
+    参考起点（goto-start、sync-test、movec-test）按 set-start 时的关节角查：换一种构型到那里，机械臂的姿势没确认过。"""
+    if start_q is None or fl.config_of(current_joints) == fl.config_of(start_q):
+        return None
+    return (f"goto_start: 机械臂现在是{fl.describe_config(current_joints)}，{target}是{fl.describe_config(start_q)}，"
+            f"构型不同，直线移不过去（要经过奇异位形）；先手动拖到{target}附近（关节约 {np.round(start_q, 1).tolist()}）")
+
+
+REFERENCE = "参考起点（set-start 时的构型）"
+
+
 # ------------------------------------------------------------------ 拖动标记 → 路径
 def load_marks(f_t_c: np.ndarray) -> dict:
     """拖动标记 {名字: limit_poses.json 里的记录 + "camera"（按记下的法兰位姿和现在的手眼外参算的相机位姿）}。"""
@@ -319,22 +350,18 @@ def pair_path(pair: str, marks: dict, start: dict) -> tuple[fl.MarkPath | None, 
                           LIMIT_MARGIN_MM, LIMIT_MARGIN_DEG), ""
 
 
-def pair_limits(pair: str, marks: dict) -> tuple[list, list]:
-    neg, pos = fl.PAIRS[pair]
-    return fl.pair_joint_limits(JOINT_MIN_DEG, JOINT_MAX_DEG, [marks[neg]["joints"], marks[pos]["joints"]])
-
-
-def fit_pair(rpc, pair: str, marks: dict, start: dict, f_t_c: np.ndarray, model: fm.SpeedModel | None):
-    """按标记定路径，再用控制器逆解收两端。返回 (路径或 None, Fit 或 None, 关节范围, 问题列表)。
-    关节速度按满速算（不乘 --scale：降速演练和正式录制走同一条路径），有 speed-test 的加速度时按梯形速度曲线。"""
+def fit_pair(rpc, pair: str, marks: dict, start: dict, f_t_c: np.ndarray, model: fm.SpeedModel | None,
+             limits: tuple[list, list]):
+    """按标记定路径，再用控制器逆解收两端（构型按标记，见 fl.fit_best）。返回 (路径或 None, Fit 或 None, 问题列表)。
+    limits：允许的关节范围（joint_limits）。关节速度按满速算（不乘 --scale：降速演练和正式录制走同一条路径），
+    有 speed-test 的加速度时按梯形速度曲线。"""
     path, missing = pair_path(pair, marks, start)
     if path is None:
-        return None, None, (JOINT_MIN_DEG, JOINT_MAX_DEG), [missing]
-    limits = pair_limits(pair, marks)
+        return None, None, [missing]
     translate = path.kind == "translate"
     accel = (model.accel_mm_s2 if translate else model.accel_deg_s2) if model else None
     lim = fl.FitLimits(
-        joint_min=limits[0], joint_max=limits[1], reference_joints=start["joints"],
+        joint_min=limits[0], joint_max=limits[1],
         max_joint_step_deg=MAX_JOINT_STEP_DEG, min_camera_z_m=MIN_CAMERA_Z_M,
         max_joint_speed_deg_s=MAX_JOINT_SPEED_DEG_S,
         speed=SPEED_MPS * 1000.0 if translate else ROT_DEG_S, accel=accel,
@@ -342,22 +369,24 @@ def fit_pair(rpc, pair: str, marks: dict, start: dict, f_t_c: np.ndarray, model:
         max_length=MAX_STROKE_M * 1000.0 if translate else MAX_ROTATION_DEG,
         glass=fm.GlassCheck(start["camera"], GLASS_REGIONS, distance_m=WINDOW_DISTANCE_M),
         glass_margin_deg=GLASS_MARGIN_DEG,
-        wiggle_deg=WIGGLE_DEG if translate else 0.0, wiggle_side=int(TRANSLATION_WIGGLE_SIDE))
-    fit = fl.fit_path(rpc, path, f_t_c, marks[fl.PAIRS[pair][0]]["joints"], lim)
-    return path, fit, limits, list(fit.problems)
+        wiggle_deg=WIGGLE_DEG if translate else 0.0, wiggle_side=int(TRANSLATION_WIGGLE_SIDE),
+        singular_margin_deg=SINGULAR_MARGIN_DEG)
+    neg, pos = fl.PAIRS[pair]
+    fit = fl.fit_best(rpc, path, f_t_c, marks[neg]["joints"], marks[pos]["joints"], lim)
+    return path, fit, list(fit.problems)
 
 
-def build_recording(rpc, direction: str, marks: dict, start: dict, f_t_c: np.ndarray, model):
-    """录制 direction 的全部段。返回 (段或 None, 路径说明, 写进 motion_log 的路径记录, 关节范围, 问题列表)。"""
+def build_recording(rpc, direction: str, marks: dict, start: dict, f_t_c: np.ndarray, model, limits):
+    """录制 direction 的全部段。返回 (段或 None, 路径说明, 写进 motion_log 的路径记录, 起点关节角, 问题列表)。"""
     pair = fl.RECORD_PAIR[direction][0]
-    path, fit, limits, problems = fit_pair(rpc, pair, marks, start, f_t_c, model)
+    path, fit, problems = fit_pair(rpc, pair, marks, start, f_t_c, model, limits)
     if path is None:
-        return None, "", None, limits, problems
+        return None, "", None, None, problems
     note = fl.describe_path(path, fit)
     if path.warnings:
         note += "\n" + "\n".join(f"  注意：{w}" for w in path.warnings)
     if problems:
-        return None, note, None, limits, problems
+        return None, note, None, None, problems
     segs = fl.recording_segments(direction, path, fit, f_t_c, motion_config())
     neg, pos = fl.PAIRS[pair]
     record = {"pair": pair, "kind": path.kind,
@@ -365,8 +394,9 @@ def build_recording(rpc, direction: str, marks: dict, start: dict, f_t_c: np.nda
               "base_T_camera": path.base.tolist(), "axis": path.axis.tolist(), "heading_deg": path.heading_deg,
               "marks_s": list(path.marks_s), "margin_range": [path.lo, path.hi], "range": [fit.a, fit.b],
               "unit": path.unit, "ends": fit.ends, "fit_max_joint_speed_deg_s": fit.max_joint_speed_deg_s,
+              "config_from": fit.seed, "joints_ends": [fit.joints_a, fit.joints_b], "notes": fit.notes,
               "joint_min": limits[0], "joint_max": limits[1], "warnings": path.warnings}
-    return segs, note, record, limits, []
+    return segs, note, record, fl.start_joints(direction, fit), []
 
 
 def confirm_plan(text: str, assume_yes: bool) -> None:
@@ -467,6 +497,10 @@ def print_pair(pair: str, marks: dict, start: dict, indent: str = "  ") -> None:
         print(f"{indent}{fl.PAIR_LABEL[pair]}：{missing}")
         return
     print(indent + fl.describe_path(path).replace("\n", "\n" + indent))
+    neg, pos = fl.PAIRS[pair]
+    if fl.config_of(marks[neg]["joints"]) != fl.config_of(marks[pos]["joints"]):
+        print(f"{indent}  注意：两个标记构型不同（{neg}：{fl.describe_config(marks[neg]['joints'])}；"
+              f"{pos}：{fl.describe_config(marks[pos]['joints'])}）：一条录制换不了构型，plan 两种构型各试一次，取能走得长的")
     for w in path.warnings:
         print(f"{indent}  注意：{w}")
     for m in path.problems:
@@ -490,11 +524,6 @@ def cmd_mark(args) -> int:
     if moved > 1.0 or turned > 0.2:
         print(f"0.5 s 内法兰动了 {moved:.1f} mm、{turned:.2f}°：松手，等机械臂停稳后再记")
         return 1
-    branch = fl.branch_problem(joints, start["joints"])
-    if branch:
-        print(f"没有记：{branch}。\n  关节 {np.round(joints, 1).tolist()}，常用构型（参考起点）"
-              f"{np.round(start['joints'], 1).tolist()}；录制用直线运动，到不了另一种构型。先拖回常用构型再拖到极限")
-        return 1
     camera = flange @ f_t_c
     path = p(LIMIT_POSES)
     data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"marks": {}}
@@ -510,7 +539,7 @@ def cmd_mark(args) -> int:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"已记下 {args.direction}（{path}）")
     print(f"  {describe_mark(fl.relative(start['camera'], camera))}")
-    print(f"  关节 {np.round(joints, 1).tolist()}")
+    print(f"  关节 {np.round(joints, 1).tolist()}（{fl.describe_config(joints)}）")
     if old is not None:
         before = fm.fr5_to_matrix(old["flange"]) @ f_t_c
         print(f"  替换了 {old['created']} 的标记（光心差 {np.linalg.norm(before[:3, 3] - camera[:3, 3]) * 1000:.0f} mm、"
@@ -539,21 +568,12 @@ def cmd_limits(args) -> int:
             continue
         m = marks[name]
         print(f"  {name:<11} {describe_mark(fl.relative(start['camera'], m['camera']))}")
-        print(f"  {'':<11} 关节 {np.round(m['joints'], 1).tolist()}（{m['created']}）")
-        branch = fl.branch_problem(m["joints"], start["joints"])
-        if branch:
-            print(f"  {'':<11} 问题：{branch}")
+        print(f"  {'':<11} 关节 {np.round(m['joints'], 1).tolist()}（{fl.describe_config(m['joints'])}；{m['created']}）")
     print("\n录制路径（plan 再按逆解、关节速度、右窗和同步摆动收两端）：")
     for pair in fl.PAIRS:
         names = [n for n in fl.RECORDINGS if fl.RECORD_PAIR[n][0] == pair]
         print(f"\n  [{' / '.join(names)}]")
         print_pair(pair, marks, start, "  ")
-        if all(n in marks for n in fl.PAIRS[pair]):
-            lo, hi = pair_limits(pair, marks)
-            wider = [f"J{j + 1} {lo[j]:+.0f}～{hi[j]:+.0f}" for j in range(6)
-                     if (lo[j], hi[j]) != (JOINT_MIN_DEG[j], JOINT_MAX_DEG[j])]
-            if wider:
-                print("    关节范围按这对标记放宽：" + "，".join(wider))
     return 0
 
 
@@ -580,14 +600,22 @@ def cmd_plan(args, problems: list[str]) -> int:
         rec.start()
         try:
             rpc = rec.open_rpc()
+            lo, hi, limits_note = joint_limits(rpc)
+            print(f"关节范围：{limits_note}")
+            _, current_q, _ = current_pose(rec)
+            print(f"机械臂现在：关节 {np.round(current_q, 1).tolist()}（{fl.describe_config(current_q)}）")
             for name in names:
+                start_q = None
                 if name == "sync-test":
-                    segs, path_note, found, limits = fm.plan_sync_test(start["camera"], f_t_c, cfg), "", [], None
+                    segs, path_note, found = fm.plan_sync_test(start["camera"], f_t_c, cfg), "", []
+                    start_q = start["joints"]
                 else:
-                    segs, path_note, _, limits, found = build_recording(rpc, name, marks, start, f_t_c, model)
+                    segs, path_note, _, start_q, found = build_recording(rpc, name, marks, start, f_t_c, model, (lo, hi))
                 if segs is not None:
                     note, glass = pose_note(name, segs, start["camera"], f_t_c)
-                    found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits) + glass
+                    moved = config_problem(current_q, start_q, REFERENCE if name == "sync-test" else "这条录制的起点")
+                    found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale,
+                                                                        (lo, hi)) + glass
                 print(f"\n=== {name}：{'通过' if not found else '有问题'}")
                 for text in (path_note, note if segs is not None else ""):
                     if text:
@@ -705,20 +733,23 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         if model is None:                        # 只有 goto-start 允许没标定
             model = conservative_model(rpc)
             note = "还没有速度标定，按保守假设换算（实际只会更慢）"
-        path_note, limits = "", None
+        path_note, start_q, target = "", start["joints"], REFERENCE   # goto-start、sync-test：去参考起点
+        lo, hi, _ = joint_limits(rpc)
+        limits = (lo, hi)
         if kind == "record":                     # 按这一对拖动标记定路径，用逆解收两端
-            built, path_note, mark_path, limits, found = build_recording(rpc, direction, load_marks(f_t_c), start,
-                                                                         f_t_c, model)
+            built, path_note, mark_path, start_q, found = build_recording(rpc, direction, load_marks(f_t_c), start,
+                                                                          f_t_c, model, limits)
             if built is None:
                 raise fm.MotionAborted("路径没定下来，没有运动：\n" + (path_note + "\n" if path_note else "")
                                        + "\n".join(f"  {m}" for m in found))
-            segs = built
+            segs, target = built, "这条录制的起点"
         elif kind == "sync-test":
             segs = fm.plan_sync_test(start["camera"], f_t_c, cfg)
         else:
             segs = fm.plan_sync_test(start["camera"], f_t_c, cfg)[:1]  # 只移到参考起点
         pose, found = pose_note(name, segs, start["camera"], f_t_c)
-        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits) + found
+        moved = config_problem(current_pose(rec)[1], start_q, target)
+        found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits) + found
         if found:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found)
                                    + ("\n（goto_start 走不通时，先手动拖到这条录制的起点附近再试）"
@@ -834,13 +865,15 @@ def cmd_speed_test(args) -> int:
             runner.precheck()
             model = conservative_model(rpc)
             vmax = model.mm_s_per_pct * 100.0
-            path, fit, limits, found = fit_pair(rpc, "up_down", marks, start, f_t_c, None)
+            lo, hi, _ = joint_limits(rpc)
+            path, fit, found = fit_pair(rpc, "up_down", marks, start, f_t_c, None, (lo, hi))
             if found:
                 raise fm.MotionAborted("上下那条路径没定下来，没有运动：\n  " + "\n  ".join(found))
             travel = fit.length
             segs = fm.plan_speed_test(path.pose(fit.a), f_t_c, cfg, travel, SPEED_TEST_PCT)
             by = {s.name: s for s in segs}
-            found = check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits)
+            moved = config_problem(current_pose(rec)[1], fit.joints_a)
+            found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale, (lo, hi))
             if found:
                 raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
             pending = {"test_down": f"速度按 test_up 实测换算，目标 {SPEED_MPS * 1000 * args.scale:.1f} mm/s",
@@ -952,7 +985,9 @@ def cmd_movec_test(args) -> int:
         rpc = rec.open_rpc()
         runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
         runner.precheck()
-        found = check_segments(rec, rpc, segs, f_t_c, model, args.scale)
+        moved = config_problem(current_pose(rec)[1], start["joints"], REFERENCE)
+        found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale,
+                                                            joint_limits(rpc)[:2])
         if found:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
         confirm_plan(f"movec-test：圆弧（MoveC）和直线（MoveL）各转 +{WIGGLE_DEG:g}°、-{2 * WIGGLE_DEG:g}°、+{WIGGLE_DEG:g}°，"

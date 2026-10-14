@@ -747,23 +747,37 @@ class ParametersTest(unittest.TestCase):
         self.assertTrue(any("同步摆动会超出" in m for m in problems_with(MIN_ROTATION_DEG=8.0)))
         self.assertEqual(list(rs.fl.RECORDINGS), ["up", "right", "forward", "yaw_left", "pitch_up", "roll_right"])
 
-    def test_joint_limits_cover_traversed_range(self):
+    def test_joint_limits(self):
+        """高速录制不再另设保守的关节范围（用户 10-14 定）：JOINT_MIN/MAX 是 FR5 的关节范围，运行时和控制器软限位取交集。"""
         try:
             import run_session as rs
         except ImportError as exc:
             self.skipTest(str(exc))
-        traversed = {4: (-151.0, -99.2), 5: (-69.5, -22.1), 6: (-0.1, 0.1)}   # 10-10、10-12 录制实测
+        traversed = {1: (106.8, 134.2), 2: (-7.8, 33.6), 3: (-101.9, -22.8),   # 10-10、10-12 录制实测
+                     4: (-151.0, -99.2), 5: (-69.5, -22.1), 6: (-0.1, 0.1)}
         for j, (lo, hi) in traversed.items():
             self.assertLessEqual(rs.JOINT_MIN_DEG[j - 1], lo)
             self.assertGreaterEqual(rs.JOINT_MAX_DEG[j - 1], hi)
-        # J6 比用户 10-13 目测确认的起点 ±60° 至少保守 10°（起点 J6 ≈ 0）
-        self.assertLessEqual(max(abs(rs.JOINT_MIN_DEG[5]), abs(rs.JOINT_MAX_DEG[5])), 50.0)
-        # J4、J5 超出录制实测的部分不超出标定走过的安全范围（标定仓库 README 6.4：J4 −154～−77、J5 −119～−56）
-        self.assertGreaterEqual(rs.JOINT_MIN_DEG[3], -154.0)
-        self.assertLessEqual(rs.JOINT_MAX_DEG[3], -77.0)
-        self.assertGreaterEqual(rs.JOINT_MIN_DEG[4], -119.0)
-        for name in ("pitch_up", "roll_left", "roll_right"):
-            self.assertIn(name, rs.RECORD_NAMES)
+        self.assertEqual((rs.JOINT_MIN_DEG[1], rs.JOINT_MAX_DEG[1]), (-265.0, 85.0))   # FR5 J2
+        self.assertGreaterEqual(rs.SINGULAR_MARGIN_DEG, 2.0)
+
+        class Rpc:
+            def __init__(self, ret):
+                self.ret = ret
+
+            def GetJointSoftLimitDeg(self):
+                if isinstance(self.ret, Exception):
+                    raise self.ret
+                return self.ret
+        soft = [-170.0, 170.0, -260.0, 80.0, -150.0, 150.0, -260.0, 80.0, -170.0, 170.0, -170.0, 170.0]
+        lo, hi, note = rs.joint_limits(Rpc((0, soft)))
+        self.assertEqual(lo, [-168.0, -258.0, -148.0, -258.0, -168.0, -168.0])        # 软限位收进 2°
+        self.assertEqual(hi, [168.0, 78.0, 148.0, 78.0, 168.0, 168.0])
+        self.assertIn("J2 -260～+80", note)
+        for bad in ((5, None), (0, soft[:10]), (0, [10.0, -10.0] * 6), RuntimeError("no such method")):
+            lo, hi, note = rs.joint_limits(Rpc(bad))
+            self.assertEqual((lo, hi), (list(rs.JOINT_MIN_DEG), list(rs.JOINT_MAX_DEG)), note)
+            self.assertIn("只按 JOINT_MIN/MAX_DEG", note)
 
     def test_glass_clearance_defaults(self):
         """真实参考起点和手眼外参下：sync-test 离右窗 ≥ GLASS_MARGIN_DEG；左窗可以拍（用户 10-13 定）：
