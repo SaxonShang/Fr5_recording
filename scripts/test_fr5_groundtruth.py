@@ -7,6 +7,7 @@ import csv
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import numpy as np
@@ -390,6 +391,59 @@ class SyntheticSessionTest(unittest.TestCase):
             self.assertEqual(flags[1], "duplicate")
             t = read_tum(d / "groundtruth_tum.txt")[:, 0]
             self.assertEqual(len(t), len(np.unique(t)))
+
+    def test_end_pose_correction(self):
+        """端点位姿修正：起点不动、终点补满 ΔT，中间沿同一个螺旋运动插值（两个半程等于全程）；进度按光心沿运动方向
+        （平移）或绕转轴的转角（旋转）算，0–1 之外截断；接进 process 后可以关掉。"""
+        delta = [0.10, -0.20, 0.30, 2.0, -3.0, 1.5]                              # °、mm
+        info = {"source": "END_POSE_CORRECTION", "delta_rotvec_deg_mm": delta}
+        pos, quat = np.tile(P0, (3, 1)), np.tile(gt.matrix_to_quat(R0), (3, 1))
+        p, q = gt.apply_end_pose_correction(pos, quat, np.array([0.0, 0.5, 1.0]), info)
+        d_t = np.eye(4)
+        d_t[:3, :3] = gt.quat_to_matrix(gt.rotvec_to_quat(np.radians(delta[:3])))
+        d_t[:3, 3] = np.array(delta[3:]) / 1000.0
+        t0 = np.eye(4)
+        t0[:3, :3], t0[:3, 3] = R0, P0
+        full = d_t @ t0
+        np.testing.assert_allclose(p[0], P0, atol=1e-12)
+        np.testing.assert_allclose(p[2], full[:3, 3], atol=1e-12)
+        np.testing.assert_allclose(gt.quat_to_matrix(q[2]), full[:3, :3], atol=1e-12)
+        p2, q2 = gt.apply_end_pose_correction(p[1:2], q[1:2], np.array([0.5]), info)
+        np.testing.assert_allclose(p2[0], full[:3, 3], atol=1e-12)
+        np.testing.assert_allclose(gt.quat_to_matrix(q2[0]), full[:3, :3], atol=1e-12)
+
+        euler = [-156.0, -6.0, -168.0]                                              # R0
+        tinfo = {"kind": "translate", "start_flange": [*(P0 * 1000), *euler],
+                 "end_flange": [*((P0 + [0.3, 0, 0]) * 1000), *euler], "axis_base": None}
+        u = np.array([-0.1, 0.0, 0.25, 1.0, 1.2])
+        pp = P0 + u[:, None] * np.array([0.3, 0.0, 0.0]) + [0.0, 0.01, 0.0]       # 垂直方向偏一点不影响进度
+        qq = np.tile(gt.matrix_to_quat(R0), (5, 1))
+        np.testing.assert_allclose(gt.end_pose_progress(pp, qq, tinfo, FLANGE_T_CAM), [0, 0, 0.25, 1, 1], atol=1e-9)
+        rinfo = {"kind": "rotate", "start_flange": [*(P0 * 1000), *euler],
+                 "end_flange": [*(P0 * 1000), -156.0, -6.0, -108.0], "axis_base": [0.0, 0.0, 1.0]}   # 绕基坐标 z 转 60°
+        a = np.radians([-5.0, 0.0, 15.0, 60.0, 70.0])
+        qr = np.array([gt.matrix_to_quat(gt.euler_to_matrix(0, 0, np.degrees(x)) @ R0) for x in a])
+        np.testing.assert_allclose(gt.end_pose_progress(np.tile(P0, (5, 1)), qr, rinfo, FLANGE_T_CAM),
+                                   [0, 0, 0.25, 1, 1], atol=1e-9)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0))
+            write_motion_log(d, "record", "right", P0, P0 + [0.3, 0.0, 0.0])
+            log = json.loads((d / "motion_log.json").read_text())
+            log["parameters"] = {"PATH_SET": "fast2"}
+            (d / "motion_log.json").write_text(json.dumps(log))
+            with unittest.mock.patch.dict(gt.END_POSE_CORRECTION, {"fast2": {"right": delta}}):
+                on = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+                fixed = read_tum(d / "groundtruth_tum.txt")
+                off = gt.process(d, d / "handeye.json", d, time_correction_ms=0.0, end_correction=False)
+                plain = read_tum(d / "groundtruth_tum.txt")
+            self.assertEqual(on["end_pose_correction"]["source"], "END_POSE_CORRECTION")
+            self.assertEqual(off["end_pose_correction"]["source"], "disabled")
+            self.assertGreater(np.abs(fixed[:, 1:4] - plain[:, 1:4]).max(), 1e-4)
+            with unittest.mock.patch.dict(gt.END_POSE_CORRECTION, {"fast2": {}}):       # 表里没有这个方向：不修正
+                gt.process(d, d / "handeye.json", d, time_correction_ms=0.0)
+            np.testing.assert_array_equal(read_tum(d / "groundtruth_tum.txt"), plain)
 
     def test_warns_time_correction_at_other_exposure(self):
         with tempfile.TemporaryDirectory() as tmp:
