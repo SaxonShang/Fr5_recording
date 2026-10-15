@@ -307,7 +307,7 @@ class SyntheticSessionTest(unittest.TestCase):
             segs = [{"name": "goto_start", "flange": [*(P0 * 1000), 0, 0, 0]},
                     {"name": "translate", "flange": [*((P0 + 0.3 * axis) * 1000), 0, 0, 0]}]
             for group, factor, warned in ((None, gt.TRAVEL_SCALE["base"]["right"], False), ("base", gt.TRAVEL_SCALE["base"]["right"], False),
-                                          ("fast1", 1.0, True)):
+                                          ("fast1", 1.0, True), ("fast2", gt.TRAVEL_SCALE["fast2"]["right"], False)):
                 log = {"kind": "record", "direction": "right", "segments": segs}
                 if group:
                     log["parameters"] = {"PATH_SET": group}
@@ -398,6 +398,23 @@ class SyntheticSessionTest(unittest.TestCase):
             (d / "time_meta.txt").write_text("exposure_us=5000\n")
             report = gt.process(d, d / "handeye.json", d)
             self.assertTrue(any("时间修正" in w for w in report["warnings"]))
+            self.assertEqual(report["time_correction"]["applied_ms"], gt.TIME_CORRECTION_MS)
+
+    def test_time_correction_by_exposure(self):
+        """时间修正按曝光查表：10 ms 用低速测的值，2.5 ms 用高速测的值，都不报警；手动给的值优先。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_session(d, np.random.default_rng(0))
+            for exp_us in (10000, 2500):
+                (d / "time_meta.txt").write_text(f"exposure_us={exp_us}\n")
+                report = gt.process(d, d / "handeye.json", d)
+                tc = report["time_correction"]
+                self.assertEqual((tc["applied_ms"], tc["source"], tc["exposure_ms"]),
+                                 (gt.TIME_CORRECTION_MS_BY_EXPOSURE_US[exp_us], "TIME_CORRECTION_MS", exp_us / 1000))
+                self.assertFalse(any("时间修正" in w for w in report["warnings"]))
+            self.assertEqual(gt.TIME_CORRECTION_MS, gt.TIME_CORRECTION_MS_BY_EXPOSURE_US[10000])
+            report = gt.process(d, d / "handeye.json", d, time_correction_ms=1.5)
+            self.assertEqual((report["time_correction"]["applied_ms"], report["time_correction"]["source"]), (1.5, "manual"))
 
     def test_refuses_without_rotation(self):
         with tempfile.TemporaryDirectory() as tmp:
