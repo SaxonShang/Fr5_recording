@@ -147,6 +147,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -162,6 +163,12 @@ from zed_capture import ZedRecord, camera_users
 
 MB_PER_FRAME = 0.8    # zed_record 双目 JPEG 每帧约 0.8 MB
 HANGUP_LOG = Path(tempfile.gettempdir()) / "run_session_hangup.log"  # 有录制目录时改成目录里的 run_session.log
+
+
+# --cue（录有人走过的数据）：给画面外的人的提示音，freedesktop 的系统提示音（Box 自带）
+CUE_SOUND_DIR = "/usr/share/sounds/freedesktop/stereo"
+CUE_SOUNDS = {"ready": "message.oga", "go": "bell.oga", "leave": "complete.oga"}
+CUE_LOG = "~/ROBOT/cue_events.log"   # 每次提示追加一行，笔记本上的 cue_listener.py 跟踪它、用笔记本喇叭响（Box 显示器没喇叭）
 
 
 class HangUp(BaseException):
@@ -424,6 +431,47 @@ def build_recording(rpc, direction: str, marks: dict, start: dict, f_t_c: np.nda
               "wiggle_side": fit.wiggle_side,
               "joint_min": limits[0], "joint_max": limits[1], "warnings": path.warnings}
     return segs, note, record, fl.start_joints(direction, fit), []
+
+
+def cue(sound: str | None, text: str) -> None:
+    """给画面外的人的提示：终端大字和响铃，再用 paplay 放一声提示音（不等它放完，不耽误运动），
+    并往 CUE_LOG 追加一行（时间、提示音、文字），给笔记本上的 cue_listener.py 用。"""
+    print(f"\a\n{'=' * 28}\n>>> {text}\n{'=' * 28}", flush=True)
+    try:
+        with open(p(CUE_LOG), "a", encoding="utf-8") as f:
+            f.write(f"{time.time():.3f} {sound or '-'} {text}\n")
+    except OSError:
+        pass
+    if sound:
+        try:
+            subprocess.Popen(["paplay", str(Path(CUE_SOUND_DIR) / CUE_SOUNDS[sound])],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+
+def cue_plan(segs: list) -> dict:
+    """record --cue：录制里有人走过，每段开始时给什么提示（段名 → (提示音, 文字)）。人在运动前的静止段进画面、
+    运动中走过、运动后的静止段里走出画面；两段同步摆动时画面里不能有人（时间同步和晚一帧检查要用它们的画面）。"""
+    dur = {s.name: s.duration_s for s in segs}
+    move = next((s.name for s in segs if s.name in ("translate", "rotate")), None)
+    if move is None or "hold_before" not in dur or "hold_after" not in dur:
+        return {}
+    what = "平移" if move == "translate" else "旋转"
+    # 准备提示不写秒数：计划里同步摆动每段按 1.0 s 估，实测约 0.63 s（四段约 2.5 s）
+    return {"wiggle_start_1": ("ready", "准备：听到下一声就进画面（现在画面里不能有人）"),
+            "hold_before": ("go", f"走！进画面，{dur['hold_before']:.0f} s 后开始{what}"),
+            move: (None, f"{what}中（约 {dur[move]:.1f} s）"),
+            "hold_after": ("leave", f"离开：{dur['hold_after']:.0f} s 内走出画面"),
+            "wiggle_end_1": (None, "同步摆动：画面里不能有人")}
+
+
+def cmd_cue_test(args) -> int:
+    """不连机械臂、不开相机：三种提示各放一遍，确认现场听得到、看得到。"""
+    for sound, text in (("ready", "准备（测试）"), ("go", "走！（测试）"), ("leave", "离开（测试）")):
+        cue(sound, text)
+        time.sleep(2.5)
+    return 0
 
 
 def confirm_plan(text: str, assume_yes: bool) -> None:
@@ -781,11 +829,16 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found)
                                    + ("\n（goto_start 走不通时，先手动拖到这条录制的起点附近再试）"
                                       if any(m.startswith("goto_start") for m in found) else ""))
+        cues = cue_plan(segs) if getattr(args, "cue", False) else {}
+        if getattr(args, "cue", False) and not cues:
+            raise fm.MotionAborted("--cue 只用于平移、旋转录制，没有运动")
         header = (f"{name}：速度比例 {args.scale}，路径组 {PATH_SET}"
                   + (f"，{CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
                   + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%"
                   + (f"\n{path_note}" if path_note else "")
-                  + (f"\n{pose}" if pose else ""))
+                  + (f"\n{pose}" if pose else "")
+                  + ("\n有人走过（--cue）：运动前的静止段开始时提示进画面，运动结束时提示离开；"
+                     "两段同步摆动时画面里不能有人" if cues else ""))
         confirm_plan(header + "\n" + describe(segs, totals=zed is not None), args.yes)
         ran = True
         runner.run(segs[0])                      # 从当前位姿移到录制起点（相机还没开始录）
@@ -795,6 +848,8 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
             zed.wait_grabbing(30.0)
             for seg in segs[1:]:
                 print(f"[{seg.name}]", flush=True)
+                if seg.name in cues:
+                    cue(*cues[seg.name])
                 runner.run(seg)
                 if seg.kind == "move":
                     report_move(seg)
@@ -821,6 +876,7 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
     zed_error = zed_failure(zed.info if zed else None, data_dir)
     log = {
         "kind": kind, "direction": direction, "tag": args.tag, "speed_scale": args.scale,
+        "cue": bool(getattr(args, "cue", False)),       # 有人走过：hold_before 开始时提示进画面，hold_after 开始时提示离开
         "error": "；".join(e for e in (error, zed_error) if e) or None,
         "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG", "GLASS_REGIONS", "PATH_SET"]},
         "mark_path": mark_path,                  # 这条录制的拖动标记、定出的路径和收两端的结果（fr5_limits）
@@ -1083,6 +1139,9 @@ def main(argv=None) -> int:
     sub.add_parser("movec-test")
     record = sub.add_parser("record")
     record.add_argument("direction", choices=RECORD_NAMES)
+    record.add_argument("--cue", action="store_true",
+                        help="录有人走过的数据：运动前的静止段开始时提示进画面，运动结束时提示离开（声音 + 终端）")
+    sub.add_parser("cue-test")
     for sp in sub.choices.values():
         sp.add_argument("--scale", type=float, default=1.0, help="速度比例 (0, 1]，首次运行建议 0.25")
         sp.add_argument("--yes", action="store_true", help="跳过确认")
@@ -1100,6 +1159,8 @@ def main(argv=None) -> int:
         return cmd_mark(args)
     if args.command == "limits":
         return cmd_limits(args)
+    if args.command == "cue-test":
+        return cmd_cue_test(args)
     problems = parameter_problems()
     if args.command == "plan":
         return cmd_plan(args, problems)

@@ -125,7 +125,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `scripts/run_session.py` | 改：总控脚本，**所有可改参数都在文件开头**。子命令：`set-start`、`mark <方向>`、`limits`、`plan`、`goto-start`、`speed-test`、`sync-test`、`movec-test`、`record <方向>`；选项 `--scale`、`--yes`、`--tag` |
+| `scripts/run_session.py` | 改：总控脚本，**所有可改参数都在文件开头**。子命令：`set-start`、`mark <方向>`、`limits`、`plan`、`goto-start`、`speed-test`、`sync-test`、`movec-test`、`record <方向>`、`cue-test`；选项 `--scale`、`--yes`、`--tag`，`record` 另有 `--cue`（有人走过时的提示） |
 | `scripts/fr5_limits.py` | 新：拖动标记 → 录制路径（方向、姿态、转动中心，用控制器逆解收两端） |
 | `scripts/fr5_motion.py` | 改：运动规划与执行，加了关节速度检查和平移录制的右窗检查 |
 | `scripts/fr5_record.py` | 机械臂状态录制：独占 20004，每包记 Box 时间，停止时一次写盘 |
@@ -135,9 +135,10 @@
 | `scripts/end_pose_fit.py` | 新：由同一路径的标定板录制算端点位姿修正，并用运动段每帧检验（笔记本上运行） |
 | `scripts/handeye_poses.py`、`scripts/handeye_capture.py` | 新：围绕固定标定板选手眼标定的位姿（笔记本），在 Box 上空跑复核、自动移动并拍照，输出标定仓库格式的 session |
 | `scripts/zed_imu_extrinsic.py` | 新：读出 ZED 左目和机身 IMU 之间的出厂外参和 IMU 噪声参数（Box 上运行，写进各批数据的 `calib/camera_imu.yaml`） |
+| `scripts/cue_listener.py` | 新：在笔记本上放 `--cue` 的提示音（Box 的显示器没有喇叭时用；Windows，只用标准库） |
 | `scripts/frame_lag_check.py` | 检查图像内容和时间戳是否错位（笔记本上运行），有异常时退出码为 1 |
 | `scripts/camera_s003_refit.yaml` | ZED 校正后左目 HD1080 内参，用 s003 图像重标 |
-| `scripts/test_*.py` | 离线测试（合成数据、假逆解，不连机械臂），共 101 项；要 OpenCV 的只在笔记本上运行，要 FAIRINO SDK 的只在 Box 上运行，缺了自动跳过 |
+| `scripts/test_*.py` | 离线测试（合成数据、假逆解，不连机械臂），共 104 项；要 OpenCV 的只在笔记本上运行，要 FAIRINO SDK 的只在 Box 上运行，缺了自动跳过 |
 | `scripts/movel_probe.py` | 诊断：发零行程的 MoveL / MoveJ，看控制器拒绝哪种参数 |
 | `scripts/handeye_s003_result.json` | 手眼外参（标定仓库 `results/s003/result.json` 的副本） |
 | `scripts/start_pose.json` | 参考起点：只用来定右窗的方向和做 sync-test，录制不回这里 |
@@ -208,6 +209,7 @@
 - **每条录制的结构**：（移到起点，不录）→ 静止 5 s → 同步摆动 → 静止 3 s → 平移或旋转 → 静止 3 s → 同步摆动 → 静止 5 s，约 25 s、0.75 GB。结束后自动计算真值。
 - **录制失败**：zed_record 没有正常结束时，最后打印“录制失败”，退出码为 1，这条要重录。
 - `--tag board`：给录制目录名加后缀，用来区分验证录制和正式录制。
+- `--cue`：录有人走过的数据时用。运动前的静止段开始时提示人进画面，运动结束时提示离开（终端显示大字，Box 放提示音，同时写进 `~/ROBOT/cue_events.log`）；两段同步摆动时画面里不能有人。Box 的显示器没有喇叭时，在笔记本上先开着 `python -B scripts\cue_listener.py`（通过 SSH 跟踪这个文件，用笔记本喇叭响：准备一声、进画面三声高、离开两声低，可能晚零点几秒），再在 Box 上 `python3 run_session.py cue-test` 试一遍。
 
 ### 5.3 标定板真值验证
 
