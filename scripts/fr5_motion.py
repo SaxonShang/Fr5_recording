@@ -31,6 +31,7 @@ WORLD_UP = np.array([0.0, 0.0, 1.0])
 IMAGE_1080 = (1920, 1080, 736.23, 987.72, 555.14)   # 宽、高、f、cx、cy（s003 重标的校正后左目内参），判断玻璃是否入画用
 PATH_STEP_MM = 10.0          # 逆解检查的路径采样间隔
 PATH_STEP_DEG = 2.0
+REFINE_PARTS = 16            # 一步关节变化超过上限时，把这一步细分成这么多份重算（区分连续变化得快和真的换了逆解分支）
 ARRIVE_POS_MM = 0.5          # 判定到位的位置/姿态误差
 ARRIVE_ROT_DEG = 0.05
 MIN_PERCENT = 0.1            # MoveL 速度百分比的下限（0 会被控制器拒绝，错误码 172）
@@ -39,7 +40,9 @@ SPEED_WINDOW_S = 0.05        # 实时速度和巡航速度都按跨 50 ms 的差
 OVERSPEED_FACTOR = 1.5       # 实测线速度超过 预期 × 1.5 + 5 mm/s（角速度 + 2 °/s）就中止
 OVERSPEED_MARGIN_MM_S = 5.0
 OVERSPEED_MARGIN_DEG_S = 2.0
-MAX_PIVOT_DEV_MM = 2.0       # MoveC 旋转时光心偏离旋转中心超过这么多就中止（MoveL 转 30° 会鼓出约 4 mm）
+MAX_PIVOT_DEV_MM = 6.0       # MoveC 旋转时光心偏离旋转中心超过这么多就中止。用来发现圆弧没有绕光心转（当成直线走时
+                             # 30° 鼓出约 4 mm、54° 约 15 mm）。10-14 偏航演练：匀速段 ≤ 0.3 mm，起停瞬态随速度变大
+                             # （10 °/s 0.8、25 °/s 1.5 mm，50 °/s 估约 3 mm），原来的 2 mm 全速时会误停
 STALL_S = 5.0                # 没到位、又连续这么久没有移动，就中止
 STALL_MM, STALL_DEG = 0.05, 0.02
 STATE_LOST_S = 2.0           # 运动中超过这么久没有新的状态包（20004 断开），就中止
@@ -372,6 +375,25 @@ def _excess(q, joint_min, joint_max) -> np.ndarray:
     return np.maximum(np.maximum(np.asarray(joint_min) - q, q - np.asarray(joint_max)), 0.0)
 
 
+def _refine_step(rpc, seg: Segment, prev: np.ndarray, target: np.ndarray, u0: float, u1: float, ref, f_t_c,
+                 limit: float, parts: int = REFINE_PARTS) -> tuple[list | None, float]:
+    """u0 → u1 这一步关节变化超过 limit 时细分成 parts 份逐份逆解（从 ref 起推）：每份都不超过 limit，说明只是
+    连续地变化得快（例如手臂快伸直的地方），返回 (u1 处的关节角, 最大的一份)；仍有一份超过 limit，就是真的跳到了
+    另一组逆解（或逆解失败），返回 (None, 那一份)。"""
+    q_prev, worst = list(ref), 0.0
+    for i in range(1, parts + 1):
+        u = u0 + (u1 - u0) * i / parts
+        err, q = inverse_kin(rpc, path_flange(seg, prev, target, u, f_t_c), q_prev)
+        if q is None:
+            return None, math.inf
+        step = max(abs(a - b) for a, b in zip(q, q_prev))
+        worst = max(worst, step)
+        if step > limit:
+            return None, step
+        q_prev = q
+    return q_prev, worst
+
+
 def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current_joints, f_t_c,
                joint_min, joint_max, max_joint_step_deg: float, min_camera_z_m: float) -> list[str]:
     """沿实际路径（MoveL 直线 / MoveC 圆弧）采样，用控制器逆解检查：有解、关节在范围内、不跳支、相机不低于下限。
@@ -420,12 +442,18 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
                 break
             slack = np.minimum(slack, excess)
             step = max(abs(a - b) for a, b in zip(q, ref))
-            if step > max_joint_step_deg:
-                problems.append(f"{seg.name}: 路径 {u:.0%} 处关节一步变化 {step:.1f}°，可能跳到另一组逆解")
-                break
+            rate_step = step                                  # 换算关节速度用：每个采样间隔的关节变化
+            if step > max_joint_step_deg:                     # 先细分重算：连续变化得快就放行，真的跳了才算问题
+                q_fine, worst = _refine_step(rpc, seg, prev, target, (k - 1) / n, u, ref, f_t_c, max_joint_step_deg)
+                if q_fine is None:
+                    problems.append(f"{seg.name}: 路径 {u:.0%} 处关节一步变化 {step:.1f}°（细分后仍有一步 "
+                                    f"{worst:.1f}°），可能跳到另一组逆解")
+                    break
+                q = q_fine
+                rate_step = worst * REFINE_PARTS              # 细分后最快那一份换回整步，关节速度按它算（偏保守）
             if per_step > 1e-9:
-                seg.joint_rate = max(seg.joint_rate, step / per_step)
-                seg.joint_rates.append(((k - 0.5) / n, step / per_step))
+                seg.joint_rate = max(seg.joint_rate, rate_step / per_step)
+                seg.joint_rates.append(((k - 0.5) / n, rate_step / per_step))
             ref = q
             if seg.motion == "C" and 2 * k == n:
                 seg.via_joints = q

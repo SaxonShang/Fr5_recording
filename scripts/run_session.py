@@ -143,6 +143,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import shutil
 import signal
@@ -1112,5 +1113,14 @@ def main(argv=None) -> int:
     return cmd_motion(args, args.command, getattr(args, "direction", None))
 
 
+def main_synced(argv=None) -> int:
+    """main() 之后把文件系统缓冲写到盘上（os.sync）：10-14 俯仰演练录完约 1 分钟 Box 断电，最后写的 motion_log、
+    机械臂状态、真值、相机日志都成了空文件（图像早写完、还在）。录完马上落盘，断电也不丢。"""
+    try:
+        return main(argv)
+    finally:
+        os.sync()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_synced())

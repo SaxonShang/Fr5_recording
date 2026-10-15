@@ -1,5 +1,5 @@
 --- zed_record.cpp.bak-20261008	2026-09-21 14:41:25.964976074 +0800
-+++ zed_record.cpp	2026-10-14 09:44:51.756356651 +0800
++++ zed_record.cpp	2026-10-14 16:53:58.766325699 +0800
 @@ -31,8 +31,10 @@
  #include <fstream>
  #include <iomanip>
@@ -301,7 +301,29 @@
    std::thread csv_save_th(csv_save_thread_func, std::ref(zed_imu_q),
                            zed_imu_csv_path);
  
-@@ -845,9 +937,14 @@
+@@ -830,14 +922,18 @@
+   }
+   stop_event.store(true);
+ 
++  // 先等抓图线程退出（它每次 grab 之后检查 stop_event，最多一帧多一点），再关相机。
++  // 反过来的话，抓图线程还在 grab / retrieveImage / getSensorsDataBatch 里时 SDK 内部对象就被拆了：
++  // 10-14 全速演练两次 “pure virtual method called” 后 abort（SIGABRT，时间表缺结尾、没写 time_meta.txt），
++  // 其他几次是 CUDA illegal memory access、最后一帧只有左目
++  if (grab_th.joinable()) {
++    grab_th.join();
++  }
+   if (zed) {
+     zed->close();
+     log_line("ZED 已关闭。");
+   }
+ 
+-  if (grab_th.joinable()) {
+-    grab_th.join();
+-  }
+   ZedFrameItem leftover;
+   while (image_q.try_pop(leftover)) {
+     forward_frame_to_save(std::move(leftover), save_q, nullptr, forwarded);
+@@ -845,9 +941,14 @@
    save_q.stop();
    image_q.stop();
    zed_imu_q.stop();

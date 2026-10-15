@@ -922,14 +922,18 @@ int main(int argc, char** argv) {
   }
   stop_event.store(true);
 
+  // 先等抓图线程退出（它每次 grab 之后检查 stop_event，最多一帧多一点），再关相机。
+  // 反过来的话，抓图线程还在 grab / retrieveImage / getSensorsDataBatch 里时 SDK 内部对象就被拆了：
+  // 10-14 全速演练两次 “pure virtual method called” 后 abort（SIGABRT，时间表缺结尾、没写 time_meta.txt），
+  // 其他几次是 CUDA illegal memory access、最后一帧只有左目
+  if (grab_th.joinable()) {
+    grab_th.join();
+  }
   if (zed) {
     zed->close();
     log_line("ZED 已关闭。");
   }
 
-  if (grab_th.joinable()) {
-    grab_th.join();
-  }
   ZedFrameItem leftover;
   while (image_q.try_pop(leftover)) {
     forward_frame_to_save(std::move(leftover), save_q, nullptr, forwarded);

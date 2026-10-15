@@ -288,6 +288,35 @@ class PlanTest(unittest.TestCase):
         problems = fm.check_plan(FakeIK(), rot_only, flange0, [0.0] * 6, F_T_C, *wide, 100.0, 0.0)
         self.assertTrue(any("MoveC 的起点" in m for m in problems), problems)
 
+    def test_check_plan_steep_but_continuous(self):
+        """一段关节变化得快但连续（每 10 mm 变 8°）：细分后每份都很小，不算跳支，关节速度按快的算；
+        真的跳了（某处突然 +40°）：细分后仍然跳，报问题。"""
+        centre = fm.level_camera(NOW)
+        end = centre.copy()
+        end[:3, 3] += centre[:3, 0] * 0.1                         # 往右 100 mm
+        seg = fm._move("translate", end, F_T_C, 50.0)
+        p0 = (centre @ np.linalg.inv(F_T_C))[:3, 3] * 1000.0
+
+        class Steep:
+            def __init__(self, jump=False):
+                self.jump = jump
+
+            def GetInverseKinRef(self, typ, pose, ref):
+                s = float(np.linalg.norm(np.asarray(pose[:3]) - p0))   # 法兰离起点多少 mm（直线平移，单调）
+                q = [0.0, 0.0, -60.0 + 0.8 * abs(s), -90.0, -45.0, 0.0]
+                if self.jump and abs(s) > 50.0:
+                    q[3] += 40.0
+                return 0, q
+        flange0 = centre @ np.linalg.inv(F_T_C)
+        ok = fm.check_plan(Steep(), [seg], flange0, [0.0, 0.0, -60.0, -90.0, -45.0, 0.0], F_T_C,
+                           [-1e4] * 6, [1e4] * 6, 5.0, 0.0)
+        self.assertEqual(ok, [])
+        self.assertAlmostEqual(seg.joint_rate, 0.8, delta=0.05)  # 每 mm 0.8°
+        seg2 = fm._move("translate", end, F_T_C, 50.0)
+        bad = fm.check_plan(Steep(jump=True), [seg2], flange0, [0.0, 0.0, -60.0, -90.0, -45.0, 0.0], F_T_C,
+                            [-1e4] * 6, [1e4] * 6, 5.0, 0.0)
+        self.assertTrue(any("细分后仍有一步" in m for m in bad), bad)
+
     def test_check_plan_returns_from_outside_range(self):
         """当前就在范围外：移到起点可以往回走（越界只减不增），终点和录制段必须在范围内。"""
         class FakeIK:
@@ -649,7 +678,7 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("arrived_box_ns", rot.log)
 
     def test_movec_off_pivot_aborts(self):
-        start6, rot = self._rotation("pitch_down", deg=30.0)     # 当成直线走时光心鼓出约 4 mm
+        start6, rot = self._rotation("pitch_down", deg=60.0)     # 当成直线走时光心鼓出约 16 mm
         arm = _FakeArm(start6, mm_s_per_pct=1.0, deg_s_per_pct=0.5, movec_as_line=True)   # 控制器把它当直线走
         with self.assertRaisesRegex(fm.MotionAborted, "光心偏离"):
             fm.MotionRunner(arm, arm, accel_percent=100).run(rot)
@@ -670,7 +699,7 @@ class RunnerTest(unittest.TestCase):
         self.assertIsNotNone(rot.log["movec"]["returned_box_ns"])
 
     def test_blocking_movec_off_pivot_aborts(self):
-        start6, rot = self._rotation("pitch_down", deg=30.0)
+        start6, rot = self._rotation("pitch_down", deg=60.0)
         arm = _FakeArm(start6, mm_s_per_pct=1.0, deg_s_per_pct=0.5, movec_as_line=True, movec_blocks=True)
         try:
             with self.assertRaisesRegex(fm.MotionAborted, "光心偏离"):
