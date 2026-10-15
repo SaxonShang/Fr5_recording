@@ -133,9 +133,11 @@
 | `scripts/fr5_groundtruth.py` | 改：离线真值；时间修正按曝光、行程和转角系数按路径组查表 |
 | `scripts/gt_board_check.py` | 标定板真值验证（笔记本上运行） |
 | `scripts/end_pose_fit.py` | 新：由同一路径的标定板录制算端点位姿修正，并用运动段每帧检验（笔记本上运行） |
+| `scripts/handeye_poses.py`、`scripts/handeye_capture.py` | 新：围绕固定标定板选手眼标定的位姿（笔记本），在 Box 上空跑复核、自动移动并拍照，输出标定仓库格式的 session |
+| `scripts/zed_imu_extrinsic.py` | 新：读出 ZED 左目和机身 IMU 之间的出厂外参和 IMU 噪声参数（Box 上运行，写进各批数据的 `calib/camera_imu.yaml`） |
 | `scripts/frame_lag_check.py` | 检查图像内容和时间戳是否错位（笔记本上运行），有异常时退出码为 1 |
 | `scripts/camera_s003_refit.yaml` | ZED 校正后左目 HD1080 内参，用 s003 图像重标 |
-| `scripts/test_*.py` | 离线测试（合成数据、假逆解，不连机械臂），共 94 项；要 OpenCV 的只在笔记本上运行，要 FAIRINO SDK 的只在 Box 上运行，缺了自动跳过 |
+| `scripts/test_*.py` | 离线测试（合成数据、假逆解，不连机械臂），共 101 项；要 OpenCV 的只在笔记本上运行，要 FAIRINO SDK 的只在 Box 上运行，缺了自动跳过 |
 | `scripts/movel_probe.py` | 诊断：发零行程的 MoveL / MoveJ，看控制器拒绝哪种参数 |
 | `scripts/handeye_s003_result.json` | 手眼外参（标定仓库 `results/s003/result.json` 的副本） |
 | `scripts/start_pose.json` | 参考起点：只用来定右窗的方向和做 sync-test，录制不回这里 |
@@ -256,7 +258,7 @@
 
 笔记本上的副本放在 `data/` 下（不进 git）：
 
-- 正式录制：`data/recordings_highspeed/`（6 条，含左右目，约 4.5 GB）；
+- 正式录制：`data/recordings_highspeed/`（6 条，含左右目，约 4.5 GB），附给数据使用者的 `使用说明.md` 和标定文件 `calib/`；
 - 标定板验证录制：`data/board_check/<录制名>/`（只有左目）。
 
 真值可以单独重算：
