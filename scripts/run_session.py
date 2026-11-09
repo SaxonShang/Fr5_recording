@@ -37,10 +37,10 @@ GLASS_REGIONS = [
     (-87.0, -60.3, -8.0, 11.0),
     (-180.0, -87.0, -90.0, 90.0),
 ]
-# 底座搬动后的右窗，只用于 holdout1。None = 还没量，plan 和 record 报问题；regions 为空 = 新位置看不到窗或已遮住。
-# 格式 {"viewpoint_mm": (x, y, z), "regions": [(方位角起, 方位角止, 仰角下, 仰角上), ...], "distance_m": 玻璃最近距离}：
+# holdout1 的玻璃窗检查。2026-11-09 用户定这批录制不考虑玻璃，regions 为空表示不检查；None = 没定过，plan 和 record 报问题。
+# 要检查时的格式 {"viewpoint_mm": (x, y, z), "regions": [(方位角起, 方位角止, 仰角下, 仰角上), ...], "distance_m": 玻璃最近距离}：
 # 从基坐标系的 viewpoint_mm 水平看，方位角零点是基坐标 +X，向左为正，仰角向上为正，单位 °
-HOLDOUT_WINDOW = None
+HOLDOUT_WINDOW = {"viewpoint_mm": (0.0, 0.0, 0.0), "regions": [], "distance_m": 7.0}
 GLASS_MARGIN_DEG = 1.0       # 画面离玻璃至少这么多 °（画面左右边缘 1° 约 35 px）
 WINDOW_DISTANCE_M = 7.0      # 玻璃离参考起点光心的最近距离 m（窗底仰角 −6.5°、相机离地至少约 0.8 m 估的下限）；光心移动时按它算视差
 CAMERA_FPS = 30              # 相机帧率（15 / 30 / 60，传给 zed_record）
@@ -448,7 +448,7 @@ def window_note(segs: list[fm.Segment], f_t_c: np.ndarray) -> tuple[str, list[st
 
 def waypoint_note(spec: hp.WaypointPath, side: int, segs: list[fm.Segment], f_t_c: np.ndarray, window: str) -> str:
     """路径说明：姿态范围、离奇异多远、关节最快、超出开发录制走过范围的关节、摆动方向和标定板放哪。"""
-    level = fm.level_facing_x(np.asarray(spec.reference_mm, dtype=float) / 1000.0)
+    level = fm.waypoint_pose(np.asarray(spec.reference_mm, dtype=float) / 1000.0, hp.Pose(), spec.frame_yaw_deg)
     span = fm.pose_span(segs, level, f_t_c)
     angles = "，".join(f"{label} {span[key][0]:+.1f}～{span[key][1]:+.1f}°"
                       for key, label in (("heading", "朝向"), ("pitch", "俯仰"), ("roll", "横滚")))
@@ -458,7 +458,8 @@ def waypoint_note(spec: hp.WaypointPath, side: int, segs: list[fm.Segment], f_t_
     fastest = max((s.log.get("max_joint_speed_deg_s") or 0.0) for s in segs if s.kind == "move" and s.recorded)
     legs = [s for s in segs if s.name.startswith("leg_")]
     lines = [spec.description,
-             f"参考位置 {tuple(spec.reference_mm)} mm，{len(legs)} 段，同步摆动 {side:+d}；{angles}（零点是水平朝基坐标 +X）",
+             f"参考位置（基坐标系）{np.round(level[:3, 3] * 1000.0, 1).tolist()} mm，{len(legs)} 段，同步摆动 {side:+d}；"
+             f"{angles}（零点是水平朝路径前方，基坐标朝向 {spec.frame_yaw_deg:+.1f}°）",
              f"离奇异 |J3| ≥ {min_abs[2]:.1f}°、|J5| ≥ {min_abs[4]:.1f}°；关节最快 {fastest:.0f} °/s；{window}"]
     beyond = [f"J{j + 1} {lo[j]:.0f}～{hi[j]:.0f}"
               for j in range(6) if lo[j] < DEV_JOINT_MIN_DEG[j] or hi[j] > DEV_JOINT_MAX_DEG[j]]
@@ -473,11 +474,12 @@ def build_waypoint_recording(rpc, name: str, f_t_c: np.ndarray, model, limits):
     """路径表里的路径 name 的全部段。同步摆动往哪边由这里选（+1 优先），和机械臂当前位姿无关。不自动收缩：不通过就报问题，人工改路径表。
     返回 (段或 None, 路径说明, 写进 motion_log 的路径记录, 起点关节角, 问题列表)。"""
     spec = hp.PATHS[name]
-    start_flange = fm.waypoint_pose(np.asarray(spec.reference_mm, dtype=float) / 1000.0, spec.start) @ np.linalg.inv(f_t_c)
-    err, start_q = fm.inverse_kin(rpc, start_flange, spec.seed_joints)
+    start_flange = (fm.waypoint_pose(np.asarray(spec.reference_mm, dtype=float) / 1000.0, spec.start, spec.frame_yaw_deg)
+                    @ np.linalg.inv(f_t_c))
+    err, start_q = fm.inverse_kin(rpc, start_flange, spec.seed_in_base)
     if start_q is None:
         return None, spec.description, None, None, [f"起点控制器逆解失败（错误码 {err}）"]
-    if fl.config_of(start_q) != fl.config_of(spec.seed_joints):
+    if fl.config_of(start_q) != fl.config_of(spec.seed_in_base):
         return None, spec.description, None, None, [f"起点逆解的构型不对：{np.round(start_q, 1).tolist()}"]
     tried = []
     for side in (+1, -1):
@@ -489,7 +491,8 @@ def build_waypoint_recording(rpc, name: str, f_t_c: np.ndarray, model, limits):
         found += glass
         if not found:
             record = {"path": name, "path_set": hp.PATH_SET, "description": spec.description,
-                      "reference_mm": list(spec.reference_mm), "seed_joints": list(spec.seed_joints), "start_joints": start_q,
+                      "reference_mm": list(spec.reference_mm), "frame_yaw_deg": spec.frame_yaw_deg,
+                      "seed_joints": list(spec.seed_in_base), "start_joints": start_q,
                       "wiggle_side": side, "wiggle_axis": spec.wiggle_axis, "correction_key": spec.correction_key,
                       "labels": spec.labels, "window": HOLDOUT_WINDOW, "joint_min": limits[0], "joint_max": limits[1]}
             return segs, waypoint_note(spec, side, segs, f_t_c, window), record, start_q, []

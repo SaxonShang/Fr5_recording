@@ -272,12 +272,17 @@ def level_facing_x(centre_m) -> np.ndarray:
     return out
 
 
-def waypoint_pose(reference_m, pose) -> np.ndarray:
-    """路径点的相机位姿。reference_m：本条参考位置；pose：holdout1_paths.Pose（依次俯仰、横滚、朝向）。"""
+def waypoint_pose(reference_m, pose, frame_yaw_deg: float = 0.0) -> np.ndarray:
+    """路径点的相机位姿（基坐标系）。reference_m：本条参考位置；pose：holdout1_paths.Pose（依次俯仰、横滚、朝向），
+    都在路径坐标系里；frame_yaw_deg：路径坐标系相对基坐标系绕 z 转的角度。"""
     c = level_facing_x(np.asarray(reference_m, dtype=float) + np.array([pose.x, pose.y, pose.z]) / 1000.0)
     c = rotate_about(c, c[:3, 0], pose.pitch)
     c = rotate_about(c, c[:3, 2], pose.roll)
-    return yaw_about_vertical(c, pose.heading)
+    c = yaw_about_vertical(c, pose.heading)
+    rz = axis_angle(WORLD_UP, frame_yaw_deg)
+    out = np.eye(4)
+    out[:3, :3], out[:3, 3] = rz @ c[:3, :3], rz @ c[:3, 3]
+    return out
 
 
 def relative_rotation(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, float]:
@@ -291,7 +296,8 @@ def plan_waypoints(spec, f_t_c: np.ndarray, cfg: MotionConfig, side: int) -> lis
     """多段路径（spec：holdout1_paths.WaypointPath）：移到起点（不录）→ 静止 → 同步摆动 → 静止 → leg_1、wp_1、…、leg_N → 静止
     → 同步摆动 → 静止。side：同步摆动往哪边（+1 / -1）。到位后停住，段与段之间不过渡（blendR=0）。"""
     reference = np.asarray(spec.reference_mm, dtype=float) / 1000.0
-    poses = [waypoint_pose(reference, spec.start)] + [waypoint_pose(reference, leg.target) for leg in spec.legs]
+    yaw = spec.frame_yaw_deg
+    poses = [waypoint_pose(reference, spec.start, yaw)] + [waypoint_pose(reference, leg.target, yaw) for leg in spec.legs]
     axis_of = (lambda camera: camera[:3, 2].copy()) if spec.wiggle_axis == "optical" else (lambda camera: None)
     body = []
     for k, leg in enumerate(spec.legs, 1):

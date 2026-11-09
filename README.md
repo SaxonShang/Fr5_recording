@@ -40,6 +40,8 @@
 | `s_path_A`、`s_path_B`、`s_path_C` | `s_path`（`--tag sceneA/B/C`） | A / B / C |
 | `eight` | `eight`（仅完整版） | A |
 
+路径表的数值来自 13.11，整体绕基座 z 轴转 176°，朝向机械臂 2026-11-09 停放时的方向（相机朝向基坐标 175.5°）。这批录制不考虑玻璃。
+
 场景 A 是实验室的近远层次场景；B 是约 3 m × 2 m 的非重复高纹理硬板，距 S 点光心约 1.0 m；C 位置和尺寸同 B，换成周期约 3 cm 的二维重复图案。
 
 ## 2. 硬件、网络与软件版本
@@ -49,7 +51,7 @@
 | 机械臂 | FAIRINO FR5，型号 `FR5-V1-002(V6.0)`；WebApp `v3.9.1`；控制器软件 `V3.9.5-QX`；WebApp 自动模式速度百分比 60%。底座在 2026-10-16 之后搬到了实验室的另一位置 |
 | 相机 | ZED X（S/N 49953548），ZED SDK 5.1.2，HD1080，30 fps，全局快门；手动曝光 2.5 ms，模拟增益 13 dB；录校正后的左右目 JPEG，关闭自标定 |
 | 相机录制程序 | `zed_record`（本仓库的补丁）：可设曝光、增益和帧率，3 个线程并行存图 |
-| 手眼外参 | `handeye_s003_result.json`，法兰到左目，sha256 以 `a8212d48` 开头；相机没有拆过，由开工核对确认仍然有效 |
+| 手眼外参 | `handeye_s003_result.json`，法兰到左目，sha256 以 `a8212d48` 开头；相机没有拆过，由带板验收确认仍然有效 |
 | 计算单元 | ZED Box Mini（Jetson，L4T R36.4.4，Ubuntu 22.04，Python 3.10），自带显示器和鼠标 |
 | 网络 | Box 有线 `192.168.58.11/24` 直连 FR5 控制器 `192.168.58.2`；Box WiFi `10.255.250.132`（DHCP，可能会变），笔记本通过它 SSH |
 | 控制器端口 | 20003 XML-RPC 指令；20004 实时状态推送（同一时间只服务一个连接）；80 / 9999 WebApp |
@@ -88,7 +90,7 @@ MoveL 和组合段的 s 取法兰在弦上的投影，MoveC 取绕转轴转过�
 - **同步摆动**：10°、20 °/s、来回 2 次，只往一侧摆。绕相机竖直轴，横滚绕光轴。哪一侧由 `plan` 选。
 - **段**：每段是一条 MoveL 或 MoveC，`blendR=0`，到位后停住，最短停 1 s。
 - **组合段速度**：同时平移和转动的段，用时 `T = max(L/v, θ/ω)`，ω = 50 °/s，速度百分比 `p = max(L/(5.96·T), θ/(2.152·T))`。L 是法兰行程（mm），θ 是转角（°）。短段不追目标线速度。
-- **路径检查**：`plan` 用控制器逆解沿路径采样，只报通过或不通过：有解、关节在范围内、关节速度 ≤ 150 °/s、离奇异 ≥ 5°、构型不变、不拍右窗。多段路径不自动收缩，不通过就人工改路径表。
+- **路径检查**：`plan` 用控制器逆解沿路径采样，只报通过或不通过：有解、关节在范围内、关节速度 ≤ 150 °/s、离奇异 ≥ 5°、构型不变。多段路径不自动收缩，不通过就人工改路径表。
 - **运动中保护**：超速（组合段线速度 1.5 倍 + 5 mm/s，角速度 2 倍 + 2 °/s）、MoveC 光心偏离、状态中断、停顿时发 StopMotion；Ctrl+C 或 SSH 断开时先停机械臂再停相机。
 
 ### 3.5 精度
@@ -119,10 +121,10 @@ MoveL 和组合段的 s 取法兰在弦上的投影，MoveC 取绕转轴转过�
 
 | 文件 | 说明 |
 |---|---|
-| `scripts/holdout1_paths.py` | 路径表：参考位置、路径点、段的速度和停留。**改路径只改这里** |
+| `scripts/holdout1_paths.py` | 路径表：录制方向、参考位置、路径点、段的速度和停留。**改路径只改这里** |
 | `scripts/run_session.py` | 总控，其他可改参数都在文件开头。子命令 `plan`、`speed-test`、`record`、`warmup`；选项 `--scale`、`--yes`、`--tag` |
 | `scripts/fr5_motion.py` | 运动规划、逆解检查、速度换算和逐段执行 |
-| `scripts/fr5_limits.py` | 开工核对用：由拖动标记定 `right`、`roll_right` 的路径 |
+| `scripts/fr5_limits.py` | 由拖动标记定 `speed-test` 的上下路径和 `right`、`roll_right`（这批录制不用后两条） |
 | `scripts/fr5_record.py`、`scripts/zed_capture.py` | 机械臂状态录制（独占 20004）、`zed_record` 子进程管理 |
 | `scripts/fr5_groundtruth.py` | 离线真值，包括路径点修正 |
 | `scripts/end_pose_fit.py` | 由带板录像拟合路径点修正，留一检验，`--write` 写修正表（笔记本） |
@@ -135,7 +137,7 @@ MoveL 和组合段的 s 取法兰在弦上的投影，MoveC 取绕转轴转过�
 | `scripts/fr5_kin.py` | FR5 解析运动学，只用于离线测试 |
 | `scripts/test_*.py` | 离线测试（不连机械臂）；要 OpenCV 的只在笔记本运行，要 FAIRINO SDK 的只在 Box 运行，缺了自动跳过 |
 | `scripts/handeye_s003_result.json`、`camera_s003_refit.yaml`、`camera_imu.yaml` | 手眼外参、校正后左目 HD1080 内参、左目–IMU 外参 |
-| `scripts/start_pose.json` | 开工核对路径用的参考起点 |
+| `scripts/start_pose.json` | `fr5_limits.py` 用的参考起点 |
 | `scripts/waypoint_corrections.json` | 路径点修正表，`end_pose_fit.py --write` 生成 |
 | `zed_record/` | Box 上 `zed_record.cpp` 的当前版本和补丁 |
 | `deploy_to_box.ps1`、`sync_from_box.ps1` | 把脚本部署到 Box 的 `~/ROBOT/fr5_verify`；把现场改过的脚本拉回来 |
@@ -145,23 +147,25 @@ MoveL 和组合段的 s 取法兰在弦上的投影，MoveC 取绕转轴转过�
 
 | 参数 | 值 | 说明 |
 |---|---|---|
-| `HOLDOUT_WINDOW` | `None` | 底座搬动后的右窗。`None` 时 `plan` 和 `record` 拒绝 holdout1 路径；看不到窗或已遮住时 `regions` 写空表 |
+| `HOLDOUT_WINDOW` | `regions` 为空 | 玻璃窗检查，这批录制不考虑玻璃 |
 | `CAMERA_FPS`、`EXPOSURE_US`、`ANALOG_GAIN_MDB` | 30、2500、13000 | 相机设置 |
 | `WIGGLE_DEG`、`WIGGLE_DEG_S`、`WIGGLE_CYCLES` | 10、20、2 | 同步摆动 |
 | `HOLD_START_S`、`HOLD_MID_S`、`HOLD_END_S` | 5、3、5 | 首尾和中间的静止 |
 | `WEBAPP_SPEED_PCT` | 60 | WebApp 速度百分比，改了要重跑 `speed-test` |
 | `SINGULAR_MARGIN_DEG`、`MAX_JOINT_SPEED_DEG_S` | 5、150 | 离奇异位形、关节速度的限制 |
 | `DEV_JOINT_MIN_DEG`、`DEV_JOINT_MAX_DEG` | 见文件 | 开发录制走过的关节范围，超出时只提示 |
-| `PATH_SET`、`SPEED_MPS`、`ROT_DEG_S`、`GLASS_REGIONS`、`LIMIT_*` | fast2 的值 | 开工核对两条的路径参数，不要改 |
+| `PATH_SET`、`SPEED_MPS`、`ROT_DEG_S`、`GLASS_REGIONS`、`LIMIT_*` | fast2 的值 | `fr5_limits.py` 路径的参数，不要改 |
+
+录制方向 `FRAME_YAW_DEG` 在 `holdout1_paths.py`，值是 176°。
 
 ## 5. 使用流程
 
 每一步的完整命令和通过标准在 [实验记录.md 的“运行手册”](实验记录.md#运行手册)。
 
 1. **部署**：`deploy_to_box.ps1` 把脚本放到 Box 的 `~/ROBOT/fr5_verify`，录制数据写在 `~/ROBOT/sessions_verify`。
-2. **开工核对**：确认时钟、原有路径、周边和线缆、手眼外参、重力方向、到位稳定时间和相机连续录制。手眼核对把标定板放在基坐标 (1.65, −0.02, 0.56) m，朝 −X。
-3. **新路径准备**：量右窗，`plan` 空跑，0.2、0.5、1.0 倍速演练，试录场景 B、C。
-4. **带板核验**：每种轨迹录 2 条，第一条拟合修正，第二条验收。
+2. **开工核对**：确认时钟、速度标定和相机连续录制；重力方向和到位稳定时间用第一组带板录制检查。
+3. **新路径准备**：`plan` 空跑，0.2、0.5、1.0 倍速演练（同时确认周边和线缆），试录场景 B、C。
+4. **带板核验**：每种轨迹录 2 条，第一条拟合修正，第二条验收，手眼外参也由这一步确认。
 5. **正式录制**：移走标定板，按路径录。S 形按轮次录，轮内场景顺序依次为 ABC、BCA、CAB。
 6. **录完检查和交付**：每条都查整帧错位，生成 `conditions.yaml`。
 

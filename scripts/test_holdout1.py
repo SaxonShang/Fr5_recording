@@ -7,6 +7,7 @@
 import argparse
 import contextlib
 import csv
+import dataclasses
 import io
 import json
 import math
@@ -52,8 +53,8 @@ def import_run_session():
 
 def start_of(spec) -> tuple[np.ndarray, list]:
     """(起点法兰位姿, 起点关节角)。"""
-    flange = fm.waypoint_pose(np.array(spec.reference_mm) / 1000.0, spec.start) @ np.linalg.inv(F_T_C)
-    return flange, fm.inverse_kin(fr5_kin.OfflineRPC(), flange, spec.seed_joints)[1]
+    flange = fm.waypoint_pose(np.array(spec.reference_mm) / 1000.0, spec.start, spec.frame_yaw_deg) @ np.linalg.inv(F_T_C)
+    return flange, fm.inverse_kin(fr5_kin.OfflineRPC(), flange, spec.seed_in_base)[1]
 
 
 class PathTableTest(unittest.TestCase):
@@ -82,6 +83,10 @@ class PathTableTest(unittest.TestCase):
         top = -fm.waypoint_pose(ref, hp.Pose(roll=30.0))[:3, 1]                      # 画面顶部方向
         self.assertLess(top[1], 0.0)                                                 # 横滚为正：顶部向右（−y）
         np.testing.assert_allclose(fm.waypoint_pose(ref, hp.Pose(x=100.0, z=-50.0))[:3, 3], ref + [0.1, 0, -0.05], atol=1e-12)
+        turned = fm.waypoint_pose(ref, hp.Pose(), 90.0)                               # 路径坐标系转 90°：前方变成基坐标 +y
+        np.testing.assert_allclose(turned[:3, 2], [0, 1, 0], atol=1e-12)
+        np.testing.assert_allclose(turned[:3, 3], [0.0, 0.6, 0.5], atol=1e-12)
+        np.testing.assert_allclose(turned[:3, 1], [0, 0, -1], atol=1e-12)             # 仍然水平
 
     def test_s_and_eight_tables(self):
         s = hp.PATHS["s_path"]
@@ -137,6 +142,23 @@ class WaypointPlanTest(unittest.TestCase):
             for s in segs:
                 if s.kind == "move" and s.recorded:
                     self.assertGreaterEqual(min(s.log["joint_range"]["min_abs"][2], s.log["joint_range"]["min_abs"][4]), 5.0, (name, s.name))
+
+    def test_frame_yaw_only_shifts_j1(self):
+        """整张表绕基座 z 转时，只有 J1 变，其余关节、预计速度都和转之前一样。"""
+        rpc = fr5_kin.OfflineRPC()
+        for name in ("s_path", "roll_bidir"):
+            turned = hp.PATHS[name]
+            plain = dataclasses.replace(turned, frame_yaw_deg=0.0)
+            results = []
+            for spec in (turned, plain):
+                flange, q = start_of(spec)
+                segs = fm.plan_waypoints(spec, F_T_C, CFG, +1)
+                self.assertEqual(fm.check_plan(rpc, segs, flange, q, F_T_C, *LIMITS, 5.0, 0.18, 5.0) + fm.apply_speed(segs, MODEL, 1.0), [], name)
+                results.append([s for s in segs if s.kind == "move" and s.recorded])
+            for a, b in zip(*results):
+                np.testing.assert_allclose(a.joints[1:], b.joints[1:], atol=1e-6, err_msg=f"{name} {a.name}")
+                self.assertAlmostEqual((a.joints[0] - b.joints[0] - turned.frame_yaw_deg + 180.0) % 360.0, 180.0, places=6)
+                self.assertAlmostEqual(a.percent, b.percent, places=6)
 
     def test_singular_and_config_problems(self):
         c = fm.level_facing_x([0.6, -0.3, 0.5])

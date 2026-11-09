@@ -2,10 +2,10 @@
 
 改路径只改这个文件。plan 不通过时人工改这里，不自动收缩；改过之后要重新录带板验收（同一路径的所有录像用同一组值）。
 
-坐标约定（和 run_session.py 一致）：
-  位移 x、y、z 是相对本条参考位置（reference_mm，左目光心在 FR5 基坐标系下的 mm）的 mm，基坐标系：x 前、y 左、z 上。
-  朝向零点是基坐标 +X，向左为正；俯仰向上为正；横滚以画面顶部向右为正。
-  姿态由水平朝 +X 的相机依次得到：俯仰（绕相机 x）、横滚（绕光轴）、朝向（绕竖直轴）。
+坐标约定：表里的参考位置（reference_mm）、位移 x、y、z（mm）和朝向都在路径坐标系里（x 前、y 左、z 上），
+  路径坐标系由 FR5 基坐标系绕 z 轴转 FRAME_YAW_DEG 得到。表的数值是 13.11 的，只有录制方向由 FRAME_YAW_DEG 决定。
+  朝向零点是路径前方，向左为正；俯仰向上为正；横滚以画面顶部向右为正。
+  姿态由水平朝路径前方的相机依次得到：俯仰（绕相机 x）、横滚（绕光轴）、朝向（绕竖直轴）。
 
 一条路径 = 起点 + 若干段。每段是一条 MoveL 或 MoveC，blendR=0，到位后停住（段名 leg_k，停留段名 wp_k，最后一段后面接 hold_after）。
 """
@@ -15,6 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 PATH_SET = "holdout1"
+# 录制方向：路径坐标系相对基坐标系绕 z 转的角度 °。底座搬动后，2026-11-09 定以机械臂当时的朝向为前方（相机朝向基坐标 175.5°），
+# 不再去开发录制的区域。整张表绕基座 z 转时，各关节的运动只有 J1 平移这个角度，其余关节、离奇异和关节速度都不变。
+FRAME_YAW_DEG = 176.0
 STOP_S = 1.0                  # 路径点最短停留：真值修正取停留段中间一半的 15 帧
 
 
@@ -43,7 +46,7 @@ class Leg:
 class WaypointPath:
     description: str
     reference_mm: tuple
-    seed_joints: tuple        # 定构型用的关节角（J3 > 0、J5 < 0），plan 由它求起点逆解
+    seed_joints: tuple        # 定构型用的关节角（J3 > 0、J5 < 0），路径坐标系和基坐标系重合时的值；实际用 seed_in_base
     legs: tuple
     start: Pose = Pose()
     start_label: str = "start"
@@ -52,6 +55,12 @@ class WaypointPath:
     hold_before_s: float = 3.0
     hold_after_s: float = 3.0
     board: str = ""           # 带板录制时标定板放哪里（plan 打印）
+    frame_yaw_deg: float = FRAME_YAW_DEG
+
+    @property
+    def seed_in_base(self) -> tuple:
+        """当前录制方向下的种子关节角：绕基座转 yaw 只改 J1。"""
+        return ((self.seed_joints[0] + self.frame_yaw_deg + 180.0) % 360.0 - 180.0, *self.seed_joints[1:])
 
     @property
     def labels(self) -> list[str]:
@@ -95,7 +104,7 @@ def _trans_block(prefix: str, pitch: float) -> tuple:
 _TO_TILT = Leg(Pose(pitch=TRANS_TILT_DEG), "tilt_home", "C", rate_deg_s=ROLL_DEG_S, hold_s=TRANS_STOP_S)
 _TO_LEVEL = Leg(Pose(), "level_home", "C", rate_deg_s=ROLL_DEG_S, hold_s=TRANS_STOP_S)
 _TRANS_COMMON = dict(reference_mm=TRANS_REF, seed_joints=TRANS_SEED, correction_key="trans_two_attitude",
-                     board="板中心约 z = 975 mm（比路径中点高约 0.25 m，要支架），水平距离 1.3–1.5 m，正对 +X")
+                     board="板中心约 z = 975 mm（比路径中点高约 0.25 m，要支架），水平距离 1.3–1.5 m，正对路径前方")
 TRANS_LEVEL_FIRST = WaypointPath(
     description="两种姿态的平移，水平先走：水平 4 段 → 俯仰 +25° → 同样 4 段 → 转回水平",
     legs=_trans_block("level", 0.0) + (_TO_TILT,) + _trans_block("tilt", TRANS_TILT_DEG) + (_TO_LEVEL,), **_TRANS_COMMON)
@@ -144,7 +153,7 @@ EIGHT = WaypointPath(
     reference_mm=EIGHT_REF, seed_joints=EIGHT_SEED, correction_key="eight",
     legs=tuple(Leg(_q(n), f"{i:02d}_{n}", speed_mm_s=EIGHT_MM_S, max_rate_deg_s=LEG_MAX_DEG_S)
                for i, n in enumerate(_Q_LOOP * _EIGHT_LOOPS, 1)),
-    board="正对 +X，距起点约 1.2 m")
+    board="正对路径前方，距起点约 1.2 m")
 
 # ------------------------------------------------------------------ 加计辨识
 _ACCEL_ATTITUDES = ((0.0, 0.0), (+25.0, 0.0), (-25.0, 0.0), (0.0, +40.0), (0.0, -40.0),
