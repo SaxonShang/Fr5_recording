@@ -489,69 +489,33 @@ class RunSessionTest(unittest.TestCase):
             code = fn(*args)
         return code, out.getvalue()
 
-    def test_mark_limits_plan(self):
+    def test_plan_and_record_fast2(self):
+        """开工核对的两条走拖动标记定的路径（标记文件是只读输入）；在确认处回答 no，没有运动。"""
         rs = self.rs
-        mark = lambda name: self.run_cmd(rs.cmd_mark, argparse.Namespace(direction=name))   # noqa: E731
-        with mock.patch.object(rs.time, "sleep"):
-            for name, cam in self.marks.items():
-                self.park(cam)
-                code, text = mark(name)
-                self.assertEqual(code, 0, text)
-            self.assertIn("12 个标记都记了", text)
-            self.assertIn("横滚：绕光心", text)                                   # 记完一对就列出这一对的路径
-            # 另一种构型（10-14 拖到的那种）也记（用户 10-14 定）；这一对构型不同时会提醒
-            _FakeRecorder.ARM["joints"] = [138.8, -58.6, 113.5, -235.4, -84.8, 15.0]
-            code, text = mark("up")
-            self.assertEqual(code, 0, text)
-            self.assertIn("肘部 J3 +113.5°", text)
-            self.assertIn("两个标记构型不同", text)
-            self.park(self.marks["up"])                                       # 再按常用构型记一次，后面的 plan 用它
-            self.assertEqual(mark("up")[0], 0)
-        data = json.loads(Path(rs.LIMIT_POSES).read_text(encoding="utf-8"))
-        self.assertEqual(sorted(data["marks"]), sorted(fl.MARK_NAMES))
-
-        code, text = self.run_cmd(rs.cmd_limits, argparse.Namespace())
+        marks = {}
+        for name, cam in self.marks.items():
+            flange = fm.matrix_to_fr5(cam @ np.linalg.inv(self.f_t_c))
+            marks[name] = {"created": "test", "flange": flange, "joints": self.ik.GetInverseKinRef(0, flange, [])[1]}
+        Path(rs.LIMIT_POSES).write_text(json.dumps({"marks": marks}), encoding="utf-8")
+        self.park(self.marks["up"])
+        code, text = self.run_cmd(rs.cmd_plan, argparse.Namespace(names=rs.STARTUP_CHECK_NAMES, scale=1.0), [])
         self.assertEqual(code, 0, text)
-        for label in ("上下平移", "左右平移", "前后平移", "偏航", "俯仰", "横滚"):
-            self.assertIn(label, text)
-
-        self.park(self.marks["up"])                                           # 停在最后拖到的地方，不在参考起点
-        code, text = self.run_cmd(rs.cmd_plan, argparse.Namespace(names=[], scale=1.0), [])
-        self.assertEqual(code, 0, text)
-        self.assertIn("全部通过", text)
-        for name in fl.RECORDINGS:
+        for name in rs.STARTUP_CHECK_NAMES:
             self.assertIn(f"=== {name}：通过", text)
-        # 机械臂在另一种构型（10-14 拖到的那种）：录制和去参考起点（sync-test）都要先手动拖回去
-        flipped = [138.8, -58.6, 113.5, -235.4, -84.8, 15.0]
-        saved_joints, _FakeRecorder.ARM["joints"] = _FakeRecorder.ARM["joints"], flipped
-        code2, text2 = self.run_cmd(rs.cmd_plan, argparse.Namespace(names=["up", "sync-test"], scale=1.0), [])
-        self.assertEqual(code2, 1)
-        self.assertIn("这条录制的起点是肘部 J3", text2)
-        self.assertIn("参考起点（set-start 时的构型）是肘部 J3 -74.3°", text2)
-        _FakeRecorder.ARM["joints"] = saved_joints
-        self.assertNotIn("via_start", text)
-        # 偏航：右边被右窗挡住（拖到 −6°、收进 3° 是 −3°，没到右窗），左边收进 3°
-        self.assertIn("方位角 -3.0 → +27.0°", text)
-        # 上下：标记 −150 / +300 mm，两端各收进 30 mm：390 mm 的竖直行程
-        self.assertIn("共 390.0 mm", text)
-
-        # speed-test 走上下这条路径的全程；record 从当前位姿直接移到录制起点。都在确认处回答 no，没有运动
         args = argparse.Namespace(scale=0.2, yes=False, tag="")
         with mock.patch("builtins.input", return_value="no"):
             code, text = self.run_cmd(rs.cmd_speed_test, args)
             self.assertEqual(code, 1)
             self.assertIn("test_up          移动 390.0 mm", text)
-            self.assertIn("没有确认", text)
-            Path(rs.SPEED_CAL).write_text(json.dumps({          # 有了速度标定才能 record
+            Path(rs.SPEED_CAL).write_text(json.dumps({
                 "created": "test", "settings": {k: getattr(rs, k) for k in rs.CAL_KEYS},
                 "model": {"mm_s_per_pct": 6.0, "wiggle_deg_s_per_pct": 2.08, "ramp_s": 0.3},
                 "accel": {"test_down_mm_s2": 2500.0, "test_yaw_back_deg_s2": 300.0}}), encoding="utf-8")
-            code, text = self.run_cmd(rs.cmd_motion, args, "record", "roll_right")
+            code, text = self.run_cmd(rs.cmd_motion, args, "roll_right")
             self.assertEqual(code, 1)
-            self.assertIn("横滚 -42.0 → +42.0°", text)
             self.assertIn("rotate           圆弧", text)
             self.assertIn("没有确认", text)
-        self.assertEqual(list(Path(rs.SESSIONS_DIR).iterdir()), [])          # 没有运动就不留录制目录
+        self.assertEqual(list(Path(rs.SESSIONS_DIR).iterdir()), [])
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ SPEED_WINDOW_S = 0.05        # 实时速度和巡航速度都按跨 50 ms 的差
 OVERSPEED_FACTOR = 1.5       # 实测线速度超过 预期 × 1.5 + 5 mm/s（角速度 + 2 °/s）就中止
 OVERSPEED_MARGIN_MM_S = 5.0
 OVERSPEED_MARGIN_DEG_S = 2.0
+COMBINED_OVERSPEED_ROT_FACTOR = 2.0   # 组合段（同时平移和转动）角速度留 2 倍余量：实际时间律要上机才知道，阈值上机调定
 MAX_PIVOT_DEV_MM = 6.0       # MoveC 旋转时光心偏离旋转中心超过这么多就中止。用来发现圆弧没有绕光心转（当成直线走时
                              # 30° 鼓出约 4 mm、54° 约 15 mm）。10-14 偏航演练：匀速段 ≤ 0.3 mm，起停瞬态随速度变大
                              # （10 °/s 0.8、25 °/s 1.5 mm，50 °/s 估约 3 mm），原来的 2 mm 全速时会误停
@@ -148,7 +149,7 @@ class Segment:
     joints: list | None = None
     speed_mm_s: float = 0.0       # 设计线速度（平移、移到起点）
     rate_deg_s: float = 0.0       # 设计角速度（同步摆动、旋转）；非 0 时按摆动换算速度百分比
-    fixed_percent: float | None = None  # speed-test / movec-test 用：固定的速度百分比
+    fixed_percent: float | None = None  # speed-test 用：固定的速度百分比
     distance_mm: float = 0.0      # 法兰行程（MoveC 为弧长）、姿态变化（fill_geometry 填）
     angle_deg: float = 0.0
     percent: float | None = None  # 速度百分比（apply_speed 填）
@@ -164,6 +165,7 @@ class Segment:
     f_t_c: np.ndarray | None = None     # 有 pivot 时用来由法兰位姿算光心
     joint_rate: float | None = None     # 路径上关节变化最快处：每 mm（平移）或每 °（以转动为主的段）几度（check_plan 填）
     joint_rates: list | None = None     # 每个采样间隔 [(间隔中点的进度 0–1, 每 mm / 每 ° 几度)]（check_plan 填）
+    max_rate_deg_s: float = 0.0   # MoveL 组合段（同时平移和转动）：转动不超过这个角速度，apply_speed 按它和 speed_mm_s 定用时
     log: dict = field(default_factory=dict)
 
 
@@ -177,9 +179,8 @@ class MotionConfig:
     wiggle_deg_s: float
     wiggle_cycles: int
     reposition_mps: float
-    sync_test_hold_s: float
     rot_deg_s: float = 5.0        # 旋转角速度
-    translation_wiggle_side: int = 0  # 平移录制和 sync-test 的同步摆动：0 两边摆；+1 只往左摆；-1 只往右摆
+    translation_wiggle_side: int = 0  # 平移录制的同步摆动：0 两边摆；+1 只往左摆；-1 只往右摆
 
 
 @dataclass
@@ -248,23 +249,6 @@ def plan_rotation(start: np.ndarray, axis, deg: float, f_t_c: np.ndarray, cfg: M
             + [Segment("hold_end", "hold", duration_s=cfg.hold_end_s)])
 
 
-def plan_movec_test(centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig, test_percent: float) -> list[Segment]:
-    """MoveC 探测：在起点绕光心竖直轴（同步摆动的轴，已安全走过）用 MoveC 转 +θ、-2θ、+θ，
-    再用 MoveL 走同样三段对照光心偏离。速度都用固定百分比，按摆动标定估计预计速度（超速保护用）。"""
-    up, d = camera_up(centre), cfg.wiggle_deg
-    segs = [_move("goto_start", centre, f_t_c, cfg.reposition_mps * 1000.0, recorded=False)]
-    cam = centre
-    for prefix in ("arc", "line"):
-        for i, deg in enumerate((d, -2.0 * d, d)):
-            name = f"{prefix}_{i + 1}"
-            seg = (_arc(name, cam, up, deg, f_t_c, cfg.wiggle_deg_s, fixed_percent=test_percent) if prefix == "arc"
-                   else _move(name, rotate_about(cam, up, deg), f_t_c, rate_deg_s=cfg.wiggle_deg_s,
-                              fixed_percent=test_percent, pivot=True))
-            segs.append(seg)
-            cam = seg.camera
-    return segs
-
-
 def plan_translation(start: np.ndarray, end: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig) -> list[Segment]:
     """直线平移：从相机位姿 start 移到 end（姿态相同），前后各一次同步摆动（绕相机竖直轴，按 translation_wiggle_side）。
     开头的 goto_start 从机械臂当前位姿直接移过去（不录制）。"""
@@ -279,13 +263,55 @@ def plan_translation(start: np.ndarray, end: np.ndarray, f_t_c: np.ndarray, cfg:
             + [Segment("hold_end", "hold", duration_s=cfg.hold_end_s)])
 
 
-def plan_sync_test(centre: np.ndarray, f_t_c: np.ndarray, cfg: MotionConfig) -> list[Segment]:
-    side = cfg.translation_wiggle_side
-    return ([_move("goto_start", centre, f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
+def level_facing_x(centre_m) -> np.ndarray:
+    """光心在 centre_m（基坐标系 m）、水平朝基坐标 +X 的相机位姿。"""
+    z, y = np.array([1.0, 0.0, 0.0]), -WORLD_UP
+    out = np.eye(4)
+    out[:3, :3] = np.c_[np.cross(y, z), y, z]
+    out[:3, 3] = centre_m
+    return out
+
+
+def waypoint_pose(reference_m, pose) -> np.ndarray:
+    """路径点的相机位姿。reference_m：本条参考位置；pose：holdout1_paths.Pose（依次俯仰、横滚、朝向）。"""
+    c = level_facing_x(np.asarray(reference_m, dtype=float) + np.array([pose.x, pose.y, pose.z]) / 1000.0)
+    c = rotate_about(c, c[:3, 0], pose.pitch)
+    c = rotate_about(c, c[:3, 2], pose.roll)
+    return yaw_about_vertical(c, pose.heading)
+
+
+def relative_rotation(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, float]:
+    """相机 a 到 b 的转动：(基坐标系单位轴, 转角 °)，转角在 [0, 180]。"""
+    v = gt.quat_to_rotvec(gt.matrix_to_quat(b[:3, :3] @ a[:3, :3].T))
+    deg = math.degrees(float(np.linalg.norm(v)))
+    return (v / np.linalg.norm(v) if deg > 1e-9 else WORLD_UP.copy()), deg
+
+
+def plan_waypoints(spec, f_t_c: np.ndarray, cfg: MotionConfig, side: int) -> list[Segment]:
+    """多段路径（spec：holdout1_paths.WaypointPath）：移到起点（不录）→ 静止 → 同步摆动 → 静止 → leg_1、wp_1、…、leg_N → 静止
+    → 同步摆动 → 静止。side：同步摆动往哪边（+1 / -1）。到位后停住，段与段之间不过渡（blendR=0）。"""
+    reference = np.asarray(spec.reference_mm, dtype=float) / 1000.0
+    poses = [waypoint_pose(reference, spec.start)] + [waypoint_pose(reference, leg.target) for leg in spec.legs]
+    axis_of = (lambda camera: camera[:3, 2].copy()) if spec.wiggle_axis == "optical" else (lambda camera: None)
+    body = []
+    for k, leg in enumerate(spec.legs, 1):
+        a, b = poses[k - 1], poses[k]
+        if leg.motion == "C":
+            axis, deg = relative_rotation(a, b)
+            seg = _arc(f"leg_{k}", a, axis, deg, f_t_c, leg.rate_deg_s)
+        else:
+            seg = _move(f"leg_{k}", b, f_t_c, speed_mm_s=leg.speed_mm_s)
+            seg.max_rate_deg_s = leg.max_rate_deg_s
+        body.append(seg)
+        if k < len(spec.legs):
+            body.append(Segment(f"wp_{k}", "hold", duration_s=leg.hold_s))
+    return ([_move("goto_start", poses[0], f_t_c, cfg.reposition_mps * 1000.0, recorded=False),
              Segment("hold_start", "hold", duration_s=cfg.hold_start_s)]
-            + _wiggle("wiggle_start", centre, f_t_c, cfg, side)
-            + [Segment("hold_middle", "hold", duration_s=cfg.sync_test_hold_s)]
-            + _wiggle("wiggle_end", centre, f_t_c, cfg, side)
+            + _wiggle("wiggle_start", poses[0], f_t_c, cfg, side, axis_of(poses[0]))
+            + [Segment("hold_before", "hold", duration_s=spec.hold_before_s)]
+            + body
+            + [Segment("hold_after", "hold", duration_s=spec.hold_after_s)]
+            + _wiggle("wiggle_end", poses[-1], f_t_c, cfg, side, axis_of(poses[-1]))
             + [Segment("hold_end", "hold", duration_s=cfg.hold_end_s)])
 
 
@@ -328,7 +354,11 @@ def apply_speed(segments: list[Segment], model: SpeedModel | None, scale: float)
         k_lin = model.mm_s_per_pct if model else None
         k_rot = model.wiggle_deg_s_per_pct if model else None
         p = lin = rot = t = None
-        if seg.rate_deg_s > 0:                    # 同步摆动：按摆动标定换算
+        if seg.max_rate_deg_s > 0:                # 组合段：线速度、角速度都不超目标，短段不追目标线速度
+            t = max(seg.distance_mm / (seg.speed_mm_s * scale), seg.angle_deg / (seg.max_rate_deg_s * scale))
+            lin, rot = seg.distance_mm / t, seg.angle_deg / t
+            p = max(lin / k_lin, rot / k_rot) if k_lin and k_rot else None
+        elif seg.rate_deg_s > 0:                  # 同步摆动：按摆动标定换算
             p = seg.fixed_percent or (seg.rate_deg_s * scale / k_rot if k_rot else None)
             if model is None:
                 rot = seg.rate_deg_s * scale
@@ -394,15 +424,25 @@ def _refine_step(rpc, seg: Segment, prev: np.ndarray, target: np.ndarray, u0: fl
     return q_prev, worst
 
 
+def _config(q) -> tuple[int, int]:
+    """构型：肘部 J3、腕部 J5 的正负（和 fr5_limits.config_of 相同）。"""
+    return int(np.sign(q[2])), int(np.sign(q[4]))
+
+
 def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current_joints, f_t_c,
-               joint_min, joint_max, max_joint_step_deg: float, min_camera_z_m: float) -> list[str]:
+               joint_min, joint_max, max_joint_step_deg: float, min_camera_z_m: float,
+               singular_margin_deg: float | None = None) -> list[str]:
     """沿实际路径（MoveL 直线 / MoveC 圆弧）采样，用控制器逆解检查：有解、关节在范围内、不跳支、相机不低于下限。
     机械臂当前就在范围外时（例如上次停在别的朝向），不录制的移动段（移到起点）可以往回走：
     超出的量只能变小，终点必须回到范围内；录制段一律严格检查。
-    同时填好每段的行程、姿态变化和目标关节角（MoveC 还有中间点的关节角）。返回问题列表（空表示通过）。"""
+    同时填好每段的行程、姿态变化和目标关节角（MoveC 还有中间点的关节角）。返回问题列表（空表示通过）。
+    singular_margin_deg：多段路径用。全程不换构型，录制段（和移到起点的终点）J3、J5 离 0 至少这么多 °，
+    每段的关节范围写进 seg.log["joint_range"]。按拖动标记定的路径由 fr5_limits 查这两项，这里不传。"""
     fill_geometry(segments, current_flange)
     problems = []
     ref = list(map(float, current_joints))
+    strict = singular_margin_deg is not None
+    config0 = _config(ref)
     prev = current_flange
     slack = _excess(ref, joint_min, joint_max)                      # 允许的越界量，只减不增
     z_slack = max(0.0, min_camera_z_m - float((current_flange @ f_t_c)[2, 3]))
@@ -421,6 +461,7 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
         # 每个采样间隔走过的路程（mm）或转角（°），用来把关节变化换算成关节速度
         per_step = (seg.angle_deg if seg.rate_deg_s > 0 else seg.distance_mm) / n
         seg.joint_rate, seg.joint_rates = 0.0, []
+        seen = [list(ref)]
         for k in range(1, n + 1):
             u = k / n
             returning = not seg.recorded and k < n                    # 移到起点途中可以从范围外往回走
@@ -451,6 +492,15 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
                     break
                 q = q_fine
                 rate_step = worst * REFINE_PARTS              # 细分后最快那一份换回整步，关节速度按它算（偏保守）
+            if strict:
+                if _config(q) != config0:
+                    problems.append(f"{seg.name}: 路径 {u:.0%} 处构型变了（J3、J5 变号）：{np.round(q, 1).tolist()}")
+                    break
+                near = [f"J{j + 1} {q[j]:+.1f}°" for j in (2, 4) if abs(q[j]) < singular_margin_deg]
+                if near and (seg.recorded or k == n):
+                    problems.append(f"{seg.name}: 路径 {u:.0%} 处离奇异位形不到 {singular_margin_deg:g}°：{'、'.join(near)}")
+                    break
+                seen.append(list(q))
             if per_step > 1e-9:
                 seg.joint_rate = max(seg.joint_rate, rate_step / per_step)
                 seg.joint_rates.append(((k - 0.5) / n, rate_step / per_step))
@@ -458,6 +508,10 @@ def check_plan(rpc, segments: list[Segment], current_flange: np.ndarray, current
             if seg.motion == "C" and 2 * k == n:
                 seg.via_joints = q
         seg.joints = ref
+        if strict:
+            arr = np.asarray(seen, dtype=float)
+            seg.log["joint_range"] = {"min": arr.min(axis=0).tolist(), "max": arr.max(axis=0).tolist(),
+                                      "min_abs": np.abs(arr).min(axis=0).tolist()}
         prev = target
     return problems
 
@@ -475,6 +529,8 @@ def joint_speed_problems(segments: list[Segment], max_deg_s: float, model: Speed
         if not speed:
             continue
         accel = (model.accel_deg_s2 if rot else model.accel_mm_s2) if model else None
+        if accel and seg.max_rate_deg_s > 0 and seg.expect_deg_s and model.accel_deg_s2:   # 组合段：线、角按同一时间律，加速时间取长的
+            accel = speed / max(speed / accel, seg.expect_deg_s / model.accel_deg_s2)
         length = seg.angle_deg if rot else seg.distance_mm
         if accel and seg.joint_rates and length > 0:
             w = max(r * min(speed, math.sqrt(2.0 * accel * u * length), math.sqrt(2.0 * accel * (1.0 - u) * length))
@@ -816,9 +872,13 @@ class MotionRunner:
         timeout = time.monotonic() + (2.0 * seg.duration_s + 60.0 if seg.speed_known else 300.0)
         # 以转动为主的段（旋转、同步摆动）只查角速度：控制器起步时先平移约 1 mm、腕部随后才转
         # （10-12 movec-test 实测，50 ms 内 8–13 mm/s，预计只有 3.5 mm/s），线速度会误报；标定失效时角速度一样超
+        # 组合段线速度和角速度都查，角速度余量更大
+        combined = seg.max_rate_deg_s > 0
         limit = (seg.expect_mm_s * OVERSPEED_FACTOR + OVERSPEED_MARGIN_MM_S
-                 if seg.expect_mm_s and not seg.expect_deg_s else None)
-        limit_rot = (seg.expect_deg_s * OVERSPEED_FACTOR + OVERSPEED_MARGIN_DEG_S) if seg.expect_deg_s else None
+                 if seg.expect_mm_s and (combined or not seg.expect_deg_s) else None)
+        limit_rot = (seg.expect_deg_s * (COMBINED_OVERSPEED_ROT_FACTOR if combined else OVERSPEED_FACTOR)
+                     + OVERSPEED_MARGIN_DEG_S) if seg.expect_deg_s else None
+        peak_v, peak_w = 0.0, 0.0                 # 组合段记录实时速度的最大值，上机调阈值用
         moving_seen = False
         mark_pose, mark_time = fr5_to_matrix(samples[0][1]), time.monotonic()
         j = 0                                     # 实时速度窗口的起点
@@ -842,11 +902,13 @@ class MotionRunner:
                     moving_seen = True
                     seg.log["moving_box_ns"] = time.time_ns()
                 j, v = recent_speed(samples, j)
+                peak_v = max(peak_v, v or 0.0)
                 if limit is not None and v is not None and v > limit:
                     raise MotionAborted(f"{seg.name}: 实测法兰线速度 {v:.1f} mm/s 超过上限 {limit:.1f} mm/s，"
                                         "已中止（WebApp 速度百分比改过？重跑 speed-test）")
                 if limit_rot is not None:
                     _, w = recent_angular_speed(samples, j)
+                    peak_w = max(peak_w, w or 0.0)
                     if w is not None and w > limit_rot:
                         raise MotionAborted(f"{seg.name}: 实测角速度 {w:.1f} °/s 超过上限 {limit_rot:.1f} °/s，"
                                             "已中止（WebApp 速度百分比改过？重跑 speed-test）")
@@ -880,3 +942,5 @@ class MotionRunner:
                 seg.log["measured"] = motion_stats(samples)
             if seg.pivot is not None:
                 seg.log["pivot_dev_max_mm"] = pivot_max
+            if combined:
+                seg.log["overspeed"] = {"limit_mm_s": limit, "limit_deg_s": limit_rot, "peak_mm_s": peak_v, "peak_deg_s": peak_w}

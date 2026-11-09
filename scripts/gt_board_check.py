@@ -48,6 +48,12 @@ MIN_MOVING_FRAMES = 20        # 摆动帧少于这么多就不做时间扫描
 NEAR_GROUP_MM, NEAR_GROUP_DEG = 20.0, 12.0   # 离某个静止位姿不到 20 mm、转动不到 12° 的运动帧算“在这个位姿摆动”
                                              # （摆动 10°，光心偏离约 2 mm）
 SCAN_SKIP_SEGMENTS = ("translate", "rotate")   # 有 motion_log.json 时这两段的帧不进时间扫描（见 check）
+WAYPOINT_LEG_PREFIX = "leg_"   # 多段路径的运动段，同样不进时间扫描
+# 多段路径的带板验收门槛（第二条带板录制，用第一条拟合的修正）
+ACCEPT_WAYPOINT_MM, ACCEPT_WAYPOINT_DEG = 1.0, 0.10      # 路径点静止帧的标定板位置差、姿态差（相对第 0 组）
+ACCEPT_MOVING_RMS_MM, ACCEPT_MOVING_MAX_MM = 2.5, 5.0    # 运动帧的标定板偏离
+ACCEPT_MOVING_ROT_RMS_DEG = 0.20                         # 运动帧的姿态偏离 RMS
+ACCEPT_TIME_MS = 1.5                                     # 时间残差
 
 
 def load_camera(path: Path) -> np.ndarray:
@@ -255,12 +261,14 @@ def check(save_data: Path, calib_repo: Path, camera_yaml: Path, target_yaml: Pat
                        "board_in_camera_r": mean_rotation(np.array([frames[used[i]]["r_board"] for i in g]))})
     for g in groups:
         g["camera_turn_from_first_deg"] = float(angle_deg(g["camera_r"], groups[0]["camera_r"]))
-    # 两两比较：差值也分解到第一组的相机系（x 右、y 下、z 前），便于和运动方向对照。
+    segs = segment_names(save_data, t_ms[used])
+    waypoint = segs is not None and any(str(n).startswith(WAYPOINT_LEG_PREFIX) for n in segs)
+    # 两两比较（多段路径的路径点很多，只和第 0 组比）：差值也分解到第一组的相机系（x 右、y 下、z 前），便于和运动方向对照。
     # 相机转动：真值 = 两组相机姿态之差；图像 = 两组里标定板相对相机的姿态之差（标定板不动，和机械臂无关）。
     # 两者之差（残差转动）就是标定板在基坐标系下的姿态差，转角之比对应平移录制的行程放大。
     first_r = groups[0]["camera_r"] if groups else None
     pairs = []
-    for a in range(len(groups)):
+    for a in range(1 if waypoint else len(groups)):
         for b in range(a + 1, len(groups)):
             ga, gb = groups[a], groups[b]
             moved = np.subtract(gb["camera_mm"], ga["camera_mm"])
@@ -286,14 +294,13 @@ def check(save_data: Path, calib_repo: Path, camera_yaml: Path, target_yaml: Pat
     # 时间扫描只用“在某个静止位姿附近转动”的帧（同步摆动），参考点取最近那个静止组的标定板中心。
     # 平移、旋转段的帧不用（有 motion_log.json 时按段名去掉；没有时只按离静止位姿的远近）：
     # 它们带着随位姿变化的空间误差，而且和速度同号，会把时间估计带偏。
-    segs = segment_names(save_data, t_ms[used])
     scan, scans_by_group = None, []
     if groups:
         group_cam = np.array([g["camera_mm"] for g in groups])
         group_r = np.array([mean_rotation(cam_r[used][g]) for g in group_frames])
         moving_idx = np.nonzero(is_moving)[0]
         if segs is not None:
-            moving_idx = moving_idx[~np.isin(segs[moving_idx], SCAN_SKIP_SEGMENTS)]
+            moving_idx = moving_idx[[not (n in SCAN_SKIP_SEGMENTS or str(n).startswith(WAYPOINT_LEG_PREFIX)) for n in segs[moving_idx]]]
         dist = np.linalg.norm(cam_t[used][moving_idx][:, None, :] * 1000.0 - group_cam[None], axis=2)
         turn = angle_deg(cam_r[used][moving_idx][:, None], group_r[None])
         score = np.where((dist < NEAR_GROUP_MM) & (turn < NEAR_GROUP_DEG), dist / NEAR_GROUP_MM + turn / NEAR_GROUP_DEG,
@@ -332,6 +339,9 @@ def check(save_data: Path, calib_repo: Path, camera_yaml: Path, target_yaml: Pat
         "time_scan": scan,
         "time_scan_by_group": scans_by_group,
     }
+    if waypoint:
+        result["waypoint_correction_source"] = report.get("waypoint_correction", {}).get("source")
+        result["acceptance"] = acceptance(result)
     output.mkdir(parents=True, exist_ok=True)
     (output / "board_check_report.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     with open(output / "board_check_frames.csv", "w", newline="", encoding="utf-8") as f:
@@ -351,6 +361,19 @@ def check(save_data: Path, calib_repo: Path, camera_yaml: Path, target_yaml: Pat
                         "" if d is None else f"{d:.3f}", "" if dd is None else f"{dd:.4f}",
                         "" if seg_all is None else seg_all[i]])
     return result
+
+
+def acceptance(r: dict) -> dict:
+    """多段路径的带板验收：每项 {value, limit, ok}，passed 要求每项都有值且不超门槛。"""
+    pairs, moving, rot, scan = r["static_group_pairs"], r["moving"] or {}, r["rotation_deg"], r["time_scan"]
+    values = {"waypoint_board_mm": (max((x["board_diff_mm"] for x in pairs), default=None), ACCEPT_WAYPOINT_MM),
+              "waypoint_board_deg": (max((x["board_diff_deg"] for x in pairs), default=None), ACCEPT_WAYPOINT_DEG),
+              "moving_rms_mm": (moving.get("rms_mm"), ACCEPT_MOVING_RMS_MM),
+              "moving_max_mm": (moving.get("max_mm"), ACCEPT_MOVING_MAX_MM),
+              "moving_rotation_rms_deg": (rot["moving_rms"], ACCEPT_MOVING_ROT_RMS_DEG),
+              "time_residual_ms": (abs(scan["best_delta_ms"]) if scan and not scan["at_edge"] else None, ACCEPT_TIME_MS)}
+    items = {k: {"value": v, "limit": lim, "ok": v is not None and v <= lim} for k, (v, lim) in values.items()}
+    return {"items": items, "passed": all(i["ok"] for i in items.values())}
 
 
 def summary(r: dict) -> str:
@@ -395,6 +418,14 @@ def summary(r: dict) -> str:
                          f"（RMS {g['rms_at_0_mm']:.2f} → {g['rms_at_best_mm']:.2f} mm）")
     else:
         lines.append(f"静止位置附近的摆动帧少于 {MIN_MOVING_FRAMES}，没做时间扫描")
+    if "acceptance" in r:
+        names = {"waypoint_board_mm": "路径点静止帧板位置差（mm）", "waypoint_board_deg": "路径点静止帧板姿态差（°）",
+                 "moving_rms_mm": "运动帧板偏离 RMS（mm）", "moving_max_mm": "运动帧板偏离最大（mm）",
+                 "moving_rotation_rms_deg": "运动帧姿态偏离 RMS（°）", "time_residual_ms": "时间残差（ms）"}
+        lines.append(f"带板验收（路径点修正：{r['waypoint_correction_source']}）：" + ("通过" if r["acceptance"]["passed"] else "不通过"))
+        for key, item in r["acceptance"]["items"].items():
+            value = "没有数据" if item["value"] is None else f"{item['value']:.3f}"
+            lines.append(f"  {'过' if item['ok'] else '×'} {names[key]}：{value}，门槛 {item['limit']:g}")
     return "\n".join(lines)
 
 

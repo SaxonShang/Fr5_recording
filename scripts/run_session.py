@@ -1,37 +1,27 @@
 #!/usr/bin/env python3
-"""一条录制的总控：FR5 运动（fr5_motion）+ 机械臂状态（fr5_record）+ 图像和 IMU（zed_capture）+ 真值（fr5_groundtruth）。
-所有可改参数都在本文件开头，其他模块不放可调参数。
+"""验证数据集（holdout1）一条录制的总控：FR5 运动（fr5_motion）+ 机械臂状态（fr5_record）+ 图像和 IMU（zed_capture）+ 真值（fr5_groundtruth）。
+路径表在 holdout1_paths.py，其他可改参数都在本文件开头。
 
 在 Box 自己的终端里运行（人在机械臂旁边，手边有急停）：
-    python3 run_session.py set-start        读当前位姿，算出相机水平的参考起点并保存（不动机械臂；10-10 已做，一般不用再做）
-    python3 run_session.py mark up          手动拖到某个方向的极限位姿后，记下当前位姿（不动机械臂）；
-                                            平移 forward/backward/left/right/up/down，旋转 yaw_left … roll_right
-    python3 run_session.py limits           按拖动标记列出每条录制的路径（不连机械臂）
-    python3 run_session.py plan             空跑：按标记定路径、用控制器逆解收两端，检查 6 条录制和 sync-test（不动机械臂）
-    python3 run_session.py goto-start       低速移到参考起点（会先确认；sync-test、movec-test 在这里做）
-    python3 run_session.py speed-test       速度标定：在上下那条路径上实测速度百分比对应的 mm/s 和 °/s（会先确认，不开相机）
-    python3 run_session.py sync-test        时间同步验证：只做同步摆动的录制（会先确认）
-    python3 run_session.py movec-test       MoveC 探测：在参考起点用 MoveC 和 MoveL 各绕光心竖直轴转 ±10°，对照光心偏离
-    python3 run_session.py record up        正式录制一条（会先确认）。每对标记录一条，共 6 条：
-                                            平移 up（最下到最上）、right（最左到最右）、forward（最后到最前）；
-                                            旋转 yaw_left（偏航，右到左）、pitch_up（俯仰，下到上）、roll_right（横滚，左到右）。
-                                            反方向（down、left、backward、yaw_right、pitch_down、roll_left）也能录
-选项：--scale 0.25  按比例降速（路径不变）；--yes  跳过确认（只在你已经看过计划时用）；
-      --tag board  加在录制目录名后面（区分验证录制和正式录制）
+    python3 run_session.py plan [名称 ...]      空跑检查，不动机械臂；不给名称时检查全部 holdout1 路径
+    python3 run_session.py speed-test           速度标定（会先确认，不开相机）。WebApp 速度百分比变了才要重跑
+    python3 run_session.py record <名称>        录制一条（会先确认）
 
-每条录制单独一个目录 SESSIONS_DIR/时间_名称/，相机和机械臂数据都在其中的 save_data/ 里。
-录制的路径由这一对拖动标记定（fr5_limits）：标记只是大概的极限，两端先收进 LIMIT_MARGIN_MM / LIMIT_MARGIN_DEG，
-再按逆解、关节速度、右窗和同步摆动往里收。不回参考起点：开头从机械臂当前位姿直接移到录制起点。
-sync-test 和 record 需要先有 speed-test 的结果；改了 WebApp 速度百分比要重跑 speed-test。
+录制名称：holdout1 路径 accel_static_a/b、accel_rate_slow_first/fast_first、roll_bidir、trans_level_first/tilt_first、s_path、eight；
+开工核对 right、roll_right（路径组 fast2，由 LIMIT_POSES 里的拖动标记定，这份文件是只读输入）。
+选项：--scale 0.25  按比例降速（路径不变）；--yes  跳过确认（只在你已经看过计划时用）；
+      --tag board  加在录制目录名后面（board 带板、rehearsal 演练、sceneA/B/C 区分 S 形的场景）
+
+每条录制单独一个目录 SESSIONS_DIR/时间_名称/，相机和机械臂数据都在其中的 save_data/ 里。开头从机械臂当前位姿直接移到录制起点。
+record 需要先有 speed-test 的结果。
 """
 
 # ================================ 可修改参数 ================================
-# 高速录制（high-speed 分支，2026-10-14 起）：平移 0.5 m/s、旋转 50 °/s、30 fps、曝光 2.5 ms，只避开右侧落地窗。
-# 10-12 平移、10-13 旋转的低速录制用的是 git 标签 data-v1 的设置（路径组 "base"）。
-PATH_SET = "fast2"           # 这一套路径几何的名字，写进 motion_log；真值的行程、转角系数按它查（fr5_groundtruth）。
-                             # fast2 = 10-14 起按拖动标记定的路径；重新拖动标记、路径变了就换个名字，免得用错系数
+# 开工核对的两条（right、roll_right）必须和开发录制是同一条路径：SPEED_MPS 到 ROT_DEG_S、GLASS_* 和 LIMIT_* 都是 fast2 的值，不要改。
+# holdout1 的路径和速度在 holdout1_paths.py，窗位在 HOLDOUT_WINDOW。
+PATH_SET = "fast2"           # 开工核对的路径组，写进 motion_log；真值的行程、转角系数和端点修正按它查（fr5_groundtruth）
 SPEED_MPS = 0.5              # 平移速度 m/s
-TRANSLATION_WIGGLE_SIDE = 1  # sync-test 的同步摆动（平移录制也用它，除非 TRANSLATION_WIGGLE_AUTO）：+1 只往左摆
+TRANSLATION_WIGGLE_SIDE = 1  # fast2 平移录制的同步摆动（除非 TRANSLATION_WIGGLE_AUTO）：+1 只往左摆
                              # （画面右边缘离右窗更远），-1 只往右，0 两边摆
 TRANSLATION_WIGGLE_AUTO = True  # 平移录制的同步摆动往左还是往右由 plan 按行程选：两种各收一次两端，取长的
                                 # （一样长取往左）。10-14：左右往右摆 758 mm、往左 509 mm；前后往左 516、往右 228
@@ -46,6 +36,10 @@ GLASS_REGIONS = [
     (-87.0, -60.3, -8.0, 11.0),
     (-180.0, -87.0, -90.0, 90.0),
 ]
+# 底座搬动后的右窗，只用于 holdout1。None = 还没量，plan 和 record 报问题；regions 为空 = 新位置看不到窗或已遮住。
+# 格式 {"viewpoint_mm": (x, y, z), "regions": [(方位角起, 方位角止, 仰角下, 仰角上), ...], "distance_m": 玻璃最近距离}：
+# 从基坐标系的 viewpoint_mm 水平看，方位角零点是基坐标 +X，向左为正，仰角向上为正，单位 °
+HOLDOUT_WINDOW = None
 GLASS_MARGIN_DEG = 1.0       # 画面离玻璃至少这么多 °（画面左右边缘 1° 约 35 px）
 WINDOW_DISTANCE_M = 7.0      # 玻璃离参考起点光心的最近距离 m（窗底仰角 −6.5°、相机离地至少约 0.8 m 估的下限）；光心移动时按它算视差
 CAMERA_FPS = 30              # 相机帧率（15 / 30 / 60，传给 zed_record）
@@ -56,10 +50,9 @@ NEAREST_DEPTH_M = 1.0        # 画面里最近物体的距离 m，用来估算�
 HOLD_START_S = 5.0           # 开头静止 s（同时用来估陀螺零偏）
 HOLD_MID_S = 3.0             # 同步摆动和平移之间的静止 s
 HOLD_END_S = 5.0             # 结尾静止 s
-WIGGLE_DEG = 10.0            # 同步摆动幅度 °（平移录制和 sync-test 绕相机竖直轴摆；旋转录制绕本条的转轴往内侧摆）
+WIGGLE_DEG = 10.0            # 同步摆动幅度 °（绕相机竖直轴，横滚绕本条的转轴；单侧方向由 plan 选）
 WIGGLE_DEG_S = 20.0          # 同步摆动角速度 °/s（真值脚本要求至少 10 °/s）
 WIGGLE_CYCLES = 2            # 同步摆动来回次数
-SYNC_TEST_HOLD_S = 10.0      # sync-test 两次摆动之间的静止 s
 REPOSITION_MPS = 0.05        # 录制前从当前位姿移到录制起点的速度 m/s
 WEBAPP_SPEED_PCT = 60        # WebApp 里的速度百分比（SDK 读不到，照抄过来）；WebApp 改了这里也要改，并重跑 speed-test。
                              # 高速录制用 60%（10-14 用户已在 WebApp 改好；0.5 m/s 约需 SDK 83%）
@@ -88,15 +81,18 @@ SINGULAR_MARGIN_DEG = 5.0    # 录制路径上 J3（手臂伸直）、J5（腕�
 MAX_JOINT_STEP_DEG = 5.0     # 路径上每 10 mm / 2° 允许的最大关节变化（超过说明逆解可能跳支）
 MAX_JOINT_SPEED_DEG_S = 150.0  # 录制段按预计速度走时任一关节的最快速度上限 °/s（FR5 额定 180 °/s）
 MAX_SPEED_RIPPLE = 0.05      # 平移巡航段速度波动（标准差/均值）超过它就警告“速度不平稳”
+LONG_LEG_MM = 200.0          # 多段路径：不短于这个行程的 MoveL 段才比较实测线速度和预计值（短段没有匀速段）
+# 开发录制 6 条实际走过的关节范围 °（只提示超出的关节，上机时盯住线缆和腕部，不拒绝）
+DEV_JOINT_MIN_DEG = [101.0, -118.0, 20.0, -253.0, -95.0, -80.0]
+DEV_JOINT_MAX_DEG = [173.0, -22.0, 152.0, -96.0, -10.0, 84.0]
 MIN_FREE_GB = 5.0            # 开始录制前 Box 至少剩余的磁盘空间 GB
 ROBOT_IP = "192.168.58.2"
-SESSIONS_DIR = "~/ROBOT/sessions"
+SESSIONS_DIR = "~/ROBOT/sessions_verify"
 ZED_RECORD = "~/ROBOT/zed_imu/build/zed_record"
-HANDEYE = "~/ROBOT/fr5_record/handeye_s003_result.json"
-START_POSE = "~/ROBOT/fr5_record/start_pose.json"
-SPEED_CAL = "~/ROBOT/fr5_record/speed_calibration.json"
-MOVEC_TEST = "~/ROBOT/fr5_record/movec_test.json"
-LIMIT_POSES = "~/ROBOT/fr5_record/limit_poses.json"   # mark 记下的拖动标记
+HANDEYE = "~/ROBOT/fr5_verify/handeye_s003_result.json"
+START_POSE = "~/ROBOT/fr5_verify/start_pose.json"
+SPEED_CAL = "~/ROBOT/fr5_verify/speed_calibration.json"
+LIMIT_POSES = "~/ROBOT/fr5_verify/limit_poses.json"   # 开发录制时记下的拖动标记（只读）：定开工核对的路径和 speed-test 的路径
 
 # 允许范围 [下限, 上限]，超出就拒绝运行
 RANGES = {
@@ -116,7 +112,6 @@ RANGES = {
     "WIGGLE_DEG": (5.0, 15.0),
     "WIGGLE_DEG_S": (12.0, 40.0),
     "WIGGLE_CYCLES": (1, 4),
-    "SYNC_TEST_HOLD_S": (5.0, 60.0),
     "REPOSITION_MPS": (0.01, 0.10),
     "WEBAPP_SPEED_PCT": (1, 100),
     "ACCEL_PCT": (1, 100),
@@ -134,6 +129,7 @@ RANGES = {
     "SINGULAR_MARGIN_DEG": (2.0, 20.0),
     "MAX_JOINT_SPEED_DEG_S": (30.0, 170.0),
     "MAX_SPEED_RIPPLE": (0.01, 0.2),
+    "LONG_LEG_MM": (50.0, 500.0),
     "MIN_FREE_GB": (1.0, 100.0),
 }
 # ==========================================================================
@@ -158,17 +154,12 @@ import numpy as np
 import fr5_groundtruth as gt
 import fr5_limits as fl
 import fr5_motion as fm
+import holdout1_paths as hp
 from fr5_record import StateRecorder
 from zed_capture import ZedRecord, camera_users
 
 MB_PER_FRAME = 0.8    # zed_record 双目 JPEG 每帧约 0.8 MB
 HANGUP_LOG = Path(tempfile.gettempdir()) / "run_session_hangup.log"  # 有录制目录时改成目录里的 run_session.log
-
-
-# --cue（录有人走过的数据）：给画面外的人的提示音，freedesktop 的系统提示音（Box 自带）
-CUE_SOUND_DIR = "/usr/share/sounds/freedesktop/stereo"
-CUE_SOUNDS = {"ready": "message.oga", "go": "bell.oga", "leave": "complete.oga"}
-CUE_LOG = "~/ROBOT/cue_events.log"   # 每次提示追加一行，笔记本上的 cue_listener.py 跟踪它、用笔记本喇叭响（Box 显示器没喇叭）
 
 
 class HangUp(BaseException):
@@ -190,11 +181,12 @@ def p(path: str) -> Path:
 
 def motion_config() -> fm.MotionConfig:
     return fm.MotionConfig(SPEED_MPS, HOLD_START_S, HOLD_MID_S, HOLD_END_S,
-                           WIGGLE_DEG, WIGGLE_DEG_S, int(WIGGLE_CYCLES), REPOSITION_MPS, SYNC_TEST_HOLD_S,
+                           WIGGLE_DEG, WIGGLE_DEG_S, int(WIGGLE_CYCLES), REPOSITION_MPS,
                            rot_deg_s=ROT_DEG_S, translation_wiggle_side=int(TRANSLATION_WIGGLE_SIDE))
 
 
-RECORD_NAMES = list(fl.RECORD_PAIR)          # 12 个方向都能录；每对标记录一条，默认的 6 条见 fl.RECORDINGS
+STARTUP_CHECK_NAMES = ["right", "roll_right"]   # 开工核对：fast2 路径上各录一条带板，看手眼和底座搬动后的精度
+RECORD_NAMES = [*hp.PATHS, *STARTUP_CHECK_NAMES]
 
 
 def pose_note(name: str, segs: list[fm.Segment], start_camera: np.ndarray, f_t_c: np.ndarray) -> tuple[str, list[str]]:
@@ -282,6 +274,7 @@ def parameter_problems() -> list[str]:
                    f"超过 MAX_BLUR_PX={MAX_BLUR_PX}；这个曝光下角速度最高 {w_max:.1f} °/s")
     if any(len(r) != 4 or not (r[0] < r[1] and r[2] < r[3]) for r in GLASS_REGIONS):
         out.append("GLASS_REGIONS 每块必须是 (方位角起, 方位角止, 仰角下, 仰角上)，且起 < 止、下 < 上")
+    out += window_format_problems()
     if CAMERA_FPS not in (15, 30, 60):
         out.append(f"CAMERA_FPS = {CAMERA_FPS}，只能是 15、30 或 60")
     if UP_DOWN_HEADING_BASE_DEG is not None and not (isinstance(UP_DOWN_HEADING_BASE_DEG, (int, float))
@@ -302,10 +295,21 @@ def parameter_problems() -> list[str]:
     return out
 
 
+def window_format_problems() -> list[str]:
+    if HOLDOUT_WINDOW is None:
+        return []
+    w = HOLDOUT_WINDOW
+    if not isinstance(w, dict) or set(w) != {"viewpoint_mm", "regions", "distance_m"} or len(w["viewpoint_mm"]) != 3:
+        return ["HOLDOUT_WINDOW 必须是 None 或 {viewpoint_mm: (x, y, z), regions: [...], distance_m: 距离}"]
+    if any(len(r) != 4 or not (r[0] < r[1] and r[2] < r[3]) for r in w["regions"]):
+        return ["HOLDOUT_WINDOW 的 regions 每块必须是 (方位角起, 方位角止, 仰角下, 仰角上)，且起 < 止、下 < 上"]
+    return []
+
+
 def load_start() -> dict:
     path = p(START_POSE)
     if not path.exists():
-        raise SystemExit(f"没有起点文件 {path}：先运行 python3 run_session.py set-start")
+        raise SystemExit(f"没有起点文件 {path}：从 ~/ROBOT/fr5_record 拷过来")
     data = json.loads(path.read_text(encoding="utf-8"))
     data["camera"] = np.array(data["base_T_camera"])
     return data
@@ -317,12 +321,13 @@ def current_pose(rec: StateRecorder):
 
 
 def check_segments(rec: StateRecorder, rpc, segs: list[fm.Segment], f_t_c, model, scale: float,
-                   joint_limits: tuple[list, list] | None = None) -> list[str]:
+                   joint_limits: tuple[list, list] | None = None, waypoint: bool = False) -> list[str]:
     """从当前位姿出发做逆解检查，并按速度模型换算每段的速度百分比。返回问题列表。
-    joint_limits：(下限, 上限)，默认 JOINT_MIN_DEG / JOINT_MAX_DEG（录制时用这对标记放宽过的范围）。"""
+    joint_limits：(下限, 上限)，默认 JOINT_MIN_DEG / JOINT_MAX_DEG。waypoint：多段路径，另查离奇异和构型。"""
     flange, joints, _ = current_pose(rec)
     lo, hi = joint_limits or (JOINT_MIN_DEG, JOINT_MAX_DEG)
-    problems = (fm.check_plan(rpc, segs, flange, joints, f_t_c, lo, hi, MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M)
+    problems = (fm.check_plan(rpc, segs, flange, joints, f_t_c, lo, hi, MAX_JOINT_STEP_DEG, MIN_CAMERA_Z_M,
+                              SINGULAR_MARGIN_DEG if waypoint else None)
                 + fm.apply_speed(segs, model, scale))
     return problems + fm.joint_speed_problems(segs, MAX_JOINT_SPEED_DEG_S, model)
 
@@ -345,16 +350,12 @@ def joint_limits(rpc) -> tuple[list, list, str]:
     return lo, hi, "控制器关节软限位：" + "，".join(f"J{j + 1} {s:+.0f}～{e:+.0f}" for j, (s, e) in enumerate(soft))
 
 
-def config_problem(current_joints, start_q, target: str = "这条录制的起点") -> str | None:
-    """机械臂现在的构型和要去的位姿不同：直线移不过去（要经过奇异位形），要先手动拖过去。
-    参考起点（goto-start、sync-test、movec-test）按 set-start 时的关节角查：换一种构型到那里，机械臂的姿势没确认过。"""
+def config_problem(current_joints, start_q) -> str | None:
+    """机械臂现在的构型和要去的位姿不同：直线移不过去（要经过奇异位形），要先手动拖过去。"""
     if start_q is None or fl.config_of(current_joints) == fl.config_of(start_q):
         return None
-    return (f"goto_start: 机械臂现在是{fl.describe_config(current_joints)}，{target}是{fl.describe_config(start_q)}，"
-            f"构型不同，直线移不过去（要经过奇异位形）；先手动拖到{target}附近（关节约 {np.round(start_q, 1).tolist()}）")
-
-
-REFERENCE = "参考起点（set-start 时的构型）"
+    return (f"goto_start: 机械臂现在是{fl.describe_config(current_joints)}，这条录制的起点是{fl.describe_config(start_q)}，"
+            f"构型不同，直线移不过去（要经过奇异位形）；先手动拖到这条录制的起点附近（关节约 {np.round(start_q, 1).tolist()}）")
 
 
 # ------------------------------------------------------------------ 拖动标记 → 路径
@@ -433,45 +434,87 @@ def build_recording(rpc, direction: str, marks: dict, start: dict, f_t_c: np.nda
     return segs, note, record, fl.start_joints(direction, fit), []
 
 
-def cue(sound: str | None, text: str) -> None:
-    """给画面外的人的提示：终端大字和响铃，再用 paplay 放一声提示音（不等它放完，不耽误运动），
-    并往 CUE_LOG 追加一行（时间、提示音、文字），给笔记本上的 cue_listener.py 用。"""
-    print(f"\a\n{'=' * 28}\n>>> {text}\n{'=' * 28}", flush=True)
-    try:
-        with open(p(CUE_LOG), "a", encoding="utf-8") as f:
-            f.write(f"{time.time():.3f} {sound or '-'} {text}\n")
-    except OSError:
-        pass
-    if sound:
-        try:
-            subprocess.Popen(["paplay", str(Path(CUE_SOUND_DIR) / CUE_SOUNDS[sound])],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            pass
+# ------------------------------------------------------------------ 路径表 → 路径（holdout1）
+def window_note(segs: list[fm.Segment], f_t_c: np.ndarray) -> tuple[str, list[str]]:
+    """holdout1 路径的右窗检查。返回 (说明, 问题列表)。"""
+    if HOLDOUT_WINDOW is None:
+        return "", ["HOLDOUT_WINDOW 还没设：先量底座搬动后的右窗（看不到窗或已遮住时 regions 写空表）"]
+    if not HOLDOUT_WINDOW["regions"]:
+        return "右窗：HOLDOUT_WINDOW 的 regions 为空，不检查", []
+    view = fm.level_facing_x(np.asarray(HOLDOUT_WINDOW["viewpoint_mm"], dtype=float) / 1000.0)
+    clear, where = fm.glass_clearance(segs, view, f_t_c, HOLDOUT_WINDOW["regions"], distance_m=HOLDOUT_WINDOW["distance_m"])
+    note = f"画面离右窗最近 {clear:.2f}°（{where}）"
+    return note, ([] if clear >= GLASS_MARGIN_DEG else [f"{note}，少于 GLASS_MARGIN_DEG={GLASS_MARGIN_DEG}°"])
 
 
-def cue_plan(segs: list) -> dict:
-    """record --cue：录制里有人走过，每段开始时给什么提示（段名 → (提示音, 文字)）。人在运动前的静止段进画面、
-    运动中走过、运动后的静止段里走出画面；两段同步摆动时画面里不能有人（时间同步和晚一帧检查要用它们的画面）。"""
-    dur = {s.name: s.duration_s for s in segs}
-    move = next((s.name for s in segs if s.name in ("translate", "rotate")), None)
-    if move is None or "hold_before" not in dur or "hold_after" not in dur:
-        return {}
-    what = "平移" if move == "translate" else "旋转"
-    # 准备提示不写秒数：计划里同步摆动每段按 1.0 s 估，实测约 0.63 s（四段约 2.5 s）
-    return {"wiggle_start_1": ("ready", "准备：听到下一声就进画面（现在画面里不能有人）"),
-            "hold_before": ("go", f"走！进画面，{dur['hold_before']:.0f} s 后开始{what}"),
-            move: (None, f"{what}中（约 {dur[move]:.1f} s）"),
-            "hold_after": ("leave", f"离开：{dur['hold_after']:.0f} s 内走出画面"),
-            "wiggle_end_1": (None, "同步摆动：画面里不能有人")}
+def waypoint_note(spec: hp.WaypointPath, side: int, segs: list[fm.Segment], f_t_c: np.ndarray, window: str) -> str:
+    """路径说明：姿态范围、离奇异多远、关节最快、超出开发录制走过范围的关节、摆动方向和标定板放哪。"""
+    level = fm.level_facing_x(np.asarray(spec.reference_mm, dtype=float) / 1000.0)
+    span = fm.pose_span(segs, level, f_t_c)
+    angles = "，".join(f"{label} {span[key][0]:+.1f}～{span[key][1]:+.1f}°"
+                      for key, label in (("heading", "朝向"), ("pitch", "俯仰"), ("roll", "横滚")))
+    ranges = [s.log["joint_range"] for s in segs if s.recorded and "joint_range" in s.log]
+    lo, hi = np.min([r["min"] for r in ranges], axis=0), np.max([r["max"] for r in ranges], axis=0)
+    min_abs = np.min([r["min_abs"] for r in ranges], axis=0)
+    fastest = max((s.log.get("max_joint_speed_deg_s") or 0.0) for s in segs if s.kind == "move" and s.recorded)
+    legs = [s for s in segs if s.name.startswith("leg_")]
+    lines = [spec.description,
+             f"参考位置 {tuple(spec.reference_mm)} mm，{len(legs)} 段，同步摆动 {side:+d}；{angles}（零点是水平朝基坐标 +X）",
+             f"离奇异 |J3| ≥ {min_abs[2]:.1f}°、|J5| ≥ {min_abs[4]:.1f}°；关节最快 {fastest:.0f} °/s；{window}"]
+    beyond = [f"J{j + 1} {lo[j]:.0f}～{hi[j]:.0f}"
+              for j in range(6) if lo[j] < DEV_JOINT_MIN_DEG[j] or hi[j] > DEV_JOINT_MAX_DEG[j]]
+    if beyond:
+        lines.append("注意：这些关节超出开发录制走过的范围，第一次演练时盯住腕部和线缆：" + "、".join(beyond))
+    if spec.board:
+        lines.append(f"带板录制时标定板：{spec.board}")
+    return "\n".join(lines)
 
 
-def cmd_cue_test(args) -> int:
-    """不连机械臂、不开相机：三种提示各放一遍，确认现场听得到、看得到。"""
-    for sound, text in (("ready", "准备（测试）"), ("go", "走！（测试）"), ("leave", "离开（测试）")):
-        cue(sound, text)
-        time.sleep(2.5)
-    return 0
+def build_waypoint_recording(rpc, name: str, f_t_c: np.ndarray, model, limits):
+    """路径表里的路径 name 的全部段。同步摆动往哪边由这里选（+1 优先），和机械臂当前位姿无关。不自动收缩：不通过就报问题，人工改路径表。
+    返回 (段或 None, 路径说明, 写进 motion_log 的路径记录, 起点关节角, 问题列表)。"""
+    spec = hp.PATHS[name]
+    start_flange = fm.waypoint_pose(np.asarray(spec.reference_mm, dtype=float) / 1000.0, spec.start) @ np.linalg.inv(f_t_c)
+    err, start_q = fm.inverse_kin(rpc, start_flange, spec.seed_joints)
+    if start_q is None:
+        return None, spec.description, None, None, [f"起点控制器逆解失败（错误码 {err}）"]
+    if fl.config_of(start_q) != fl.config_of(spec.seed_joints):
+        return None, spec.description, None, None, [f"起点逆解的构型不对：{np.round(start_q, 1).tolist()}"]
+    tried = []
+    for side in (+1, -1):
+        segs = fm.plan_waypoints(spec, f_t_c, motion_config(), side)
+        found = (fm.check_plan(rpc, segs, start_flange, start_q, f_t_c, limits[0], limits[1], MAX_JOINT_STEP_DEG,
+                               MIN_CAMERA_Z_M, SINGULAR_MARGIN_DEG)
+                 + fm.apply_speed(segs, model, 1.0) + fm.joint_speed_problems(segs, MAX_JOINT_SPEED_DEG_S, model))
+        window, glass = window_note(segs, f_t_c)
+        found += glass
+        if not found:
+            record = {"path": name, "path_set": hp.PATH_SET, "description": spec.description,
+                      "reference_mm": list(spec.reference_mm), "seed_joints": list(spec.seed_joints), "start_joints": start_q,
+                      "wiggle_side": side, "wiggle_axis": spec.wiggle_axis, "correction_key": spec.correction_key,
+                      "labels": spec.labels, "window": HOLDOUT_WINDOW, "joint_min": limits[0], "joint_max": limits[1]}
+            return segs, waypoint_note(spec, side, segs, f_t_c, window), record, start_q, []
+        tried += [f"同步摆动 {side:+d}：{m}" for m in found]
+    return None, spec.description, None, start_q, tried
+
+
+def leg_summary(seg: fm.Segment) -> dict:
+    """多段路径一段的预计和实测，写进 motion_log；notes 是和预计差得多的项（13.11 上机清单第 10 项的判据）。"""
+    m = seg.log.get("measured") or {}
+    lin, ang = m.get("linear_mm_s"), m.get("angular_deg_s")
+    notes = []
+    if seg.motion == "L" and seg.distance_mm >= LONG_LEG_MM and lin and seg.expect_mm_s:
+        error = lin["mean"] / seg.expect_mm_s - 1.0
+        if abs(error) > MAX_SPEED_ERROR:
+            notes.append(f"线速度比预计差 {error:+.0%}")
+    if ang and seg.expect_deg_s and ang["max"] > 1.5 * seg.expect_deg_s:
+        notes.append(f"角速度最大 {ang['max']:.1f} °/s，超过预计 {seg.expect_deg_s:.1f} °/s 的 1.5 倍")
+    return {"name": seg.name, "motion": seg.motion, "percent": seg.percent, "distance_mm": seg.distance_mm,
+            "angle_deg": seg.angle_deg, "expected_mm_s": seg.expect_mm_s, "expected_deg_s": seg.expect_deg_s,
+            "planned_duration_s": seg.duration_s, "duration_s": m.get("duration_s"),
+            "mean_mm_s": lin["mean"] if lin else None, "max_mm_s": lin["max"] if lin else None,
+            "mean_deg_s": ang["mean"] if ang else None, "max_deg_s": ang["max"] if ang else None,
+            "pivot_dev_max_mm": seg.log.get("pivot_dev_max_mm"), "overspeed": seg.log.get("overspeed"), "notes": notes}
 
 
 def confirm_plan(text: str, assume_yes: bool) -> None:
@@ -517,157 +560,18 @@ def describe(segments: list[fm.Segment], pending: dict | None = None, totals: bo
 
 
 # ------------------------------------------------------------------ 命令
-def cmd_set_start(args) -> int:
-    f_t_c, handeye = gt.load_handeye(p(HANDEYE))
-    with tempfile.TemporaryDirectory() as tmp:
-        rec = StateRecorder(tmp, ROBOT_IP)
-        rec.start()
-        try:
-            rpc = rec.open_rpc()
-            flange, joints, _ = current_pose(rec)
-            camera = flange @ f_t_c
-            level = fm.level_camera(camera)
-            target = level @ np.linalg.inv(f_t_c)
-            err, q = rpc.GetInverseKinRef(0, fm.matrix_to_fr5(target), joints)
-            if err != 0 or q is None:
-                print(f"水平起点控制器逆解失败（错误码 {err}）")
-                return 1
-        finally:
-            rec.stop(write=False)
-    z = camera[:3, 2]
-    tilt, roll = np.degrees(np.arcsin(-z[2])), np.degrees(np.arcsin(camera[2, 0]))
-    data = {
-        "created": dt.datetime.now().isoformat(timespec="seconds"),
-        "base_T_camera": level.tolist(),
-        "flange": fm.matrix_to_fr5(target),
-        "joints": list(map(float, q)),
-        "from_flange": fm.matrix_to_fr5(flange),
-        "from_joints": joints,
-        "level_correction_deg": {"tilt": float(tilt), "roll": float(roll)},
-        "handeye_sha256": handeye["sha256"],
-    }
-    p(START_POSE).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"已保存起点 {p(START_POSE)}")
-    print(f"  相机光心 {np.round(level[:3, 3] * 1000, 1).tolist()} mm；当前相机俯仰 {tilt:+.2f}°、横滚 {roll:+.2f}°，起点改为水平")
-    print(f"  起点关节 {np.round(q, 2).tolist()}（相对当前 {np.round(np.subtract(q, joints), 2).tolist()}）")
-    if max(abs(tilt), abs(roll)) > 5:
-        print("  注意：当前相机偏离水平超过 5°，移到起点时姿态变化较大，先用 --scale 0.25 低速执行")
-    return 0
-
-
-def describe_mark(rel: dict) -> str:
-    fwd, left, up = (fl.signed(v, 0) for v in rel["offset_mm"])
-    head, pitch, roll = (fl.signed(v) for v in rel["angles_deg"])
-    return f"光心相对参考起点 前 {fwd}、左 {left}、上 {up} mm，姿态 方位角 {head}°、俯仰 {pitch}°、横滚 {roll}°"
-
-
-def mark_pair(name: str) -> str:
-    return next(pair for pair, ends in fl.PAIRS.items() if name in ends)
-
-
-def print_pair(pair: str, marks: dict, start: dict, indent: str = "  ") -> None:
-    """一对标记定出的路径（还没按逆解收两端）、提醒和问题。"""
-    path, missing = pair_path(pair, marks, start)
-    if path is None:
-        print(f"{indent}{fl.PAIR_LABEL[pair]}：{missing}")
-        return
-    print(indent + fl.describe_path(path).replace("\n", "\n" + indent))
-    neg, pos = fl.PAIRS[pair]
-    if fl.config_of(marks[neg]["joints"]) != fl.config_of(marks[pos]["joints"]):
-        print(f"{indent}  注意：两个标记构型不同（{neg}：{fl.describe_config(marks[neg]['joints'])}；"
-              f"{pos}：{fl.describe_config(marks[pos]['joints'])}）：一条录制换不了构型，plan 两种构型各试一次，取能走得长的")
-    for w in path.warnings:
-        print(f"{indent}  注意：{w}")
-    for m in path.problems:
-        print(f"{indent}  问题：{m}")
-
-
-def cmd_mark(args) -> int:
-    """读当前位姿，记成 args.direction 方向的拖动极限，存进 LIMIT_POSES（不动机械臂）。"""
-    f_t_c, handeye = gt.load_handeye(p(HANDEYE))
-    start = load_start()
-    with tempfile.TemporaryDirectory() as tmp:
-        rec = StateRecorder(tmp, ROBOT_IP)
-        rec.start()
-        try:
-            first, _, _ = current_pose(rec)
-            time.sleep(0.5)
-            flange, joints, pkg = current_pose(rec)
-        finally:
-            rec.stop(write=False)
-    moved, turned = np.linalg.norm(flange[:3, 3] - first[:3, 3]) * 1000.0, fm.rotation_deg(first, flange)
-    if moved > 1.0 or turned > 0.2:
-        print(f"0.5 s 内法兰动了 {moved:.1f} mm、{turned:.2f}°：松手，等机械臂停稳后再记")
-        return 1
-    camera = flange @ f_t_c
-    path = p(LIMIT_POSES)
-    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"marks": {}}
-    old = data["marks"].get(args.direction)
-    data["marks"][args.direction] = {
-        "created": dt.datetime.now().isoformat(timespec="seconds"),
-        "flange": fm.matrix_to_fr5(flange),
-        "joints": list(map(float, joints)),
-        "base_T_camera": camera.tolist(),
-        "handeye_sha256": handeye["sha256"],
-        "main_code": int(pkg.main_code), "sub_code": int(pkg.sub_code),
-    }
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"已记下 {args.direction}（{path}）")
-    print(f"  {describe_mark(fl.relative(start['camera'], camera))}")
-    print(f"  关节 {np.round(joints, 1).tolist()}（{fl.describe_config(joints)}）")
-    if old is not None:
-        before = fm.fr5_to_matrix(old["flange"]) @ f_t_c
-        print(f"  替换了 {old['created']} 的标记（光心差 {np.linalg.norm(before[:3, 3] - camera[:3, 3]) * 1000:.0f} mm、"
-              f"姿态差 {fm.rotation_deg(before, camera):.1f}°）")
-    print_pair(mark_pair(args.direction), load_marks(f_t_c), start)
-    missing = [n for n in fl.MARK_NAMES if n not in data["marks"]]
-    print("还没记：" + "、".join(missing) if missing
-          else "12 个标记都记了：python3 run_session.py plan 按逆解收两端、检查全部录制")
-    return 0
-
-
-def cmd_limits(args) -> int:
-    """按拖动标记列出每条录制的路径（还没按逆解收两端；不连机械臂）。"""
-    f_t_c, _ = gt.load_handeye(p(HANDEYE))
-    start = load_start()
-    marks = load_marks(f_t_c)
-    if not marks:
-        print(f"还没有拖动标记（{p(LIMIT_POSES)}）：手动拖到极限位姿后运行 python3 run_session.py mark <方向>")
-        return 1
-    print(f"余量：平移 {LIMIT_MARGIN_MM:g} mm、旋转 {LIMIT_MARGIN_DEG:g}°；角度相对参考起点（{start['created']}），"
-          "方位角正 = 向左、俯仰正 = 向上、横滚正 = 画面顶部向右")
-    print("\n拖动标记：")
-    for name in fl.MARK_NAMES:
-        if name not in marks:
-            print(f"  {name:<11} （没有）")
-            continue
-        m = marks[name]
-        print(f"  {name:<11} {describe_mark(fl.relative(start['camera'], m['camera']))}")
-        print(f"  {'':<11} 关节 {np.round(m['joints'], 1).tolist()}（{fl.describe_config(m['joints'])}；{m['created']}）")
-    print("\n录制路径（plan 再按逆解、关节速度、右窗和同步摆动收两端）：")
-    for pair in fl.PAIRS:
-        names = [n for n in fl.RECORDINGS if fl.RECORD_PAIR[n][0] == pair]
-        print(f"\n  [{' / '.join(names)}]")
-        print_pair(pair, marks, start, "  ")
-    return 0
-
-
 def cmd_plan(args, problems: list[str]) -> int:
     for m in problems:
         print(f"参数问题：{m}")
     f_t_c, _ = gt.load_handeye(p(HANDEYE))
     start = load_start()
-    cfg = motion_config()
-    names = args.names or [*fl.RECORDINGS, "sync-test"]
-    unknown = [n for n in names if n not in RECORD_NAMES and n != "sync-test"]
+    names = args.names or list(hp.PATHS)
+    unknown = [n for n in names if n not in RECORD_NAMES]
     if unknown:
-        print(f"不认识的录制名：{unknown}")
+        print(f"不认识的录制名：{unknown}（可选：{' '.join(RECORD_NAMES)}）")
         return 2
     marks = load_marks(f_t_c)
-    print(f"路径组 {PATH_SET}；相机 {CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB")
-    print(f"模糊估算：{NEAREST_DEPTH_M} m 处 左右/上下平移 {fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px，"
-          f"前后平移画面边缘约 {1.3 * fm.blur_px(SPEED_MPS, EXPOSURE_US, NEAREST_DEPTH_M):.2f} px；"
-          f"旋转 {fm.rotation_blur_px(ROT_DEG_S, EXPOSURE_US):.2f} px（1080p）")
+    print(f"路径组：路径表里的是 {hp.PATH_SET}，开工核对是 {PATH_SET}；相机 {CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB")
     model, note = load_speed_model()
     print(note if model else f"注意：{note}；下面没有速度百分比，时长按设计速度估算，关节速度按全程匀速（偏保守）")
     with tempfile.TemporaryDirectory() as tmp:
@@ -680,19 +584,19 @@ def cmd_plan(args, problems: list[str]) -> int:
             _, current_q, _ = current_pose(rec)
             print(f"机械臂现在：关节 {np.round(current_q, 1).tolist()}（{fl.describe_config(current_q)}）")
             for name in names:
-                start_q = None
-                if name == "sync-test":
-                    segs, path_note, found = fm.plan_sync_test(start["camera"], f_t_c, cfg), "", []
-                    start_q = start["joints"]
+                waypoint = name in hp.PATHS
+                if waypoint:
+                    segs, path_note, _, start_q, found = build_waypoint_recording(rpc, name, f_t_c, model, (lo, hi))
                 else:
                     segs, path_note, _, start_q, found = build_recording(rpc, name, marks, start, f_t_c, model, (lo, hi))
+                note = ""
                 if segs is not None:
-                    note, glass = pose_note(name, segs, start["camera"], f_t_c)
-                    moved = config_problem(current_q, start_q, REFERENCE if name == "sync-test" else "这条录制的起点")
+                    note, glass = ("", []) if waypoint else pose_note(name, segs, start["camera"], f_t_c)
+                    moved = config_problem(current_q, start_q)
                     found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale,
-                                                                        (lo, hi)) + glass
+                                                                        (lo, hi), waypoint) + glass
                 print(f"\n=== {name}：{'通过' if not found else '有问题'}")
-                for text in (path_note, note if segs is not None else ""):
+                for text in (path_note, note):
                     if text:
                         print("  " + text.replace("\n", "\n  "))
                 if segs is not None:
@@ -768,124 +672,108 @@ def zed_failure(info: dict | None, data_dir: Path) -> str | None:
     return "zed_record 没有正常结束：" + "，".join(problems) + "。图像时间表和 IMU 文件可能缺结尾，这条不能作正式数据，要重录"
 
 
-def cmd_motion(args, kind: str, direction: str | None) -> int:
-    busy = camera_users() if kind != "goto-start" else []
+def cmd_motion(args, direction: str) -> int:
+    busy = camera_users()
     if busy:
         print("相机正被占用，先关掉这些程序：\n  " + "\n  ".join(busy))
         return 1
+    waypoint = direction in hp.PATHS
+    group = hp.PATH_SET if waypoint else PATH_SET
     f_t_c, handeye = gt.load_handeye(p(HANDEYE))
     start = load_start()
-    cfg = motion_config()
     model, note = load_speed_model()
-    if model is None and kind != "goto-start":
+    if model is None:
         print(note)
         return 1
-    name = direction or kind
-    session_dir = None
-    if kind != "goto-start":
-        root = p(SESSIONS_DIR)
-        root.mkdir(parents=True, exist_ok=True)
-        free_gb = shutil.disk_usage(root).free / 1e9
-        if free_gb < MIN_FREE_GB:
-            print(f"磁盘只剩 {free_gb:.1f} GB，少于 MIN_FREE_GB={MIN_FREE_GB}")
-            return 1
-        session_dir = root / (f"{dt.datetime.now():%Y%m%d_%H%M%S}_{name}" + (f"_{args.tag}" if args.tag else ""))
-        session_dir.mkdir()
-        data_dir = session_dir / "save_data"
-        global HANGUP_LOG
-        HANGUP_LOG = session_dir / "run_session.log"
-    else:
-        data_dir = Path(tempfile.mkdtemp(prefix="fr5_goto_"))
+    root = p(SESSIONS_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(root).free / 1e9
+    if free_gb < MIN_FREE_GB:
+        print(f"磁盘只剩 {free_gb:.1f} GB，少于 MIN_FREE_GB={MIN_FREE_GB}")
+        return 1
+    session_dir = root / (f"{dt.datetime.now():%Y%m%d_%H%M%S}_{direction}" + (f"_{args.tag}" if args.tag else ""))
+    session_dir.mkdir()
+    data_dir = session_dir / "save_data"
+    global HANGUP_LOG
+    HANGUP_LOG = session_dir / "run_session.log"
 
     rec = StateRecorder(data_dir, ROBOT_IP)
     rec.start()
-    zed = ZedRecord(p(ZED_RECORD), session_dir, EXPOSURE_US, ANALOG_GAIN_MDB, CAMERA_FPS) if session_dir else None
-    error, ran, segs, mark_path = None, False, [], None
+    zed = ZedRecord(p(ZED_RECORD), session_dir, EXPOSURE_US, ANALOG_GAIN_MDB, CAMERA_FPS)
+    error, ran, segs, mark_path, waypoint_path = None, False, [], None, None
     try:
         rpc = rec.open_rpc()
         runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
         runner.precheck()
-        if model is None:                        # 只有 goto-start 允许没标定
-            model = conservative_model(rpc)
-            note = "还没有速度标定，按保守假设换算（实际只会更慢）"
-        path_note, start_q, target = "", start["joints"], REFERENCE   # goto-start、sync-test：去参考起点
         lo, hi, _ = joint_limits(rpc)
         limits = (lo, hi)
-        if kind == "record":                     # 按这一对拖动标记定路径，用逆解收两端
+        if waypoint:
+            built, path_note, waypoint_path, start_q, found = build_waypoint_recording(rpc, direction, f_t_c, model, limits)
+        else:
             built, path_note, mark_path, start_q, found = build_recording(rpc, direction, load_marks(f_t_c), start,
                                                                           f_t_c, model, limits)
-            if built is None:
-                raise fm.MotionAborted("路径没定下来，没有运动：\n" + (path_note + "\n" if path_note else "")
-                                       + "\n".join(f"  {m}" for m in found))
-            segs, target = built, "这条录制的起点"
-        elif kind == "sync-test":
-            segs = fm.plan_sync_test(start["camera"], f_t_c, cfg)
-        else:
-            segs = fm.plan_sync_test(start["camera"], f_t_c, cfg)[:1]  # 只移到参考起点
-        pose, found = pose_note(name, segs, start["camera"], f_t_c)
-        moved = config_problem(current_pose(rec)[1], start_q, target)
-        found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits) + found
+        if built is None:
+            raise fm.MotionAborted("路径没定下来，没有运动：\n" + (path_note + "\n" if path_note else "")
+                                   + "\n".join(f"  {m}" for m in found))
+        segs = built
+        pose, found = ("", []) if waypoint else pose_note(direction, segs, start["camera"], f_t_c)
+        moved = config_problem(current_pose(rec)[1], start_q)
+        found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits, waypoint) + found
         if found:
             raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found)
                                    + ("\n（goto_start 走不通时，先手动拖到这条录制的起点附近再试）"
                                       if any(m.startswith("goto_start") for m in found) else ""))
-        cues = cue_plan(segs) if getattr(args, "cue", False) else {}
-        if getattr(args, "cue", False) and not cues:
-            raise fm.MotionAborted("--cue 只用于平移、旋转录制，没有运动")
-        header = (f"{name}：速度比例 {args.scale}，路径组 {PATH_SET}"
-                  + (f"，{CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB" if zed else "")
-                  + f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%"
+        header = (f"{direction}：速度比例 {args.scale}，路径组 {group}"
+                  f"，{CAMERA_FPS} fps，曝光 {EXPOSURE_US} μs，增益 {ANALOG_GAIN_MDB} mdB"
+                  f"\n{note}；WebApp 速度百分比应为 {WEBAPP_SPEED_PCT}%"
                   + (f"\n{path_note}" if path_note else "")
-                  + (f"\n{pose}" if pose else "")
-                  + ("\n有人走过（--cue）：运动前的静止段开始时提示进画面，运动结束时提示离开；"
-                     "两段同步摆动时画面里不能有人" if cues else ""))
-        confirm_plan(header + "\n" + describe(segs, totals=zed is not None), args.yes)
+                  + (f"\n{pose}" if pose else ""))
+        confirm_plan(header + "\n" + describe(segs), args.yes)
         ran = True
         runner.run(segs[0])                      # 从当前位姿移到录制起点（相机还没开始录）
         report_move(segs[0])
-        if zed:
-            zed.start()
-            zed.wait_grabbing(30.0)
-            for seg in segs[1:]:
-                print(f"[{seg.name}]", flush=True)
-                if seg.name in cues:
-                    cue(*cues[seg.name])
-                runner.run(seg)
-                if seg.kind == "move":
-                    report_move(seg)
+        zed.start()
+        zed.wait_grabbing(30.0)
+        for seg in segs[1:]:
+            print(f"[{seg.name}]", flush=True)
+            runner.run(seg)
+            if seg.kind == "move":
+                report_move(seg)
     except BaseException as exc:  # noqa: BLE001 - 包括 Ctrl+C：先停机械臂，再收尾
         error = f"{type(exc).__name__}: {exc}"
         if ran:
             fm.emergency_stop(ROBOT_IP)
         print(f"\n中止：{error}")
     finally:
-        if zed and zed.proc is not None:
+        if zed.proc is not None:
             zed.stop()
-        rec.stop(write=session_dir is not None and ran)
+        rec.stop(write=ran)
 
-    if session_dir is not None and not ran:
+    if not ran:
         if HANGUP_LOG.exists() and HANGUP_LOG.parent == session_dir:  # 断线日志留到 /tmp
             shutil.copy2(HANGUP_LOG, Path(tempfile.gettempdir()) / "run_session_hangup.log")
         shutil.rmtree(session_dir, ignore_errors=True)  # 没有运动，也没有录到任何东西
         return 1
-    if session_dir is None:
-        shutil.rmtree(data_dir, ignore_errors=True)
-        print("已到参考起点" if error is None else "")
-        return 0 if error is None else 1
 
-    zed_error = zed_failure(zed.info if zed else None, data_dir)
+    zed_error = zed_failure(zed.info, data_dir)
+    parameters = {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG", "GLASS_REGIONS", "PATH_SET"]}
+    parameters["PATH_SET"] = group
+    if waypoint:
+        parameters["GLASS_REGIONS"] = (HOLDOUT_WINDOW or {}).get("regions")
+        waypoint_path["legs"] = [leg_summary(s) for s in segs if s.name.startswith("leg_")]
     log = {
-        "kind": kind, "direction": direction, "tag": args.tag, "speed_scale": args.scale,
-        "cue": bool(getattr(args, "cue", False)),       # 有人走过：hold_before 开始时提示进画面，hold_after 开始时提示离开
+        "kind": "record", "direction": direction, "tag": args.tag, "speed_scale": args.scale,
         "error": "；".join(e for e in (error, zed_error) if e) or None,
-        "parameters": {k: globals()[k] for k in [*RANGES, "JOINT_MIN_DEG", "JOINT_MAX_DEG", "GLASS_REGIONS", "PATH_SET"]},
-        "mark_path": mark_path,                  # 这条录制的拖动标记、定出的路径和收两端的结果（fr5_limits）
+        "parameters": parameters,
+        "mark_path": mark_path,                  # fast2：这条录制的拖动标记、定出的路径和收两端的结果（fr5_limits）
+        "waypoint_path": waypoint_path,          # holdout1：路径表、到达点名字、选的摆动方向和每段的预计与实测
         "speed_model": dataclasses.asdict(model) if model else None,
         "start_pose": {k: start[k] for k in ("base_T_camera", "flange", "joints", "created")},
         "handeye_sha256": handeye["sha256"],
-        "zed_record": zed.info if zed else None,
+        "zed_record": zed.info,
         "segments": [segment_log(s) for s in segs],
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "paths_sha256": hashlib.sha256(Path(hp.__file__).read_bytes()).hexdigest(),
     }
     translate = next((s for s in segs if s.name == "translate"), None)
     if translate is not None and error is None:
@@ -895,6 +783,10 @@ def cmd_motion(args, kind: str, direction: str | None) -> int:
         log["rotate_speed"] = rotate_summary(rotate, args.scale)
     (data_dir / "motion_log.json").write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n数据目录：{session_dir}")
+    if waypoint:
+        for leg in waypoint_path["legs"]:
+            for text in leg["notes"]:
+                print(f"注意：{leg['name']} {text}")
     speed = log.get("translate_speed")
     if speed:
         print(f"平移实际速度 {speed['mean_mm_s']:.1f} mm/s（预计 {speed['expected_mm_s']:.1f}，设计 {speed['design_mm_s']:.1f}），"
@@ -1052,100 +944,18 @@ def cmd_speed_test(args) -> int:
     return 0
 
 
-def cmd_movec_test(args) -> int:
-    """MoveC 探测：起点上用 MoveC 和 MoveL 各绕光心竖直轴转 +θ、-2θ、+θ（θ = WIGGLE_DEG，同步摆动已走过的范围），
-    速度都是 SPEED_TEST_PCT。看 MoveC 是否被接受、光心是否不动、速度百分比和 MoveL 是否一样。不开相机，结果存 MOVEC_TEST。"""
-    model, note = load_speed_model()
-    if model is None:
-        print(note)
-        return 1
-    f_t_c, _ = gt.load_handeye(p(HANDEYE))
-    start = load_start()
-    segs = fm.plan_movec_test(start["camera"], f_t_c, motion_config(), SPEED_TEST_PCT)
-    error, ran = None, False
-    # 原始状态包存下来（结束时写一次），事后能逐包查速度和光心；没有运动就不留目录
-    state_dir = p(SESSIONS_DIR) / f"{dt.datetime.now():%Y%m%d_%H%M%S}_movec-test"
-    rec = StateRecorder(state_dir, ROBOT_IP)
-    try:
-        rec.start()
-        rpc = rec.open_rpc()
-        runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
-        runner.precheck()
-        moved = config_problem(current_pose(rec)[1], start["joints"], REFERENCE)
-        found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale,
-                                                            joint_limits(rpc)[:2])
-        if found:
-            raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
-        confirm_plan(f"movec-test：圆弧（MoveC）和直线（MoveL）各转 +{WIGGLE_DEG:g}°、-{2 * WIGGLE_DEG:g}°、+{WIGGLE_DEG:g}°，"
-                     f"速度都是 {SPEED_TEST_PCT}%（预计按摆动标定估算，超过 1.5 倍就中止；"
-                     f"圆弧时光心偏离超过 {fm.MAX_PIVOT_DEV_MM} mm 也中止）\n{note}\n只录机械臂状态，不开相机\n"
-                     + describe(segs, totals=False), args.yes)
-        ran = True
-        for seg in segs:
-            print(f"[{seg.name}]", flush=True)
-            runner.run(seg)
-            report_move(seg)
-    except BaseException as exc:  # noqa: BLE001 - 包括 Ctrl+C：先停机械臂
-        error = f"{type(exc).__name__}: {exc}"
-        if ran:
-            fm.emergency_stop(ROBOT_IP)
-        print(f"\n中止：{error}")
-    finally:
-        rec.stop(write=ran)
-        if not ran and state_dir.is_dir() and not any(state_dir.iterdir()):
-            state_dir.rmdir()
-    if not ran:
-        return 1
-
-    def stats(prefix):
-        done = [s for s in segs if s.name.startswith(prefix) and s.log.get("measured")]
-        rates = [k for k in (_per_pct(s, "angular_deg_s") for s in done) if k]
-        devs = [s.log["pivot_dev_max_mm"] for s in done if s.log.get("pivot_dev_max_mm") is not None]
-        return (float(np.median(rates)) if rates else None), (max(devs) if devs else None), len(done)
-
-    (rate_c, dev_c, n_c), (rate_l, dev_l, n_l) = stats("arc"), stats("line")
-    result = {"created": dt.datetime.now().isoformat(timespec="seconds"), "error": error,
-              "settings": {k: globals()[k] for k in (*CAL_KEYS, "SPEED_TEST_PCT")}, "speed_scale": args.scale,
-              "movec": {"segments_done": n_c, "deg_s_per_pct": rate_c, "pivot_dev_max_mm": dev_c},
-              "movel": {"segments_done": n_l, "deg_s_per_pct": rate_l, "pivot_dev_max_mm": dev_l},
-              "state_dir": str(state_dir), "segments": [segment_log(s) for s in segs]}
-    text = json.dumps(result, ensure_ascii=False, indent=2)
-    p(MOVEC_TEST).write_text(text, encoding="utf-8")
-    (state_dir / "movec_test.json").write_text(text, encoding="utf-8")
-    print(f"\n已保存 {p(MOVEC_TEST)}；原始状态在 {state_dir}/")
-
-    def fmt(v, spec):
-        return "—" if v is None else format(v, spec)
-
-    print(f"  MoveC：完成 {n_c}/3 段，1% = {fmt(rate_c, '.3f')} °/s，光心最大偏离 {fmt(dev_c, '.2f')} mm")
-    print(f"  MoveL：完成 {n_l}/3 段，1% = {fmt(rate_l, '.3f')} °/s，光心最大偏离 {fmt(dev_l, '.2f')} mm"
-          f"（摆动标定 1% = {model.wiggle_deg_s_per_pct:.3f} °/s）")
-    if rate_c and rate_l and abs(rate_c / rate_l - 1.0) > MAX_SPEED_ERROR:
-        print(f"  注意：MoveC 和 MoveL 同样百分比下角速度差 {rate_c / rate_l - 1.0:+.0%}，旋转录制的速度要另行换算")
-    return 0 if error is None else 1
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("set-start")
-    mark = sub.add_parser("mark")
-    mark.add_argument("direction", choices=fl.MARK_NAMES, help="拖到的是哪个方向的极限")
-    sub.add_parser("limits")
     plan = sub.add_parser("plan")
-    plan.add_argument("names", nargs="*", help="要检查的录制，默认 " + " ".join(fl.RECORDINGS) + " 和 sync-test")
-    for name in ("goto-start", "speed-test", "sync-test"):
-        sub.add_parser(name)
-    sub.add_parser("movec-test")
+    plan.add_argument("names", nargs="*", help="要检查的录制，默认全部 holdout1 路径；可选 " + " ".join(RECORD_NAMES))
+    sub.add_parser("speed-test")
     record = sub.add_parser("record")
-    record.add_argument("direction", choices=RECORD_NAMES)
-    record.add_argument("--cue", action="store_true",
-                        help="录有人走过的数据：运动前的静止段开始时提示进画面，运动结束时提示离开（声音 + 终端）")
-    sub.add_parser("cue-test")
+    record.add_argument("direction", choices=RECORD_NAMES, metavar="名称", help=" ".join(RECORD_NAMES))
     for sp in sub.choices.values():
-        sp.add_argument("--scale", type=float, default=1.0, help="速度比例 (0, 1]，首次运行建议 0.25")
+        sp.add_argument("--scale", type=float, default=1.0, help="速度比例 (0, 1]，首次运行建议 0.2")
         sp.add_argument("--yes", action="store_true", help="跳过确认")
-        sp.add_argument("--tag", default="", help="加在录制目录名后面的标签，例如 board（标定板验证）")
+        sp.add_argument("--tag", default="", help="加在录制目录名后面的标签：board、rehearsal、sceneA/B/C")
     args = parser.parse_args(argv)
     if not 0 < args.scale <= 1:
         parser.error("--scale 必须在 (0, 1] 之间")
@@ -1153,14 +963,6 @@ def main(argv=None) -> int:
         parser.error("--tag 只能用字母、数字和 -，最多 20 个字符")
     signal.signal(signal.SIGHUP, _on_hangup)
     signal.signal(signal.SIGTERM, _on_hangup)
-    if args.command == "set-start":
-        return cmd_set_start(args)
-    if args.command == "mark":
-        return cmd_mark(args)
-    if args.command == "limits":
-        return cmd_limits(args)
-    if args.command == "cue-test":
-        return cmd_cue_test(args)
     problems = parameter_problems()
     if args.command == "plan":
         return cmd_plan(args, problems)
@@ -1169,9 +971,7 @@ def main(argv=None) -> int:
         return 1
     if args.command == "speed-test":
         return cmd_speed_test(args)
-    if args.command == "movec-test":
-        return cmd_movec_test(args)
-    return cmd_motion(args, args.command, getattr(args, "direction", None))
+    return cmd_motion(args, args.direction)
 
 
 def main_synced(argv=None) -> int:

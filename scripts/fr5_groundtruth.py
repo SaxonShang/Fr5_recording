@@ -108,6 +108,13 @@ END_POSE_CORRECTION = {
     },
 }
 
+# holdout1（多段路径）：Δt 只用两段同步摆动估（主体转动会把 Δt 带偏 0.5–3.1 ms）；不用行程、转角系数和端点修正，
+# 改按路径点修正。修正表 waypoint_corrections.json 由 end_pose_fit.py --write 生成，放在本文件旁边。
+WIGGLE_ONLY_PATH_SETS = {"holdout1"}
+WIGGLE_WINDOW_MARGIN_MS = 400.0      # 同步摆动段前后各放宽这么多
+WAYPOINT_CORRECTIONS = Path(__file__).resolve().parent / "waypoint_corrections.json"
+WAYPOINT_SOURCE = "waypoint_corrections.json"
+
 ARM_COLUMNS = ["box_realtime_ns", "ctrl_unix_ms", "x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg",
                "robot_state", "main_code", "sub_code", "tool", "user"]
 
@@ -580,6 +587,105 @@ def apply_end_pose_correction(pos: np.ndarray, quat: np.ndarray, s: np.ndarray, 
     return p, q
 
 
+def delta_to_matrix(d) -> np.ndarray:
+    """[rx, ry, rz（转动向量，°）, tx, ty, tz（mm）] → 4×4。"""
+    t = np.eye(4)
+    t[:3, :3] = quat_to_matrix(rotvec_to_quat(np.radians(np.asarray(d[:3], dtype=float))))
+    t[:3, 3] = np.asarray(d[3:], dtype=float) / 1000.0
+    return t
+
+
+def matrix_to_delta(t: np.ndarray) -> np.ndarray:
+    """4×4 → [rx, ry, rz（转动向量，°）, tx, ty, tz（mm）]。"""
+    return np.r_[np.degrees(quat_to_rotvec(matrix_to_quat(t[:3, :3]))), t[:3, 3] * 1000.0]
+
+
+def wiggle_windows_ms(log: dict) -> list[tuple[float, float]]:
+    """开头、结尾两段同步摆动的时间窗（Box 时间 ms，前后各放宽 WIGGLE_WINDOW_MARGIN_MS）。"""
+    out = []
+    for prefix in ("wiggle_start_", "wiggle_end_"):
+        sel = [s for s in log.get("segments", []) if s["name"].startswith(prefix) and s.get("start_box_ns") and s.get("end_box_ns")]
+        if sel:
+            out.append((min(s["start_box_ns"] for s in sel) / 1e6 - WIGGLE_WINDOW_MARGIN_MS,
+                        max(s["end_box_ns"] for s in sel) / 1e6 + WIGGLE_WINDOW_MARGIN_MS))
+    return out
+
+
+def waypoint_correction(session: Path, enabled: bool = True) -> dict:
+    """多段路径的路径点修正：每段的法兰起止位姿、时间，到达点的名字和（查到时）每个路径点的 ΔT。
+    source：not_applicable（不是多段路径）、none（这条路径不做修正）、disabled、missing（表里没有）、WAYPOINT_SOURCE。"""
+    path = session / "motion_log.json"
+    log = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    way = log.get("waypoint_path")
+    if log.get("kind") != "record" or not way:
+        return {"source": "not_applicable"}
+    segs = log.get("segments", [])
+    prev = next(s for s in segs if s["name"] == "goto_start")["flange"]
+    legs = []
+    for s in segs:
+        if s["name"].startswith("leg_") and s.get("start_box_ns"):
+            legs.append({"name": s["name"], "motion": s["motion"], "start_flange": [float(v) for v in prev],
+                         "end_flange": [float(v) for v in s["flange"]],
+                         "axis_base": [float(v) for v in s["arc_axis"]] if s.get("arc_axis") else None,
+                         "start_ms": s["start_box_ns"] / 1e6,
+                         "end_ms": s["end_box_ns"] / 1e6 if s.get("end_box_ns") else None})
+            prev = s["flange"]
+    group, key = path_set(log), way.get("correction_key")
+    info = {"path_set": group, "path": log.get("direction"), "correction_key": key, "labels": way["labels"][:len(legs) + 1],
+            "legs": legs, "boundaries_ms": [(a["end_ms"] + b["start_ms"]) / 2.0 for a, b in zip(legs[:-1], legs[1:])]}
+    if key is None or not legs:
+        return {"source": "none", **info}
+    if not enabled:
+        return {"source": "disabled", **info}
+    table = json.loads(WAYPOINT_CORRECTIONS.read_text(encoding="utf-8")) if WAYPOINT_CORRECTIONS.exists() else {}
+    entry = table.get(group, {}).get(key)
+    if entry is None or any(label not in entry["deltas"] for label in info["labels"][1:]):
+        return {"source": "missing", **info}
+    return {"source": WAYPOINT_SOURCE, "fitted_from": entry.get("fitted_from"), "fitted_at": entry.get("fitted_at"),
+            "deltas": [[0.0] * 6] + [[float(v) for v in entry["deltas"][label]] for label in info["labels"][1:]], **info}
+
+
+def waypoint_progress(box_ms: np.ndarray, pos: np.ndarray, quat: np.ndarray, info: dict) -> tuple[np.ndarray, np.ndarray]:
+    """每个样本属于第几段（0 起）和段内进度 s。段与段的分界在两段之间停留的中点；这段开始前 s = 0，到位后 s = 1。
+    MoveL（含组合段）按法兰在弦上的投影，MoveC 按绕转轴转过的比例；box_ms 是样本的 Box 时间。"""
+    k = np.searchsorted(np.array(info["boundaries_ms"], dtype=float), box_ms)
+    s = np.zeros(len(box_ms))
+    for j, leg in enumerate(info["legs"]):
+        sel = k == j
+        if not sel.any():
+            continue
+        f0, f1 = leg["start_flange"], leg["end_flange"]
+        if leg["motion"] == "C":
+            q0, q1 = (matrix_to_quat(euler_to_matrix(f[3], f[4], f[5])) for f in (f0, f1))
+            axis = np.array(leg["axis_base"]) / np.linalg.norm(leg["axis_base"])
+            turned = lambda q: quat_to_rotvec(quat_mul(q, quat_conj(np.broadcast_to(q0, q.shape)))) @ axis   # noqa: E731
+            s[sel] = turned(quat[sel]) / turned(q1[None])[0]
+        else:
+            p0, p1 = np.array(f0[:3]) / 1000.0, np.array(f1[:3]) / 1000.0
+            s[sel] = (pos[sel] - p0) @ (p1 - p0) / float((p1 - p0) @ (p1 - p0))
+        if leg["start_ms"] is not None:
+            s[sel & (box_ms < leg["start_ms"])] = 0.0
+        if leg["end_ms"] is not None:
+            s[sel & (box_ms > leg["end_ms"])] = 1.0
+    return k, np.clip(s, 0.0, 1.0)
+
+
+def apply_waypoint_correction(pos: np.ndarray, quat: np.ndarray, k: np.ndarray, s: np.ndarray, info: dict) -> tuple[np.ndarray, np.ndarray]:
+    """第 k 段的样本左乘 exp(s·log(ΔT_{k+1} ΔT_k⁻¹)) ΔT_k（基坐标系）。只有一段时就是 exp(s·log ΔT_1)，和端点修正相同。"""
+    p, q = pos.copy(), quat.copy()
+    for j in range(len(info["legs"])):
+        sel = k == j
+        if not sel.any():
+            continue
+        a, b = info["deltas"][j], info["deltas"][j + 1]
+        p_j, q_j, step = p[sel], q[sel], b
+        if any(a):
+            p_j, q_j = apply_end_pose_correction(p_j, q_j, np.ones(len(p_j)), {"source": "END_POSE_CORRECTION", "delta_rotvec_deg_mm": a})
+            step = matrix_to_delta(delta_to_matrix(b) @ np.linalg.inv(delta_to_matrix(a))).tolist()
+        p[sel], q[sel] = apply_end_pose_correction(p_j, q_j, s[sel], {"source": "END_POSE_CORRECTION", "delta_rotvec_deg_mm": step})
+    return p, q
+
+
 def write_tum(path: Path, t_ms, pos, quat) -> None:
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("# timestamp tx ty tz qx qy qz qw  (Unix s, m; left camera in FR5 base frame)\n")
@@ -654,17 +760,30 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
         if w_arm.max(initial=0) < MIN_MOTION_DEG_S:
             raise ValueError(f"机械臂最大角速度只有 {w_arm.max(initial=0):.1f} °/s，无法估计 Δt；"
                              "录制里加同步摆动，或用 --dt-ms 手动给定")
-        lag = estimate_lag(t_imu, g, t_w, w_arm, max_lag_ms)
-        lag["source"] = "gyro cross-correlation"
+        log_path = session / "motion_log.json"
+        motion_log = json.loads(log_path.read_text(encoding="utf-8")) if log_path.exists() else {}
+        windows = wiggle_windows_ms(motion_log) if path_set(motion_log) in WIGGLE_ONLY_PATH_SETS else []
+        if path_set(motion_log) in WIGGLE_ONLY_PATH_SETS and len(windows) < 2:
+            warnings.append(f"路径组 {path_set(motion_log)} 应该只用两段同步摆动估 Δt，但只找到 {len(windows)} 段")
+        if windows:
+            use = np.any([(t_imu >= a) & (t_imu <= b) for a, b in windows], axis=0)
+            lag = estimate_lag(t_imu[use], g[use], t_w, w_arm, max_lag_ms)
+            lag["source"] = "gyro cross-correlation (wiggle only)"
+            lag["windows_ms"] = [list(w) for w in windows]
+        else:
+            lag = estimate_lag(t_imu, g, t_w, w_arm, max_lag_ms)
+            lag["source"] = "gyro cross-correlation"
         if lag["at_search_edge"]:
             warnings.append("Δt 落在搜索范围边缘，增大 --max-lag-ms 再试")
         if not lag["peak_corr"] >= MIN_PEAK_CORR:
             warnings.append(f"Δt 互相关峰值只有 {lag['peak_corr']:.3f}，同步可能不可靠")
-        # 前后两段分别估计，检查漂移拟合
+        # 前后两段分别估计，检查漂移拟合（只用同步摆动时就是两段摆动各估一次）
         lo, hi = max(t_imu[0], t_w[0]), min(t_imu[-1], t_w[-1])
+        spans = {"first_40pct": (lo, lo + 0.4 * (hi - lo)), "last_40pct": (hi - 0.4 * (hi - lo), hi)}
+        if len(windows) == 2:
+            spans = dict(zip(("first_wiggle", "last_wiggle"), windows))
         segments = {}
-        for name, (a, b) in {"first_40pct": (lo, lo + 0.4 * (hi - lo)),
-                             "last_40pct": (hi - 0.4 * (hi - lo), hi)}.items():
+        for name, (a, b) in spans.items():
             sel_w = (t_w >= a) & (t_w <= b)
             sel_i = (t_imu >= a) & (t_imu <= b)
             if (hi - lo) >= MIN_SPLIT_S * 1000.0 and w_arm[sel_w].max(initial=0) >= MIN_MOTION_DEG_S:
@@ -672,7 +791,8 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
                                               min(max_lag_ms, 50.0) + abs(lag["dt_ms"]))
         lag["segments"] = segments
         if len(segments) == 2:
-            diff = abs(segments["first_40pct"]["dt_ms"] - segments["last_40pct"]["dt_ms"])
+            first, last = segments.values()
+            diff = abs(first["dt_ms"] - last["dt_ms"])
             lag["segment_diff_ms"] = diff
             if diff > MAX_SEGMENT_LAG_DIFF_MS:
                 warnings.append(f"前后两段的 Δt 相差 {diff:.1f} ms，时钟漂移拟合可能不准")
@@ -703,6 +823,13 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
     if endfix["source"] == "END_POSE_CORRECTION":
         pos_c, quat_c = apply_end_pose_correction(pos_c, quat_c, end_pose_progress(pos, quat, endfix, flange_t_cam),
                                                   endfix)
+    wayfix = waypoint_correction(session, end_correction)
+    if wayfix["source"] == WAYPOINT_SOURCE:
+        k_leg, s_leg = waypoint_progress(t_arm, pos, quat, wayfix)
+        pos_c, quat_c = apply_waypoint_correction(pos_c, quat_c, k_leg, s_leg, wayfix)
+    elif wayfix["source"] == "missing":
+        warnings.append(f"路径组 {wayfix['path_set']} 的 {wayfix['correction_key']} 在 {WAYPOINT_CORRECTIONS.name} 里还没有路径点修正，"
+                        "真值没有修正（end_pose_fit.py --write）")
 
     # 4. 真值（t_arm_cam 对齐陀螺仪，t_arm_img 再对齐到图像）
     output.mkdir(parents=True, exist_ok=True)
@@ -768,6 +895,10 @@ def process(session: Path, handeye_path: Path, output: Path, max_lag_ms: float =
             "假设 ZED 图像与 IMU 在同一时钟上、image_sync_trigger 正确标出采集期间，且相机安装自手眼标定后没有变动。",
         ],
     }
+    if wayfix["source"] != "not_applicable":
+        report["waypoint_correction"] = wayfix
+        report["conventions"].append("有 waypoint_correction 时，第 k 段的法兰位姿左乘 exp(s·log(ΔT_{k+1} ΔT_k⁻¹)) ΔT_k（基坐标系），"
+                                     "ΔT_k = deltas[k]（转动向量 °、平移 mm），s 是段内进度。")
     (output / "groundtruth_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2),
                                                     encoding="utf-8")
     return report
@@ -791,7 +922,7 @@ def main(argv=None) -> int:
     parser.add_argument("--rotation-scale-factor", type=float,
                         help="转角放大系数，默认按录制方向取 ROTATION_SCALE；1 表示不放大")
     parser.add_argument("--no-end-correction", action="store_true",
-                        help="不加 END_POSE_CORRECTION 的端点位姿修正（end_pose_fit.py 拟合时用）")
+                        help="不加端点位姿修正和路径点修正（end_pose_fit.py 拟合时用）")
     args = parser.parse_args(argv)
     session = args.session.expanduser()
     try:
@@ -815,7 +946,8 @@ def main(argv=None) -> int:
     print(f"修正：取真值的时刻再晚 {tc['applied_ms']:+.2f} ms（{tc['source']}）；"
           + (f"行程 ×{sc['factor']:.4f}（{sc['direction']}，{sc['source']}）" if sc["factor"] != 1.0 else "行程不缩放")
           + (f"；转角 ×{rc['factor']:.4f}（{rc['direction']}，{rc['source']}）" if rc["factor"] != 1.0 else "；转角不放大")
-          + ("；端点位姿修正" if report["end_pose_correction"]["source"] == "END_POSE_CORRECTION" else ""))
+          + ("；端点位姿修正" if report["end_pose_correction"]["source"] == "END_POSE_CORRECTION" else "")
+          + ("；路径点修正" if report.get("waypoint_correction", {}).get("source") == WAYPOINT_SOURCE else ""))
     dup = f"，重复时间戳 {imgs['duplicate_timestamp']} 张已去掉" if imgs["duplicate_timestamp"] else ""
     print(f"图像 {imgs['total']} 张，有真值 {imgs['with_groundtruth']} 张{dup}")
     for w in report["warnings"]:

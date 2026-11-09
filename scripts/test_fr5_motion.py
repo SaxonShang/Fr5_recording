@@ -23,8 +23,14 @@ F_T_C = np.array([[0.999660953447201, 0.0007843776424874251, 0.02602619650942236
                   [0.0, 0.0, 0.0, 1.0]])
 NOW = fm.fr5_to_matrix([484.963, -506.674, 490.858, -90.545, 0.0, -105.264]) @ F_T_C  # 10-10 的相机位姿
 CFG = fm.MotionConfig(speed_mps=0.05, hold_start_s=5, hold_mid_s=3, hold_end_s=5,
-                      wiggle_deg=10, wiggle_deg_s=20, wiggle_cycles=2, reposition_mps=0.05, sync_test_hold_s=10)
+                      wiggle_deg=10, wiggle_deg_s=20, wiggle_cycles=2, reposition_mps=0.05)
 MODEL = fm.SpeedModel(mm_s_per_pct=1.0, wiggle_deg_s_per_pct=0.5, ramp_s=0.3, calibrated=True)
+
+
+def _wiggle_only(centre, cfg=CFG, f_t_c=F_T_C):
+    """移到起点 + 一段同步摆动。"""
+    return ([fm._move("goto_start", centre, f_t_c, cfg.reposition_mps * 1000.0, recorded=False)]
+            + fm._wiggle("wiggle_start", centre, f_t_c, cfg, cfg.translation_wiggle_side))
 
 
 def _wrap(a):
@@ -126,7 +132,7 @@ class PlanTest(unittest.TestCase):
 
     def test_speed_percent_from_model(self):
         flange0 = self.centre @ np.linalg.inv(F_T_C)            # 已经在起点
-        segs = fm.plan_sync_test(self.centre, F_T_C, CFG)
+        segs = _wiggle_only(self.centre)
         fm.fill_geometry(segs, flange0)
         self.assertEqual(fm.apply_speed(segs, MODEL, 0.5), [])
         wiggles = [s for s in segs if s.name.startswith("wiggle")]
@@ -357,7 +363,7 @@ class PlanTest(unittest.TestCase):
                     self.assertTrue(-1e-9 <= heading <= cfg.wiggle_deg + 1e-9, (s.name, heading))
                     np.testing.assert_allclose(s.camera[:3, 3], base[:3, 3], atol=1e-12)
                 self.assertLess(fm.rotation_deg(wig[-1].camera, base), 1e-9)
-        sync = [s for s in fm.plan_sync_test(c, F_T_C, cfg) if s.name.startswith("wiggle")]
+        sync = [s for s in _wiggle_only(c, cfg) if s.name.startswith("wiggle")]
         self.assertTrue(all(np.degrees(np.arctan2(-(c[:3, :3].T @ s.camera[:3, 2])[0], (c[:3, :3].T @ s.camera[:3, 2])[2]))
                             >= -1e-9 for s in sync))
 
@@ -396,22 +402,6 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(fm.joint_speed_problems([tr], 1.5 * w, accel))           # 加速很快：终点前仍是满速
         slow = dataclasses.replace(MODEL, accel_mm_s2=20.0)                     # 最后 5 mm 处速度 √(2·20·5) ≈ 14 mm/s
         self.assertEqual(fm.joint_speed_problems([tr], 1.5 * w, slow), [])
-
-    def test_movec_test_plan(self):
-        segs = fm.plan_movec_test(self.centre, F_T_C, CFG, 5.0)
-        flange0 = self.centre @ np.linalg.inv(F_T_C)
-        fm.fill_geometry(segs, flange0)
-        self.assertEqual(fm.apply_speed(segs, MODEL, 1.0), [])
-        arcs = [s for s in segs if s.name.startswith("arc")]
-        lines = [s for s in segs if s.name.startswith("line")]
-        self.assertEqual([s.motion for s in arcs + lines], ["C"] * 3 + ["L"] * 3)
-        for group in (arcs, lines):
-            self.assertEqual([round(s.angle_deg, 6) for s in group], [10.0, 20.0, 10.0])
-            self.assertLess(fm.rotation_deg(group[-1].camera, self.centre), 1e-9)
-        for s in arcs + lines:
-            self.assertEqual(s.percent, 5.0)
-            self.assertAlmostEqual(s.expect_deg_s, 2.5)             # 5% × 0.5 °/s/%，超速保护用
-            np.testing.assert_allclose(s.pivot, self.centre[:3, 3], atol=1e-12)
 
 
 def _trapezoid(distance, v, a, dt=0.01):
@@ -844,7 +834,7 @@ class ParametersTest(unittest.TestCase):
         f_t_c, _ = gt.load_handeye(here / "handeye_s003_result.json")
         start = np.array(json.loads((here / "start_pose.json").read_text(encoding="utf-8"))["base_T_camera"])
         cfg = rs.motion_config()
-        note, found = rs.pose_note("sync-test", fm.plan_sync_test(start, f_t_c, cfg), start, f_t_c)
+        note, found = rs.pose_note("wiggle", _wiggle_only(start, cfg, f_t_c), start, f_t_c)
         self.assertEqual(found, [])
         self.assertIn("玻璃窗最近", note)
         up = np.array([0, 0, 1.0])

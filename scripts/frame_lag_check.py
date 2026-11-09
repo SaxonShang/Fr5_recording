@@ -12,6 +12,9 @@
 
     python frame_lag_check.py <save_data 目录> [<save_data 目录> ...]
 
+重复纹理的场景（S 形场景 C）光流法不可靠，加 --method framediff：相邻两帧的平均灰度差正比于转动速度，和陀螺仪同一帧间隔内的
+平均角速度大小做相关，找相关最大的时间平移。这个方法看的是时序，相位和曝光略有偏差：正常约 −7～−2 ms，晚一帧约 +29 ms。
+
 需要 save_data 里的 img_timeline.csv、left/、zed_imu.csv；有 motion_log.json 时只用同步摆动段（前后各放宽 0.3 s），
 没有时用陀螺仪角速度超过 MIN_GYRO_DEG_S 的帧。结果写进 save_data/frame_lag_report.json。有异常时退出码为 1。
 """
@@ -39,6 +42,9 @@ MAX_FEATURES, MIN_INLIERS = 400, 30
 SCAN_MS, SCAN_STEP_MS = 150.0, 0.5
 MIN_PAIRS = 40                  # 可用的相邻帧对少于这么多就不下结论
 LAG_OK_MS = 20.0                # |延迟| 超过它就算异常（正常约 0 ms，晚一帧约 +66.7 ms）
+FRAMEDIFF_SIZE = (480, 270)     # 帧差法把图像缩到这么大
+FRAMEDIFF_SCAN_MS = 70.0
+FRAMEDIFF_MIN_CORR = 0.95       # 帧差法的相关系数低于它就不下结论
 
 
 def read_gray(path: Path) -> np.ndarray:
@@ -101,7 +107,52 @@ def wiggle_windows(save_data: Path, t_img: np.ndarray, gyro_mean) -> tuple[np.nd
     return rate > MIN_GYRO_DEG_S, "gyro"
 
 
-def check(save_data: Path, camera_yaml: Path = CAMERA_YAML, output: Path | None = None) -> dict:
+def framediff_result(rows: list[dict], t_img: np.ndarray, period: float, use: np.ndarray, gyro_mean, save_data: Path) -> dict:
+    """帧差法：字段和光流法相同（rms 是陀螺角速度对帧差做线性回归的残差，°/s），多 method 和 peak_corr。"""
+    diff, start, end = [], [], []
+    prev, prev_t = None, None
+    for i, r in enumerate(rows):
+        if not use[i]:
+            prev = None
+            continue
+        raw = cv2.imdecode(np.fromfile(save_data / r["filename_left"], np.uint8), cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            raise FileNotFoundError(save_data / r["filename_left"])
+        image = cv2.resize(raw, FRAMEDIFF_SIZE, interpolation=cv2.INTER_AREA).astype(np.float32)
+        if prev is not None and 0.5 * period < t_img[i] - prev_t < 1.5 * period:     # 中间丢了帧的不用
+            diff.append(float(np.abs(image - prev).mean()))
+            start.append(prev_t)
+            end.append(t_img[i])
+        prev, prev_t = image, t_img[i]
+    diff, start, end = map(np.array, (diff, start, end))
+    out = {"method": "framediff", "pairs": int(len(diff))}
+    if len(diff) < MIN_PAIRS:
+        return {**out, "ok": False, "verdict": f"可用的相邻帧对只有 {len(diff)} 对（至少 {MIN_PAIRS}），没法判断"}
+    shifts = np.arange(-FRAMEDIFF_SCAN_MS, FRAMEDIFF_SCAN_MS + SCAN_STEP_MS / 2, SCAN_STEP_MS)
+    corr, rms = [], []
+    for s in shifts:
+        w = gyro_mean(start - s, end - s)
+        corr.append(float(np.corrcoef(diff, w)[0, 1]))
+        rms.append(float(np.sqrt(np.mean((w - np.polyval(np.polyfit(diff, w, 1), diff)) ** 2))))
+    corr, rms = np.array(corr), np.array(rms)
+    i = int(np.argmax(corr))
+    lag = float(shifts[i])
+    if 0 < i < len(shifts) - 1:                                   # 抛物线细化
+        a, b, c = corr[i - 1], corr[i], corr[i + 1]
+        if a - 2 * b + c < 0:
+            lag += float(0.5 * (a - c) / (a - 2 * b + c) * SCAN_STEP_MS)
+    frames_late = int(round(lag / period))
+    ok = bool(abs(lag) <= LAG_OK_MS and corr[i] >= FRAMEDIFF_MIN_CORR)
+    verdict = ("正常" if ok else f"相关系数 {corr[i]:.3f} 太低，没法判断" if corr[i] < FRAMEDIFF_MIN_CORR
+               else f"图像比时间戳晚约 {frames_late} 帧" if frames_late else "图像和时间戳错位")
+    return {**out, "lag_ms": lag, "frames_late": frames_late, "ok": ok, "at_scan_edge": i in (0, len(shifts) - 1),
+            "peak_corr": float(corr[i]),
+            "rms_deg_s": {"at_0": float(np.interp(0.0, shifts, rms)), "at_best": float(rms[i]),
+                          "at_plus_one_frame": float(np.interp(period, shifts, rms))},
+            "verdict": verdict, "shifts_ms": shifts.round(2).tolist(), "rms_curve_deg_s": rms.round(4).tolist()}
+
+
+def check(save_data: Path, camera_yaml: Path = CAMERA_YAML, output: Path | None = None, method: str = "flow") -> dict:
     k = load_camera(camera_yaml)
     k[:2] *= SCALE
     with open(save_data / "img_timeline.csv", newline="", encoding="utf-8") as f:
@@ -113,6 +164,13 @@ def check(save_data: Path, camera_yaml: Path = CAMERA_YAML, output: Path | None 
     t_imu, gyro, _ = gt.load_imu(save_data / "zed_imu.csv")
     gyro_mean = gyro_interval_mean(t_imu, np.linalg.norm(gyro, axis=1))
     use, source = wiggle_windows(save_data, t_img, gyro_mean)
+    if method == "framediff":
+        result = {"session": str(save_data), "camera_yaml": str(camera_yaml), "frame_period_ms": period, "window_source": source,
+                  **framediff_result(rows, t_img, period, use, gyro_mean, save_data)}
+        out = output or save_data
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "frame_lag_report.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
 
     t_mid, half, w_img = [], [], []
     prev, prev_t = None, None
@@ -163,6 +221,9 @@ def summary(r: dict) -> str:
     if "lag_ms" not in r:
         return f"{r['session']}：{r['verdict']}"
     rms = r["rms_deg_s"]
+    if r.get("method") == "framediff":
+        return (f"{r['session']}：{r['verdict']}。帧差法，{r['pairs']} 对相邻帧，图像比时间戳晚 {r['lag_ms']:+.1f} ms 时和陀螺仪最一致"
+                f"（相关系数 {r['peak_corr']:.3f}，帧间隔 {r['frame_period_ms']:.1f} ms）" + ("；落在扫描边缘" if r["at_scan_edge"] else ""))
     return (f"{r['session']}：{r['verdict']}。{r['pairs']} 对相邻帧（{'同步摆动段' if r['window_source'] == 'motion_log' else '陀螺仪在转的帧'}），"
             f"图像比时间戳晚 {r['lag_ms']:+.1f} ms 时和陀螺仪最一致（帧间隔 {r['frame_period_ms']:.1f} ms）；"
             f"角速度差 RMS：0 ms 处 {rms['at_0']:.2f}、最佳 {rms['at_best']:.2f}、晚一帧处 {rms['at_plus_one_frame']:.2f} °/s"
@@ -173,11 +234,12 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("save_data", type=Path, nargs="+", help="录制的 save_data 目录（可以给多个）")
     parser.add_argument("--camera", type=Path, help=f"内参，默认 {CAMERA_YAML.name}（同目录）")
+    parser.add_argument("--method", choices=("flow", "framediff"), default="flow", help="flow：光流；framediff：帧差（重复纹理的场景用）")
     args = parser.parse_args(argv)
     bad = 0
     for sd in args.save_data:
         try:
-            r = check(sd, args.camera or CAMERA_YAML)
+            r = check(sd, args.camera or CAMERA_YAML, method=args.method)
         except (OSError, ValueError, KeyError) as exc:
             print(f"{sd}：失败：{exc}")
             bad += 1
