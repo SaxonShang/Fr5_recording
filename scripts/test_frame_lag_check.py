@@ -95,11 +95,11 @@ class FrameLagTest(unittest.TestCase):
     def setUp(self):
         self.k = fl.load_camera(fl.CAMERA_YAML)
 
-    def _check(self, **kw) -> dict:
+    def _check(self, method: str = "flow", **kw) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             write_session(d, self.k, **kw)
-            r = fl.check(d)
+            r = fl.check(d, method=method)
             print("\n" + fl.summary(r))
             self.assertTrue((d / "frame_lag_report.json").exists())
             return r
@@ -119,6 +119,24 @@ class FrameLagTest(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertEqual(r["frames_late"], 1)
         self.assertIn("晚约 1 帧", r["verdict"])
+
+    def test_framediff_aligned(self):
+        r = self._check(method="framediff")
+        self.assertEqual(r["method"], "framediff")
+        self.assertEqual(r["window_source"], "motion_log")
+        self.assertEqual(r["frames_late"], 0)
+        self.assertFalse(r["at_scan_edge"])
+        self.assertLess(abs(r["lag_ms"]), fl.LAG_OK_MS)
+        for key in ("lag_ms", "ok", "verdict", "rms_deg_s", "shifts_ms", "rms_curve_deg_s", "peak_corr"):
+            self.assertIn(key, r)
+
+    def test_framediff_one_frame_late(self):
+        r = self._check(method="framediff", frames_late=1)
+        self.assertEqual(r["frames_late"], 1)
+        self.assertFalse(r["ok"])
+
+    def test_flow_report_has_no_method_field(self):
+        self.assertNotIn("method", self._check())
 
     def test_without_motion_log_uses_gyro(self):
         r = self._check(frames_late=1, motion_log=False)

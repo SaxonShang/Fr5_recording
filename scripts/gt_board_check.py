@@ -372,7 +372,8 @@ def acceptance(r: dict) -> dict:
               "moving_max_mm": (moving.get("max_mm"), ACCEPT_MOVING_MAX_MM),
               "moving_rotation_rms_deg": (rot["moving_rms"], ACCEPT_MOVING_ROT_RMS_DEG),
               "time_residual_ms": (abs(scan["best_delta_ms"]) if scan and not scan["at_edge"] else None, ACCEPT_TIME_MS)}
-    items = {k: {"value": v, "limit": lim, "ok": v is not None and v <= lim} for k, (v, lim) in values.items()}
+    items = {k: {"value": None if v is None else float(v), "limit": lim, "ok": v is not None and bool(v <= lim)}
+             for k, (v, lim) in values.items()}
     return {"items": items, "passed": all(i["ok"] for i in items.values())}
 
 

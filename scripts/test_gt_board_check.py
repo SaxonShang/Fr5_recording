@@ -182,6 +182,29 @@ class BoardCheckTest(unittest.TestCase):
                 segs = {row["segment"] for row in csv.DictReader(f)}
             self.assertEqual(segs, {"", "wiggle_start_1", "rotate"})
 
+    def test_waypoint_legs_and_acceptance(self):
+        """多段路径：leg_* 不进时间扫描，静止组只和第 0 组比，报告里有验收结果（真值故意晚 4 ms，时间残差不过）。"""
+        segments = [("wiggle_start_1", 0.8, 2.8), ("leg_1", 3.3, 4.3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._run(Path(tmp), segments=segments)
+        self.assertEqual([p["groups"] for p in r["static_group_pairs"]], [[0, 1], [0, 2]])
+        self.assertEqual(r["time_scan"]["frame_selection"], "motion_log")
+        items = r["acceptance"]["items"]
+        self.assertTrue(items["waypoint_board_mm"]["ok"])
+        self.assertFalse(items["time_residual_ms"]["ok"])
+        self.assertFalse(r["acceptance"]["passed"])
+        self.assertIn("带板验收", bc.summary(r))
+
+    def test_acceptance_thresholds(self):
+        good = {"static_group_pairs": [{"board_diff_mm": 0.9, "board_diff_deg": 0.09}], "moving": {"rms_mm": 2.4, "max_mm": 4.9},
+                "rotation_deg": {"moving_rms": 0.19}, "time_scan": {"best_delta_ms": -1.4, "at_edge": False}}
+        self.assertTrue(bc.acceptance(good)["passed"])
+        for key, change in (("static_group_pairs", [{"board_diff_mm": 1.1, "board_diff_deg": 0.0}]), ("moving", {"rms_mm": 2.6, "max_mm": 1.0}),
+                            ("moving", {"rms_mm": 1.0, "max_mm": 5.1}), ("rotation_deg", {"moving_rms": 0.21}),
+                            ("time_scan", {"best_delta_ms": 1.6, "at_edge": False}), ("time_scan", {"best_delta_ms": 0.0, "at_edge": True}),
+                            ("time_scan", None)):
+            self.assertFalse(bc.acceptance({**good, key: change})["passed"], (key, change))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,7 @@ flange = camera · (flange_T_camera)⁻¹。FR5 位姿 [x, y, z mm, rx, ry, rz �
 速度：MoveL / MoveC 用百分比速度模式（velAccParamMode=0）。物理速度模式（mm/s）被这台控制器拒绝（182/183）。
 百分比和实际速度的换算受 WebApp 速度百分比影响，由 run_session.py speed-test 实测（SpeedModel）。
 指令非阻塞下发，再由 20004 状态判断到位，这样运动中随时可以发 StopMotion。MoveC 在这台控制器上
-即使 blendR=0 也要走完才返回（10-12 movec-test 实测），所以放到后台线程里调用，主线程照常监视；
+即使 blendR=0 也要走完才返回（10-12 实测），所以放到后台线程里调用，主线程照常监视；
 运动中实时检查法兰线速度和角速度，超过预期就中止（标定失效或 WebApp 速度改过时的保护）。
 
 旋转：MoveL 让法兰走直线、姿态匀速插值，绕光心转时光心会在半路鼓出去（30° 约 4 mm）。
@@ -871,7 +871,7 @@ class MotionRunner:
         # 超时只兜底；没到位又不动由 STALL_S 发现
         timeout = time.monotonic() + (2.0 * seg.duration_s + 60.0 if seg.speed_known else 300.0)
         # 以转动为主的段（旋转、同步摆动）只查角速度：控制器起步时先平移约 1 mm、腕部随后才转
-        # （10-12 movec-test 实测，50 ms 内 8–13 mm/s，预计只有 3.5 mm/s），线速度会误报；标定失效时角速度一样超
+        # （10-12 实测，50 ms 内 8–13 mm/s，预计只有 3.5 mm/s），线速度会误报；标定失效时角速度一样超
         # 组合段线速度和角速度都查，角速度余量更大
         combined = seg.max_rate_deg_s > 0
         limit = (seg.expect_mm_s * OVERSPEED_FACTOR + OVERSPEED_MARGIN_MM_S

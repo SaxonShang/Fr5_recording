@@ -14,6 +14,29 @@ import numpy as np
 
 import fr5_groundtruth as gt
 
+_PATCHES = [
+    unittest.mock.patch.dict(gt.TRAVEL_SCALE, {"base": {"right": 1.0070, "left": 1.0070, "up": 1.0070, "down": 1.0070,
+                                                        "forward": 1.0015, "backward": 1.0015}, "fast1": {}}),
+    unittest.mock.patch.dict(gt.ROTATION_SCALE, {"base": {"pitch_up": 1.0043, "pitch_down": 1.0052, "yaw_left": 1.0, "yaw_right": 1.0,
+                                                          "roll_left": 1.0, "roll_right": 1.0},
+                                                 "fast1": {"pitch_up": 1.0043, "pitch_down": 1.0052}}),
+    unittest.mock.patch.dict(gt.TIME_CORRECTION_MS_BY_EXPOSURE_US, {10000: 4.27}),
+    unittest.mock.patch.object(gt, "TIME_CORRECTION_EXPOSURE_US", 10000),
+    unittest.mock.patch.object(gt, "TIME_CORRECTION_MS", 4.27),
+]
+
+
+def setUpModule():
+    """修正表的查表逻辑用合成数据测，表的内容（路径组、曝光档）和生产代码无关，这里给一份测试用的。"""
+    for patcher in _PATCHES:
+        patcher.start()
+
+
+def tearDownModule():
+    for patcher in _PATCHES:
+        patcher.stop()
+
+
 EPOCH_MS = 1_791_500_000_000.0  # Box / ZED 时间原点（Unix ms）
 CTRL_OFFSET_MS = 127_000.0      # 控制器时钟比 Box 快 127 s
 DRIFT = -200e-6                 # 控制器时钟比 Box 慢 200 ppm（实测量级）

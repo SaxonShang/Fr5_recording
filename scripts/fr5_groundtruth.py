@@ -15,7 +15,7 @@ SESSION_DIR 里需要 fr5_state.csv（fr5_record.py）以及 zed_imu.csv、img_t
    时间的中点，减去图像时间戳，整段平均得到“曝光中心 - 图像时间戳”（实测约 -3 ms）。
 4. 标定板验证得到的修正（见开头的 TIME_CORRECTION_MS_BY_EXPOSURE_US、TRAVEL_SCALE、ROTATION_SCALE）：
    - 时间：Δt 对齐的是陀螺仪，真值仍比图像晚一个固定量，取真值的时刻再晚这个量（按 time_meta.txt
-     的曝光查表；低速 10 ms、高速 2.5 ms 各自用标定板测过）；
+     的曝光查表；用标定板测过）；
    - 行程：机械臂实际行程比报告的长，法兰平移沿本条录制的运动方向、相对路径起点放大（方向和
      路径两端从 motion_log.json 读；不是平移录制就不缩放）；
    - 转角：俯仰旋转录制里机械臂实际转角比报告的大，法兰姿态相对本条起点、绕转轴的转角放大，
@@ -57,38 +57,24 @@ MIN_STATIC_MS = 500.0
 MIN_MOTION_DEG_S = 10.0    # 估 Δt 至少需要的峰值角速度
 MIN_PEAK_CORR = 0.9
 MAX_SEGMENT_LAG_DIFF_MS = 2.0
-MIN_SPLIT_S = 20.0         # 录制至少这么长，才把前 40% 和后 40% 分开估 Δt、互相核对（sync-test 和正式录制约 30 s）
+MIN_SPLIT_S = 20.0         # 录制至少这么长，才把前 40% 和后 40% 分开估 Δt、互相核对
 MIN_EXPOSURE_FRAMES = 20   # 估曝光中心至少需要的带标记帧数
 MAX_EXPOSURE_SD_MS = 3.0   # 各帧曝光中心偏差的标准差上限
-# 标定板验证（见 data_recording/实验记录.md）得到的修正
-# 时间：真值比图像晚的固定量（ms），按曝光（µs，time_meta.txt 的 exposure_us）分开，低速和高速各自测。
+# 标定板验证得到的修正。时间：真值比图像晚的固定量（ms），按曝光（µs，time_meta.txt 的 exposure_us）查。
 TIME_CORRECTION_MS_BY_EXPOSURE_US = {
-    10000: 4.27,   # 2026-10-12 低速：3 条录制、12 个位置平均，±0.26 ms
-    2500: 3.75,    # 2026-10-15 高速 fast2：上下、左右、前后、偏航、俯仰 ×2 的标定板录制，换到只用同步摆动估 Δt
-                   # 的基准后每个方向取一个值再平均（各方向 3.22–4.39 ms，约 ±0.5 ms；横滚不用）
+    2500: 3.75,    # 2026-10-15：上下、左右、前后、偏航、俯仰 ×2 的标定板录制，换到只用同步摆动估 Δt 的基准后
+                   # 每个方向取一个值再平均（各方向 3.22–4.39 ms，约 ±0.5 ms；横滚不用）
 }
-TIME_CORRECTION_EXPOSURE_US = 10000  # 读不到曝光或曝光不在上表时用这一档，曝光不同时报警
+TIME_CORRECTION_EXPOSURE_US = 2500   # 读不到曝光或曝光不在上表时用这一档，曝光不同时报警
 TIME_CORRECTION_MS = TIME_CORRECTION_MS_BY_EXPOSURE_US[TIME_CORRECTION_EXPOSURE_US]
-# 行程、转角系数按路径组（motion_log.json 里 parameters.PATH_SET；10-12 / 10-13 的录制没有这一项，是 "base"）
-# 和录制方向查。表里没有的方向不缩放、并报警（这条路径还没用标定板验证过）。
-# 机械臂实际行程 / 报告行程。base：start_pose.json 起点 ±150 mm 的 6 段平移（2026-10-10/12 标定板验证）
+# 下面三张表只用于开工核对（路径组 fast2 的 right、roll_right），按路径组（motion_log.json 里 parameters.PATH_SET）和录制方向查。
+# 表里没有的方向不缩放、并报警。holdout1 不用这三张表，改按路径点修正。
+# 机械臂实际行程 / 报告行程（2026-10-15 标定板验证，hold_before 对 hold_after / hold_end）
 TRAVEL_SCALE = {
-    "base": {"right": 1.0070, "left": 1.0070, "up": 1.0070, "down": 1.0070,
-             "forward": 1.0015, "backward": 1.0015},
-    "fast1": {},              # 高速录制的新平移路径（10-14 上午的设计，没有录过）
-    # 高速录制：按拖动标记定的路径（10-14 起）。2026-10-15 标定板验证（hold_before 对 hold_after / hold_end）：
-    # up +0.05～+0.08%（两条），right +0.58%，forward +0.43%；没扣录制两端的残差转动（陀螺仪分辨不出它）。
-    # 只填录过的方向，反方向没有录过。
     "fast2": {"up": 1.0007, "right": 1.0058, "forward": 1.0043},
 }
-# 机械臂实际转角 / 报告转角（2026-10-13 标定板验证：pitch_up 3 条 +0.39～+0.46%，平均 +0.43%；
-# pitch_down 2 条 +0.50、+0.54%，平均 +0.52%；偏航 10°、横滚 30° 在 ±0.03% 以内，不修正）。
+# 机械臂实际转角 / 报告转角（2026-10-15 标定板验证）：pitch_up 2 条 −0.36%、−0.37%；偏航 54°、横滚 162° 在 ±0.02% 以内，写 1.0
 ROTATION_SCALE = {
-    "base": {"pitch_up": 1.0043, "pitch_down": 1.0052, "yaw_left": 1.0, "yaw_right": 1.0,
-             "roll_left": 1.0, "roll_right": 1.0},
-    "fast1": {"pitch_up": 1.0043, "pitch_down": 1.0052},   # 俯仰和 base 同一条路径；偏航 30°、横滚 90° 待验证
-    # 按拖动标记定的转动中心和转角（2026-10-15 标定板验证）：pitch_up 2 条 −0.36%、−0.37%（和 base 那条路径的
-    # 符号相反，构型和位置不同）；偏航 54°、横滚 162° 在 ±0.02% 以内，写 1.0。只填录过的方向。
     "fast2": {"pitch_up": 0.9964, "yaw_left": 1.0, "roll_right": 1.0},
 }
 # 端点位姿修正（在行程、转角系数之后再加）：同一路径的标定板录制里，真值终点还要补的刚体变换 ΔT（基坐标系左乘；
@@ -457,7 +443,7 @@ def camera_pose(p_flange, q_flange, flange_t_cam):
 
 
 def path_set(log: dict) -> str:
-    """录制用的路径组（run_session.PATH_SET）；10-12 / 10-13 的录制没有记，是 base。"""
+    """录制用的路径组（motion_log.json 的 parameters.PATH_SET）；没有记录时是 base，修正表里没有，不修正。"""
     return str((log.get("parameters") or {}).get("PATH_SET") or "base")
 
 

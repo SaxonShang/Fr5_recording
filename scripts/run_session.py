@@ -6,6 +6,7 @@
     python3 run_session.py plan [名称 ...]      空跑检查，不动机械臂；不给名称时检查全部 holdout1 路径
     python3 run_session.py speed-test           速度标定（会先确认，不开相机）。WebApp 速度百分比变了才要重跑
     python3 run_session.py record <名称>        录制一条（会先确认）
+    python3 run_session.py warmup <路径> --minutes 30   开录前预热：重复走一条路径，不开相机、不存数据（会先确认）
 
 录制名称：holdout1 路径 accel_static_a/b、accel_rate_slow_first/fast_first、roll_bidir、trans_level_first/tilt_first、s_path、eight；
 开工核对 right、roll_right（路径组 fast2，由 LIMIT_POSES 里的拖动标记定，这份文件是只读输入）。
@@ -30,7 +31,7 @@ UP_DOWN_HEADING_BASE_DEG = 0.0  # 上下录制的相机朝向：基坐标系里�
                                 # 一块标定板三条都能用；上下的行程不受朝向影响（两端停在最低高度和标记余量）
 ROT_DEG_S = 50.0             # 旋转角速度 °/s
 # 画面里不能出现的玻璃：只管右侧落地窗（用户 10-13 定，左窗可以拍）。每块是 (方位角起, 方位角止, 仰角下, 仰角上)，单位 °，
-# 从参考起点（set-start）的光心看、相对它的水平朝向，方位角正 = 向左、仰角正 = 向上。10-13 全景图量出：右窗玻璃从柱子边缘 −60.3° 往右，
+# 从参考起点（start_pose.json）的光心看、相对它的水平朝向，方位角正 = 向左、仰角正 = 向上。10-13 全景图量出：右窗玻璃从柱子边缘 −60.3° 往右，
 # 仰角约 −6.5～+4°（上面到天花板的白条也算进去）；−87° 以右没拍到，按全是玻璃处理。
 GLASS_REGIONS = [
     (-87.0, -60.3, -8.0, 11.0),
@@ -55,7 +56,7 @@ WIGGLE_DEG_S = 20.0          # 同步摆动角速度 °/s（真值脚本要求�
 WIGGLE_CYCLES = 2            # 同步摆动来回次数
 REPOSITION_MPS = 0.05        # 录制前从当前位姿移到录制起点的速度 m/s
 WEBAPP_SPEED_PCT = 60        # WebApp 里的速度百分比（SDK 读不到，照抄过来）；WebApp 改了这里也要改，并重跑 speed-test。
-                             # 高速录制用 60%（10-14 用户已在 WebApp 改好；0.5 m/s 约需 SDK 83%）
+                             # 60% 时 0.5 m/s 约需 SDK 83%
 ACCEL_PCT = 100              # MoveL 加速度百分比（oacc）；实际加速度看 speed-test 结果，起停太猛就调小再重跑 speed-test
 SPEED_TEST_PCT = 5           # speed-test 去程的速度百分比；没标定时最快为控制器默认速度 1000 mm/s 的 5% = 50 mm/s
 MAX_SPEED_ERROR = 0.10       # 平移实测速度和预计速度相差超过 10% 就警告（speed-test 里也用来检查是否成正比）
@@ -71,9 +72,7 @@ MAX_STROKE_M = 1.0           # 平移行程上限
 MIN_ROTATION_DEG = 15.0      # 旋转转角下限（不小于 WIGGLE_DEG：同步摆动在转动范围以内）
 MAX_ROTATION_DEG = 180.0     # 旋转转角上限
 # 允许的关节范围（°）：FR5 的关节范围，运行时再和控制器读到的关节软限位取交集（各收进 SOFT_LIMIT_MARGIN_DEG）。
-# 高速录制不再另设保守范围（用户 10-14 定）：腕部 J4、J5、线缆（J6）、机柜等由拖动标记保证，拖的时候人会确认；
-# 路径只在两个标记之间，并且不换构型、离奇异位形至少 SINGULAR_MARGIN_DEG。
-# 低速录制（data-v1）用的是保守范围 [80, −30, −130, −154, −72, −50]～[160, 34, −15, −87, −19, 50]。
+# 不另设保守范围：路径不换构型、离奇异位形至少 SINGULAR_MARGIN_DEG；第一次演练时人盯腕部、线缆和机柜。
 JOINT_MIN_DEG = [-175.0, -265.0, -160.0, -265.0, -175.0, -175.0]
 JOINT_MAX_DEG = [175.0, 85.0, 160.0, 85.0, 175.0, 175.0]
 SOFT_LIMIT_MARGIN_DEG = 2.0  # 离控制器关节软限位至少这么多 °
@@ -815,6 +814,49 @@ def cmd_motion(args, direction: str) -> int:
     return 0 if error is None and zed_error is None else 1
 
 
+def cmd_warmup(args) -> int:
+    """开录前让机械臂转起来：重复走路径表里的一条路径，不开相机、不存任何数据。Ctrl+C 随时停。"""
+    f_t_c, _ = gt.load_handeye(p(HANDEYE))
+    model, note = load_speed_model()
+    if model is None:
+        print(note)
+        return 1
+    error, ran, loops = None, False, 0
+    with tempfile.TemporaryDirectory() as tmp:
+        rec = StateRecorder(tmp, ROBOT_IP)
+        rec.start()
+        try:
+            rpc = rec.open_rpc()
+            runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
+            runner.precheck()
+            limits = joint_limits(rpc)[:2]
+            segs, path_note, _, start_q, found = build_waypoint_recording(rpc, args.path, f_t_c, model, limits)
+            if segs is None:
+                raise fm.MotionAborted("路径没定下来，没有运动：\n  " + "\n  ".join(found))
+            moved = config_problem(current_pose(rec)[1], start_q)
+            found = ([moved] if moved else []) + check_segments(rec, rpc, segs, f_t_c, model, args.scale, limits, True)
+            if found:
+                raise fm.MotionAborted("检查没通过，没有运动：\n  " + "\n  ".join(found))
+            confirm_plan(f"预热 {args.path}：{args.minutes:g} 分钟，速度比例 {args.scale}，不开相机、不存数据\n{note}\n{path_note}\n"
+                         + describe(segs, totals=False), args.yes)
+            ran = True
+            runner.run(segs[0])
+            end = time.monotonic() + args.minutes * 60.0
+            while time.monotonic() < end:
+                for seg in segs[1:]:
+                    runner.run(seg)
+                loops += 1
+                print(f"第 {loops} 圈走完，还剩 {max(0.0, end - time.monotonic()) / 60.0:.1f} 分钟", flush=True)
+        except BaseException as exc:  # noqa: BLE001 - 包括 Ctrl+C：先停机械臂
+            error = f"{type(exc).__name__}: {exc}"
+            if ran:
+                fm.emergency_stop(ROBOT_IP)
+            print(f"\n中止：{error}")
+        finally:
+            rec.stop(write=False)
+    return 0 if error is None else 1
+
+
 def _per_pct(seg: fm.Segment, key: str) -> float | None:
     """实测巡航速度 ÷ 速度百分比；没测到返回 None。key：linear_mm_s 或 angular_deg_s。"""
     m = (seg.log.get("measured") or {}).get(key)
@@ -952,6 +994,9 @@ def main(argv=None) -> int:
     sub.add_parser("speed-test")
     record = sub.add_parser("record")
     record.add_argument("direction", choices=RECORD_NAMES, metavar="名称", help=" ".join(RECORD_NAMES))
+    warmup = sub.add_parser("warmup")
+    warmup.add_argument("path", choices=list(hp.PATHS), metavar="路径", help=" ".join(hp.PATHS))
+    warmup.add_argument("--minutes", type=float, default=30.0, help="预热时长（分钟，1–120），默认 30")
     for sp in sub.choices.values():
         sp.add_argument("--scale", type=float, default=1.0, help="速度比例 (0, 1]，首次运行建议 0.2")
         sp.add_argument("--yes", action="store_true", help="跳过确认")
@@ -959,6 +1004,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if not 0 < args.scale <= 1:
         parser.error("--scale 必须在 (0, 1] 之间")
+    if args.command == "warmup" and not 1.0 <= args.minutes <= 120.0:
+        parser.error("--minutes 必须在 1–120 之间")
     if args.tag and not re.fullmatch(r"[A-Za-z0-9-]{1,20}", args.tag):
         parser.error("--tag 只能用字母、数字和 -，最多 20 个字符")
     signal.signal(signal.SIGHUP, _on_hangup)
@@ -971,6 +1018,8 @@ def main(argv=None) -> int:
         return 1
     if args.command == "speed-test":
         return cmd_speed_test(args)
+    if args.command == "warmup":
+        return cmd_warmup(args)
     return cmd_motion(args, args.direction)
 
 
