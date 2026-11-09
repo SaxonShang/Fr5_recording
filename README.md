@@ -161,8 +161,9 @@
 | `scripts/zed_imu_extrinsic.py` | 新：读出 ZED 左目和机身 IMU 之间的出厂外参和 IMU 噪声参数（Box 上运行，写进各批数据的 `calib/camera_imu.yaml`） |
 | `scripts/cue_listener.py` | 新：在笔记本上放 `--cue` 的提示音（Box 的显示器没有喇叭时用；Windows，只用标准库） |
 | `scripts/frame_lag_check.py` | 检查图像内容和时间戳是否错位（笔记本上运行），有异常时退出码为 1 |
+| `scripts/sio_slam_convert.py` | 新：录制 → SIO_SLAM 的输入（`frames.csv`、`imu.csv`，图像时间加 4.7 ms 到 IMU 时间轴，附同样平移时间戳的真值和 `run_config.yaml`），只用标准库，见 6 节末尾 |
 | `scripts/camera_s003_refit.yaml` | ZED 校正后左目 HD1080 内参，用 s003 图像重标 |
-| `scripts/test_*.py` | 离线测试（合成数据、假逆解，不连机械臂），共 104 项；要 OpenCV 的只在笔记本上运行，要 FAIRINO SDK 的只在 Box 上运行，缺了自动跳过 |
+| `scripts/test_*.py` | 离线测试（合成数据、假逆解，不连机械臂），共 111 项；要 OpenCV 的只在笔记本上运行，要 FAIRINO SDK 的只在 Box 上运行，缺了自动跳过 |
 | `scripts/movel_probe.py` | 诊断：发零行程的 MoveL / MoveJ，看控制器拒绝哪种参数 |
 | `scripts/handeye_s003_result.json` | 手眼外参（标定仓库 `results/s003/result.json` 的副本） |
 | `scripts/start_pose.json` | 参考起点：只用来定右窗的方向和做 sync-test，录制不回这里 |
@@ -298,3 +299,19 @@
 ```bash
 python3 fr5_groundtruth.py <save_data 目录> --handeye handeye_s003_result.json
 ```
+
+**给 SIO_SLAM 用**：SIO_SLAM 读旧格式时要求每帧至少 25 个 IMU 样本，本数据每帧只有 4–8 个，要先转换成它的 zed_record 格式。转换结果写在每条的 `save_data/sio_slam/`（原有文件不动）：
+
+```bash
+python -B sio_slam_convert.py ..\data\recordings_highspeed ..\data\recordings_highspeed_people
+```
+
+- 默认从第 60 帧开始（前 2 s 亮度在变），这一帧带上它之前的全部 IMU，供 SIO_SLAM 做静止初始化；`--start-frame` 可改。
+- 图像时间加 4.7 ms 统一到 IMU 时间轴（3.2），`--time-offset-ms auto` 改用每条 `frame_lag_report.json` 的值。`sio_slam/groundtruth_tum.txt` 的时间戳加了同样的偏移，可以直接和 SIO_SLAM 输出的轨迹配对。
+- `20261016_143751_pitch_up_people` 开头 0.2 s 处 IMU 有一个 41.8 ms 的缺口，转换时去掉了缺口之前的样本（见该条 `convert_meta.json`）。
+- SIO_SLAM 端（本机副本的工作区改动，未提交）：参数用 `config/params_fr5_zedx_highspeed.yaml`；每条录制用环境变量指定 `run_config.yaml`，轨迹写到同一目录：
+
+  ```bash
+  SIO_RUN_CONFIG=<save_data>/sio_slam/run_config.yaml ros2 run sio_slam run_frontend
+  evo_ape tum <save_data>/sio_slam/groundtruth_tum.txt <save_data>/sio_slam/trajectory_tum.txt --align_origin
+  ```
