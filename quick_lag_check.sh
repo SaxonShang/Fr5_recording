@@ -3,7 +3,8 @@
 # 在笔记本跑 scripts/frame_lag_check.py。结论和拷全部左目图后跑的一样，但报告写在 data/quick_lag/ 下，
 # 不是交付用的 frame_lag_report.json（交付前按运行手册第 8 节在完整数据上再跑一次）。
 # 用法（笔记本 Git Bash，仓库根目录）：  ./quick_lag_check.sh <录制名>...
-# 环境变量：BOX（默认 user@10.255.250.132）、PY（默认 calibration 的 venv）。
+# 环境变量：BOX（默认 user@10.255.250.132）、PY（默认 calibration 的 venv）、METHOD（flow 或 framediff，
+# 默认 flow；场景 C 的重复纹理用 framediff）。
 set -u
 BOX="${BOX:-user@10.255.250.132}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -26,6 +27,6 @@ for r in csv.DictReader(open('img_timeline.csv')):
 PY
 " | tar xf - -C "$OUT/$N/save_data" || { echo "$N：拷贝失败"; status=1; continue; }
   echo "$N：拷了 $(ls "$OUT/$N/save_data/left" | wc -l) 张"
-  (cd "$ROOT/scripts" && PYTHONUTF8=1 "$PY" -B frame_lag_check.py "$OUT/$N/save_data") || status=1
+  (cd "$ROOT/scripts" && PYTHONUTF8=1 "$PY" -B frame_lag_check.py "$OUT/$N/save_data" --method "${METHOD:-flow}") || status=1
 done
 exit $status
