@@ -700,10 +700,10 @@ def cmd_motion(args, direction: str) -> int:
     HANGUP_LOG = session_dir / "run_session.log"
 
     rec = StateRecorder(data_dir, ROBOT_IP)
-    rec.start()
     zed = ZedRecord(p(ZED_RECORD), session_dir, EXPOSURE_US, ANALOG_GAIN_MDB, CAMERA_FPS)
     error, ran, segs, mark_path, waypoint_path = None, False, [], None, None
     try:
+        rec.start()                              # 连不上 20004 或此时 Ctrl+C：照样走到下面的收尾，删掉空目录
         rpc = rec.open_rpc()
         runner = fm.MotionRunner(rec, rpc, ACCEL_PCT)
         runner.precheck()

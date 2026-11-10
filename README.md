@@ -132,6 +132,7 @@ MoveL 和组合段的 s 取法兰在弦上的投影，MoveC 取绕转轴转过�
 | `scripts/frame_lag_check.py` | 图像和时间戳是否错位，光流法或帧差法（笔记本） |
 | `scripts/startup_checks.py` | 开工清单的数值检查：相机连续录制、重力方向、到位稳定、每段实测 |
 | `scripts/make_conditions.py` | 生成交付用的 `conditions.yaml` |
+| `scripts/make_scene_patterns.py` | 生成场景 B、C 的打印图案 |
 | `scripts/handeye_poses.py`、`scripts/handeye_capture.py` | 开工核对不通过、紧固支架后重标手眼时用 |
 | `scripts/zed_imu_extrinsic.py` | 读 ZED 出厂的左目–IMU 外参和 IMU 噪声参数 |
 | `scripts/fr5_kin.py` | FR5 解析运动学，只用于离线测试 |
@@ -214,4 +215,4 @@ MoveL 和组合段的 s 取法兰在弦上的投影，MoveC 取绕转轴转过�
 | 正式录像 | 笔记本 `data/recordings_holdout1/`，评测机 `data/recordings/recordings_holdout1/`，含 `calib/` 和 `conditions.yaml` |
 | 带板和加计录像 | `data/board_check/`，不放进批次目录 |
 | `calib/` | `camera_s003_refit.yaml`、`camera_imu.yaml`、`SN49953548.conf` |
-| 硬性检查 | `frame_lag_report.json` 中 `ok=true`、`frames_late=0`、`at_scan_edge=false`；场景 C 多一个 `method: framediff` |
+| 硬性检查 | `frame_lag_report.json` 中 `ok=true`、`frames_late=0`、`at_scan_edge=false`；场景 C 多一个 `method: framediff`；IMU 间隔 ≤ 10 ms |

@@ -516,7 +516,7 @@ class StartupChecksTest(unittest.TestCase):
         return sd
 
     def test_camera(self):
-        cases = ((0, 33.3, True), (3, 33.3, False), (0, 45.0, False))
+        cases = ((0, 33.3, True), (3, 33.3, False), (0, 45.0, True), (0, 66.7, False))
         for drops, gap, expected in cases:
             with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(sc.check_camera(self._camera_session(Path(tmp), drops, gap)), expected)
@@ -625,6 +625,17 @@ class RunSessionTest(unittest.TestCase):
         self.assertIn("路径组 holdout1", text)
         self.assertIn("leg_1", text)
         self.assertIn("没有确认", text)
+        self.assertEqual(list(Path(self.rs.SESSIONS_DIR).iterdir()), [])
+
+    def test_record_cleans_up_when_state_stream_fails(self):
+        """连不上机械臂状态（或启动时 Ctrl+C）：报错退出，不留空的录制目录。"""
+        class NoState(_FakeRecorder):
+            def start(self):
+                raise RuntimeError("3 s 内没收到有效状态包")
+        self.rs.StateRecorder = NoState
+        code, text = self.run_cmd(self.rs.cmd_motion, argparse.Namespace(scale=0.2, yes=False, tag="rehearsal"), "roll_bidir")
+        self.assertEqual(code, 1)
+        self.assertIn("没收到有效状态包", text)
         self.assertEqual(list(Path(self.rs.SESSIONS_DIR).iterdir()), [])
 
     def test_warmup_declined_does_not_move(self):

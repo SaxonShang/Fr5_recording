@@ -6,7 +6,7 @@
     python3 startup_checks.py settle  <save_data> [...]     到位后陀螺幅值按时间分箱：到位后多久回到静止水平
     python3 startup_checks.py legs    <save_data>           多段路径每段的预计和实测（线速度、角速度、超速保护）
 
-判据（实验记录的开工清单）：camera 丢弃队列都是 0、帧间隔 ≤ 40 ms、IMU 间隔 ≤ 10 ms；gravity 相对开发录制的基线
+判据（实验记录的开工清单）：camera 丢弃队列都是 0、没有丢帧（帧间隔 ≤ 50 ms；13.11 第 8 项的静止测试加 --max-frame-gap-ms 40）、IMU 间隔 ≤ 10 ms；gravity 相对开发录制的基线
 （偏离 +z 0.24°）变化 > 0.5° 就查底座是否水平，并告知评测端重估 g_w；settle 基线是 0.5–0.75 s 回到静止水平，明显变长就
 加长最短停留；legs 长段线速度和预计差 ≤ 10%，角速度不超过预计的 1.5 倍。不通过时退出码为 1。
 """
@@ -25,7 +25,7 @@ import numpy as np
 import fr5_groundtruth as gt
 
 CAMERA_IMU = Path(__file__).resolve().parent / "camera_imu.yaml"
-MAX_FRAME_GAP_MS, MAX_IMU_GAP_MS = 40.0, 10.0
+MAX_FRAME_GAP_MS, MAX_IMU_GAP_MS = 50.0, 10.0   # 30 fps 丢一帧是 66.7 ms，录制中时间戳抖动会到 45 ms；IMU 10 ms 是评测端的硬性上限
 HOLDS = ("hold_start", "hold_before", "hold_after", "hold_end")
 HOLD_SKIP_START_MS, HOLD_SKIP_END_MS = 800.0, 300.0      # 静止段开头等稳定、结尾离下一段远一点
 BASELINE_TILT_DEG, MAX_TILT_CHANGE_DEG = 0.24, 0.5
@@ -52,17 +52,17 @@ def load_imu_columns(save_data: Path) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return data[:, 0] / 1e6, data[:, 1:4], data[:, 4:7]
 
 
-def check_camera(save_data: Path) -> bool:
+def check_camera(save_data: Path, max_frame_gap_ms: float = MAX_FRAME_GAP_MS) -> bool:
     with open(save_data / "img_timeline.csv", newline="", encoding="utf-8") as f:
         t_img = np.array([float(r["zed_timestamp_ms"]) for r in csv.DictReader(f)])
     t_imu = load_imu_columns(save_data)[0]
     frame_gap, imu_gap = float(np.diff(t_img).max()), float(np.diff(t_imu).max())
     log = save_data.parent / "zed_record.log"
     drops = [int(v) for v in re.findall(r"丢弃队列 (\d+)", log.read_text(encoding="utf-8"))] if log.exists() else None
-    print(f"图像 {len(t_img)} 帧、{(t_img[-1] - t_img[0]) / 1000:.1f} s，帧间隔最大 {frame_gap:.1f} ms（门槛 {MAX_FRAME_GAP_MS:g}）；"
+    print(f"图像 {len(t_img)} 帧、{(t_img[-1] - t_img[0]) / 1000:.1f} s，帧间隔最大 {frame_gap:.1f} ms（门槛 {max_frame_gap_ms:g}）；"
           f"IMU {len(t_imu)} 行，间隔最大 {imu_gap:.2f} ms（门槛 {MAX_IMU_GAP_MS:g}）；"
           + (f"丢弃队列 {drops}" if drops is not None else f"没有 {log.name}，查不了丢弃队列"))
-    ok = frame_gap <= MAX_FRAME_GAP_MS and imu_gap <= MAX_IMU_GAP_MS and bool(drops) and not any(drops)
+    ok = frame_gap <= max_frame_gap_ms and imu_gap <= MAX_IMU_GAP_MS and bool(drops) and not any(drops)
     print("通过" if ok else "不通过")
     return ok
 
@@ -178,10 +178,11 @@ def main(argv=None) -> int:
         sp = sub.add_parser(name)
         sp.add_argument("save_data", type=Path, nargs="+" if many else None)
     sub.choices["gravity"].add_argument("--camera-imu", type=Path, default=CAMERA_IMU)
+    sub.choices["camera"].add_argument("--max-frame-gap-ms", type=float, default=MAX_FRAME_GAP_MS)
     args = parser.parse_args(argv)
     try:
         if args.command == "camera":
-            ok = check_camera(args.save_data)
+            ok = check_camera(args.save_data, args.max_frame_gap_ms)
         elif args.command == "gravity":
             ok = check_gravity(args.save_data, args.camera_imu)
         elif args.command == "settle":
